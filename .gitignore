@@ -13,3 +13,4 @@ api-hub-export-*.json
 # PyInstaller 产物
 build/
 dist/
+.build-venv/
