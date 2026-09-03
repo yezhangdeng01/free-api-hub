@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
@@ -20,7 +21,11 @@ from . import config as cfgmod
 from . import gateway, store, throttle
 from .config import PROVIDER_PRESETS
 
-FRONTEND = os.path.join(cfgmod.ROOT, "frontend", "index.html")
+if getattr(sys, "frozen", False):
+    # PyInstaller 打包：静态资源（frontend/）在 _internal 内，数据文件（config.json/data）在 exe 同目录
+    FRONTEND = os.path.join(sys._MEIPASS, "frontend", "index.html")
+else:
+    FRONTEND = os.path.join(cfgmod.ROOT, "frontend", "index.html")
 
 
 def _hdr(v):

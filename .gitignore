@@ -9,3 +9,7 @@ api-hub-export-*.json
 
 # 内部评估报告，不入库
 项目综合评估.md
+
+# PyInstaller 产物
+build/
+dist/
