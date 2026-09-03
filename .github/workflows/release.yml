@@ -1,0 +1,44 @@
+name: build-release
+
+# 每次推送 v* tag（如 v1.0.1）自动构建 Windows 绿色版并挂到对应 Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # 也可手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: 运行测试（回归把关）
+        run: python -m pytest tests/ -q
+
+      - name: PyInstaller 打包（onedir 绿色目录）
+        run: pyinstaller --noconfirm api-hub.spec
+
+      - name: 压缩为绿色 zip
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME
+          $stage = "free-api-hub-$ver-win64"
+          # 解压即用：exe 放包根，数据文件同目录自动生成
+          Compress-Archive -Path "dist/API Hub/*" -DestinationPath "$stage.zip" -Force
+          Get-Item "$stage.zip" | Select-Object Name, Length
+
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: free-api-hub-*.zip
+          generate_release_notes: false

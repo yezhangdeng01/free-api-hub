@@ -2,10 +2,15 @@
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, "frozen", False):
+    # PyInstaller 打包（绿色版）：数据目录在 exe 同目录
+    ROOT = os.path.dirname(sys.executable)
+else:
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(ROOT, "data", "usage.db")
 MODEL_STATUS_PATH = os.path.join(ROOT, "data", "model_status.json")
 _lock = threading.Lock()

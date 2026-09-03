@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import sys
 import threading
 import uuid
 
@@ -9,7 +10,11 @@ from . import vault
 
 logger = logging.getLogger("api-hub")
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, "frozen", False):
+    # PyInstaller 打包（绿色版）：数据文件（config.json/data/frontend）都在 exe 同目录
+    ROOT = os.path.dirname(sys.executable)
+else:
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 
 # 各平台预设：base_url 均为 OpenAI 兼容地址
