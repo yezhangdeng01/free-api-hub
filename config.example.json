@@ -1,0 +1,15 @@
+{
+  "port": 8787,
+  "check_interval_minutes": 30,
+  "quota_interval_minutes": 15,
+  "probe_interval_minutes": 60,
+  "auth_enabled": true,
+  "api_token": "",
+  "aliases": {},
+  "pinned": [],
+  "channels": [],
+  "route_strategy": "balanced",
+  "probe_used_models": true,
+  "adaptive_preemption": true,
+  "model_tiers": {}
+}

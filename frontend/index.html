@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>API Hub · 大模型聚合网关</title>
+<style>
+  :root {
+    --bg: #17150f; --panel: #201d16; --panel2: #26221a; --border: #3a352a;
+    --text: #e8e2d4; --muted: #9c9280; --accent: #d0a75c; --accent-dim: #8a7345;
+    --ok: #7fae72; --bad: #c96a5a; --warn: #cfa35a; --mono: "Cascadia Mono", Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif; font-size: 14px; }
+  header { display: flex; align-items: center; gap: 16px; padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  header h1 { font-size: 17px; font-weight: 600; letter-spacing: .5px; }
+  header h1 span { color: var(--accent); }
+  .chip { font-family: var(--mono); font-size: 12px; color: var(--muted); background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; user-select: none; }
+  .chip:hover { color: var(--accent); border-color: var(--accent-dim); }
+  #refresh-btn { margin-left: auto; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+  #refresh-btn:hover { border-color: var(--accent-dim); color: var(--accent); }
+  nav { display: flex; gap: 4px; padding: 0 24px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  nav button { background: none; border: none; color: var(--muted); font-size: 14px; padding: 11px 18px; cursor: pointer; border-bottom: 2px solid transparent; }
+  nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  nav button:hover { color: var(--text); }
+  main { padding: 20px 24px 48px; max-width: 1180px; margin: 0 auto; }
+  .tab { display: none; } .tab.active { display: block; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+  h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+  h3 { font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 8px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  td { padding: 9px 10px; border-bottom: 1px solid #2a261e; font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+  .click-copy { cursor: pointer; } .click-copy:hover { color: var(--accent); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.on { background: var(--ok); } .dot.off { background: var(--bad); } .dot.unknown { background: var(--muted); }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 4px; background: var(--panel2); border: 1px solid var(--border); color: var(--muted); }
+  .muted { color: var(--muted); } .small { font-size: 12px; }
+  .btn { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 12.5px; }
+  .btn:hover { border-color: var(--accent-dim); color: var(--accent); }
+  .btn.danger:hover { border-color: var(--bad); color: var(--bad); }
+  .btn.primary { background: var(--accent-dim); border-color: var(--accent-dim); color: #17150f; font-weight: 600; }
+  .btn.primary:hover { background: var(--accent); }
+  .btn.pinned { color: var(--warn); border-color: var(--warn); font-weight: 700; }
+  .btn.pinned:hover { color: var(--warn); }
+  .vdiv { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
+  .chip-btn {
+    background: var(--panel2); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 14px;
+    padding: 3px 12px; font-size: 12px; cursor: pointer;
+    transition: all .15s;
+  }
+  .chip-btn:hover { color: var(--text); border-color: var(--accent-dim); }
+  .chip-btn.active { background: var(--accent-dim); color: #17150f; border-color: var(--accent-dim); font-weight: 600; }
+  .chip-btn.ok-dot.active { background: rgba(76,175,80,.18); color: var(--ok); border-color: var(--ok); }
+  .chip-btn.warn-dot.active { background: rgba(224,177,63,.15); color: var(--warn); border-color: var(--warn); }
+  .light-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:7px; vertical-align:middle; }
+  .light-dot.ok { background: var(--ok); box-shadow: 0 0 5px var(--ok); }
+  .light-dot.limited { background: var(--warn); box-shadow: 0 0 5px var(--warn); }
+  .light-dot.down { background: var(--bad); }
+  .tag-chip {
+    display: inline-block; padding: 1px 8px; border-radius: 9px;
+    font-size: 11px; background: var(--panel2); border: 1px solid var(--border);
+    color: var(--muted); white-space: nowrap;
+  }
+  .tag-chip.ok { color: var(--ok); border-color: var(--accent-dim); }
+  .tag-chip.bad { color: var(--bad); border-color: var(--bad); }
+  .tag-sep { width:1px; height:13px; background: var(--border); margin: 0 2px; display:inline-block; vertical-align: middle; }
+  input[type=text], input[type=password], select, textarea {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; font-size: 13px; width: 100%;
+    font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 90px; line-height: 1.6; }
+  input:focus, select:focus { outline: none; border-color: var(--accent-dim); }
+  .form-grid { display: grid; grid-template-columns: 150px 1fr 1fr 1fr auto; gap: 10px; align-items: end; }
+  .form-grid label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); padding-bottom: 8px; }
+  #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--accent-dim); color: var(--accent); border-radius: 8px; padding: 9px 20px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 99; }
+  #toast.show { opacity: 1; }
+  .toolbar { display: flex; gap: 10px; margin-bottom: 12px; align-items: center; }
+  .toolbar input { width: 260px; }
+  .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .stat .num { font-size: 22px; font-weight: 600; font-family: var(--mono); }
+  .stat .lbl { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .quota-remaining { color: var(--accent); font-weight: 600; }
+  .cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  pre { background: #12100c; border: 1px solid var(--border); border-radius: 8px; padding: 14px; font-family: var(--mono); font-size: 12.5px; overflow-x: auto; color: #cfc7b4; line-height: 1.6; }
+  pre .k { color: var(--accent); }
+  .chart { display: flex; align-items: flex-end; gap: 6px; height: 140px; padding: 10px 4px 0; }
+  .bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 5px; min-width: 0; }
+  .bar { width: 100%; max-width: 42px; background: linear-gradient(180deg, var(--accent), var(--accent-dim)); border-radius: 3px 3px 0 0; min-height: 2px; }
+  .bar.err { background: linear-gradient(180deg, var(--bad), #7a4038); }
+  .bar-lbl { font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+  .empty { color: var(--muted); text-align: center; padding: 28px 0; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>API <span>Hub</span> · 大模型聚合网关</h1>
+  <div class="chip" id="gw-url" title="点击复制网关地址">加载中…</div>
+  <div class="chip" id="gw-token" title="点击复制网关 Token（在第三方工具里当 API Key 用）" style="display:none">Token…</div>
+  <button id="refresh-btn">↻ 刷新全部</button>
+</header>
+<nav>
+  <button data-tab="models" class="active">模型</button>
+  <button data-tab="channels">渠道</button>
+  <button data-tab="stats">统计</button>
+  <button data-tab="playground">测试台</button>
+  <button data-tab="guide">网关用法</button>
+</nav>
+<main>
+  <!-- 模型 -->
+  <section class="tab active" id="tab-models">
+    <div class="card">
+      <div class="toolbar" style="gap:14px">
+        <input type="text" id="model-search" placeholder="搜索模型…  支持 provider:xxx / v: / t:3">
+        <span class="muted small" id="model-count"></span>
+        <span class="vdiv"></span>
+        <span style="display:flex; gap:6px; align-items:center">
+          <button class="chip-btn ok-dot" id="show-ok-btn" title="显示免费可调模型（绿点）">● 可用</button>
+          <button class="chip-btn warn-dot" id="show-limited-btn" title="暂时限流/冷却中的免费模型（黄点）">● 受限</button>
+        </span>
+        <span class="vdiv"></span>
+        <span style="display:flex; gap:6px" id="sort-chips">
+          <button class="chip-btn" data-sort="balanced">均衡</button>
+          <button class="chip-btn" data-sort="quality">智能优先</button>
+          <button class="chip-btn" data-sort="stability">稳定优先</button>
+          <button class="chip-btn" data-sort="speed">速度优先</button>
+        </span>
+        <span style="margin-left:auto; display:flex; gap:8px; align-items:center">
+          <button class="btn" id="pg-test-all" title="对所有未测试模型各发一次 1 token 探测">测试未测</button>
+          <button class="btn" id="pg-prev">‹</button>
+          <span class="muted small" id="pg-info"></span>
+          <button class="btn" id="pg-next">›</button>
+        </span>
+      </div>
+      <table>
+        <thead><tr><th style="width:44px">#</th><th>模型</th><th>特点</th><th style="width:92px">操作</th></tr></thead>
+        <tbody id="model-rows"></tbody>
+      </table>
+      <div class="empty" id="model-empty" style="display:none"></div>
+    </div>
+  </section>
+
+  <!-- 渠道 -->
+  <section class="tab" id="tab-channels">
+    <div class="card">
+      <h2 id="ch-form-title">添加渠道</h2>
+      <div class="form-grid" style="grid-template-columns: 200px 1fr 1.2fr 1fr auto">
+        <div>
+          <label>平台类型</label>
+          <select id="ch-type"></select>
+        </div>
+        <div><label>名称（可选）</label><input type="text" id="ch-name" placeholder="留空用默认名"></div>
+        <div><label>Base URL</label><input type="text" id="ch-base" placeholder="自动填充，可修改"></div>
+        <div><label>API Key</label><input type="password" id="ch-key" placeholder="sk-…"></div>
+        <div class="check"><input type="checkbox" id="ch-enabled" checked><span>启用</span></div>
+      </div>
+      <div style="margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+        <a id="ch-keylink" href="#" target="_blank" class="btn"
+           style="text-decoration:none; color:var(--accent); border-color:var(--accent-dim)">🔗 获取 API Key ↗</a>
+        <button class="btn" id="ch-test" title="用当前表单的平台/URL/Key 测试连接，不保存">测试连接</button>
+        <button class="btn primary" id="ch-save">保存</button>
+        <button class="btn" id="ch-cancel" style="display:none">取消编辑</button>
+        <span id="ch-result" class="small" style="flex:1; min-width:140px"></span>
+      </div>
+    </div>
+    <div id="channel-list"></div>
+    <div class="card">
+      <h2>模型别名</h2>
+      <p class="muted small" style="margin-bottom:10px">把不同平台上的同一模型归并成一个别名，请求别名时组内自动故障切换。示例：别名 <span class="mono">glm-4-flash</span> 目标填 <span class="mono">glm-4-flash, zhipu/glm-4-flash</span></p>
+      <div class="form-grid" style="grid-template-columns: 1fr 2.2fr auto">
+        <div><label>别名（不含 /）</label><input type="text" id="al-name" placeholder="如 glm-4-flash"></div>
+        <div><label>目标模型 ID（多个用逗号分隔）</label><input type="text" id="al-targets" placeholder="glm-4-flash, zhipu/glm-4-flash"></div>
+        <div style="padding-bottom:0"><button class="btn primary" id="al-add">添加</button></div>
+      </div>
+      <table style="margin-top:12px"><tbody id="alias-rows"></tbody></table>
+    </div>
+    <div class="card">
+      <h2>网关设置</h2>
+      <div class="form-grid" style="grid-template-columns: 1.2fr 1fr 1.2fr auto">
+        <div><label>路由策略</label>
+          <select id="set-strategy"></select></div>
+        <div><label>模型主动探测</label>
+          <select id="set-probe"><option value="1">开启（推荐）</option><option value="0">关闭</option></select></div>
+        <div><label>429 限流预判（自学习水位）</label>
+          <select id="set-preempt"><option value="1">开启（推荐）</option><option value="0">关闭</option></select></div>
+        <div style="padding-bottom:0"><button class="btn primary" id="set-save">保存设置</button></div>
+      </div>
+      <p class="muted small" style="margin-top:8px; line-height:1.8">
+        四种策略都综合「智能档位 + 实测成功率 + 实测延迟」三项，只是权重不同（如：智能优先 = 0.6智能/0.3稳定/0.1速度；稳定优先 = 0.7稳定为主，但也参考智能与速度）。
+        429 限流预判：每撞一次 429 就记住「撞之前这一分钟/一天实际打过的量」，之后接近这个水位就提前换路，而不是等被打回再冷却。
+        能力档位是启发式估算（按模型名），可在 config.json 的 <span class="mono">model_tiers</span> 里用正则手动覆盖。
+      </p>
+    </div>
+    <div class="card">
+      <h2>配置迁移</h2>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+        <button class="btn" id="cfg-export-safe">导出（不含密钥）</button>
+        <button class="btn" id="cfg-export-full">导出（含密钥，谨慎）</button>
+        <span class="muted small">导出的文件保存在 api-hub 文件夹内</span>
+      </div>
+      <div style="margin-top:10px">
+        <label class="muted small" style="display:block;margin-bottom:4px">导入配置 JSON（粘贴到此处，渠道会追加合并）</label>
+        <textarea id="cfg-import-data" placeholder='把导出的 JSON 粘贴到这里…' style="min-height:60px"></textarea>
+        <div style="margin-top:8px"><button class="btn primary" id="cfg-import">导入</button></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 统计 -->
+  <section class="tab" id="tab-stats">
+    <div class="toolbar">
+      <select id="stat-days" style="width:120px">
+        <option value="1">最近 24 小时</option>
+        <option value="7" selected>最近 7 天</option>
+        <option value="30">最近 30 天</option>
+        <option value="90">最近 90 天</option>
+      </select>
+      <button class="btn" id="logs-refresh">↻ 请求日志</button>
+    </div>
+    <div class="stat-grid" id="stat-cards"></div>
+    <div class="card"><h2>每日请求量</h2><div class="chart" id="chart"></div></div>
+    <div class="card">
+      <h2>最近请求</h2>
+      <table>
+        <thead><tr><th style="width:150px">时间</th><th>请求模型</th><th>上游模型</th><th style="width:130px">渠道</th><th style="width:90px">延迟</th><th style="width:110px">Tokens</th><th style="width:70px">状态</th></tr></thead>
+        <tbody id="log-rows"></tbody>
+      </table>
+      <div class="empty" id="log-empty" style="display:none">还没有请求记录</div>
+    </div>
+    <div class="cols2">
+      <div class="card"><h2>按模型</h2><table><tbody id="stat-model"></tbody></table></div>
+      <div class="card"><h2>按渠道</h2><table><tbody id="stat-channel"></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- 测试台 -->
+  <section class="tab" id="tab-playground">
+    <div class="card">
+      <div class="form-grid" style="grid-template-columns: 1fr auto">
+        <div><label>模型（含别名）</label><select id="pg-model"></select></div>
+        <div style="padding-bottom:0"><button class="btn primary" id="pg-send">发送</button></div>
+      </div>
+      <div style="margin-top:12px">
+        <label class="muted small" style="display:block;margin-bottom:4px">消息</label>
+        <textarea id="pg-msg" placeholder="输入一条消息，直接测试网关与各渠道的真实可用性…"></textarea>
+      </div>
+      <pre id="pg-out" style="margin-top:12px; white-space:pre-wrap; display:none"></pre>
+    </div>
+  </section>
+
+  <!-- 网关用法 -->
+  <section class="tab" id="tab-guide">
+    <div class="card">
+      <h2>接入方式</h2>
+      <p class="muted" style="margin-bottom:12px">网关对外暴露标准 OpenAI 兼容接口，任何支持「自定义 OpenAI 地址」的工具都能直接用。服务只监听本机 127.0.0.1，不对外网开放。</p>
+      <h3>Base URL</h3>
+      <pre id="guide-url"></pre>
+      <h3 style="margin-top:14px">网关 Token（当 API Key 用）</h3>
+      <pre id="guide-token"></pre>
+      <h3 style="margin-top:14px">Python (openai 库)</h3>
+      <pre id="guide-py"></pre>
+      <h3 style="margin-top:14px">curl</h3>
+      <pre id="guide-curl"></pre>
+      <h3 style="margin-top:14px">自动切换规则</h3>
+      <p class="muted small" style="line-height:1.9">
+        · 请求按「可用渠道 → 延迟从低到高」的顺序尝试，失败自动换下一个渠道重试；<br>
+        · 失败的「模型 × 渠道」组合进入 120 秒冷却，冷却期内不再优先使用；<br>
+        · 健康检查每 10 分钟自动跑一次（可在 config.json 调整），也可手动点「刷新全部」；<br>
+        · 响应头 <span class="mono">X-Api-Hub-Channel</span> 会告诉你本次实际由哪个渠道服务。</p>
+      <h3 style="margin-top:14px">常用客户端配置（点击复制）</h3>
+      <div id="guide-snippets"></div>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const PRESETS = {zhipu:"智谱 GLM", openrouter:"OpenRouter", gemini:"Google Gemini", openai:"OpenAI", nim:"NVIDIA NIM", siliconflow:"硅基流动", groq:"Groq", cerebras:"Cerebras", mistral:"Mistral", cohere:"Cohere", modelscope:"魔搭 ModelScope", huggingface:"HuggingFace", together:"Together AI", zai:"智谱国际 Z.ai", agnes:"Agnes AI", custom:"自定义 (OpenAI 兼容)"};
+const STRATEGIES = {balanced:"均衡（稳定优先，兼顾速度）", quality:"智能优先（先强模型）", stability:"稳定优先（成功率最高）", speed:"速度优先（延迟最低）"};
+const MODEL_TIERS = {1:"轻量", 2:"中档", 3:"智能"};
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let overview = null, editingId = null;
+
+function toast(msg){ const t = $("#toast"); t.textContent = msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1800); }
+function copyText(s){ navigator.clipboard.writeText(s).then(()=>toast("已复制： "+s)).catch(()=>toast("复制失败")); }
+function fmtNum(n){ return Number(n||0).toLocaleString(); }
+function fmtLatency(ms){ return ms==null ? "—" : (ms>=1000 ? (ms/1000).toFixed(1)+"s" : ms+"ms"); }
+function fmtTime(ts){ return ts ? new Date(ts*1000).toLocaleString("zh-CN",{hour12:false}) : "—"; }
+function fmtQuota(q){
+  if (!q) return '<span class="muted small">本地统计（平台无余额接口）</span>';
+  if (q.kind === "error") return '<span class="small" style="color:var(--warn)">查询失败: '+esc(q.detail||"")+'</span>';
+  const u = q.unit || "";
+  let s = '<span class="quota-remaining">' + fmtNum(q.remaining) + " " + u + "</span>";
+  if (q.used != null) s += ' <span class="muted small">/ 已用 ' + fmtNum(q.used) + "</span>";
+  if (q.limit != null) s += ' <span class="muted small">/ 上限 ' + fmtNum(q.limit) + "</span>";
+  return s;
+}
+
+// ---- 标签页 ----
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("nav button").forEach(x=>x.classList.remove("active"));
+  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active"); $("#tab-"+b.dataset.tab).classList.add("active");
+  if (b.dataset.tab === "stats") { loadStats(); loadLogs(); }
+});
+$("#gw-url").onclick = () => copyText(overview?.gateway?.base_url || "");
+$("#refresh-btn").onclick = async () => {
+  $("#refresh-btn").textContent = "刷新中…";
+  try { await api("/api/refresh", {}); toast("已刷新模型与额度"); } catch(e){ toast("刷新失败: "+e.message); }
+  await loadOverview(); $("#refresh-btn").textContent = "↻ 刷新全部";
+};
+
+async function api(path, body, method){
+  const opt = body !== undefined
+    ? {method: method || "POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)}
+    : {};
+  const r = await fetch(path, opt);
+  if (!r.ok) throw new Error((await r.json().catch(()=>({detail:r.statusText}))).detail || r.statusText);
+  return r.json();
+}
+
+// ---- 总览 ----
+async function loadOverview(){
+  overview = await api("/api/overview");
+  const g = overview.gateway;
+  $("#gw-url").textContent = g.base_url;
+  if (g.auth_enabled && g.token){
+    $("#gw-token").style.display = "";
+    $("#gw-token").textContent = "Token: " + g.token.slice(0, 10) + "…";
+    $("#gw-token").onclick = () => copyText(g.token);
+  } else { $("#gw-token").style.display = "none"; }
+  renderGuide();
+  renderModels(); renderChannels(); renderAliases(); renderSettings();
+  migratePins();
+}
+
+function renderGuide(){
+  const g = (overview && overview.gateway) || {};
+  const base = g.base_url || "", tok = g.token || "";
+  $("#guide-url").textContent = base;
+  $("#guide-token").textContent = tok || "(鉴权已关闭)";
+  $("#guide-py").textContent =
+    'from openai import OpenAI\n' +
+    'client = OpenAI(base_url="' + base + '",\n' +
+    '                api_key="' + tok + '")\n' +
+    'resp = client.chat.completions.create(model="glm-4-flash",\n' +
+    '    messages=[{"role": "user", "content": "你好"}])\n' +
+    'print(resp.choices[0].message.content)';
+  $("#guide-curl").textContent =
+    'curl ' + base + '/chat/completions \\\n' +
+    '  -H "Content-Type: application/json" \\\n' +
+    '  -H "Authorization: Bearer ' + tok + '" \\\n' +
+    '  -d \'{"model":"glm-4-flash","messages":[{"role":"user","content":"你好"}]}\'';
+  // 常用客户端配置片段（借鉴 FreeLLMAPI 的 setup-* 思路）
+  const snippets = [
+    ["OpenAI 兼容工具（Cherry Studio / ChatBox / NextChat 等）",
+     'API 地址:  ' + base + '\nAPI Key:  ' + tok],
+    ["环境变量（OpenAI SDK 系工具通用）",
+     'export OPENAI_BASE_URL="' + base + '"\nexport OPENAI_API_KEY="' + tok + '"'],
+    ["Claude Code 等支持自定义网关的工具",
+     'Base URL: ' + base + '\nAPI Key:  ' + tok + '\n协议:     OpenAI 兼容 (/v1/chat/completions)'],
+  ];
+  $("#guide-snippets").innerHTML = snippets.map(([t, code], i) =>
+    `<h3 style="margin-top:10px">${t}</h3><pre class="click-copy" data-snip="${i}" title="点击复制">${esc(code)}</pre>`
+  ).join("");
+  document.querySelectorAll("#guide-snippets pre").forEach(p =>
+    p.onclick = () => copyText(snippets[+p.dataset.snip][1]));
+}
+
+// ---- 模型（分页；排序与状态逻辑见下方 MODEL_STATE 区块） ----
+const PAGE = {size: 100, n: 0};
+// ---- 模型：状态/收藏/搜索语法/排序 ----
+const MODEL_STATE = {sort: "balanced", showOk: true, showLimited: true};
+// 收藏持久化在后端 config.json（overview.pinned），不依赖浏览器 localStorage
+function pinList(){ return overview?.pinned || []; }
+function isPinned(id){ return pinList().includes(id); }
+async function togglePin(id){
+  const pinned = !isPinned(id);
+  // 乐观更新界面
+  if (!overview) overview = {};
+  overview.pinned = pinned
+    ? (pinList().concat([id]))
+    : pinList().filter(x => x !== id);
+  renderModels();
+  try { await api("/api/pins", {model: id, pinned}); }
+  catch(e){ toast("收藏保存失败: "+e.message); await loadOverview(); }
+}
+// 迁移旧版 localStorage 收藏 → 后端
+async function migratePins(){
+  try {
+    const old = JSON.parse(localStorage.getItem("ah_pins") || "[]");
+    if (old.length && overview && !overview.pinned) overview.pinned = [];
+    if (old.length){
+      const cur = overview?.pinned || [];
+      for (const m of old){ if (!cur.includes(m)){ cur.push(m); await api("/api/pins", {model: m, pinned: true}); } }
+      localStorage.removeItem("ah_pins");
+      toast(`已迁移 ${old.length} 个收藏`);
+      await loadOverview();
+    }
+  } catch(e){ /* 忽略 */ }
+}
+function syncChips(){
+  document.querySelectorAll("#sort-chips .chip-btn").forEach(b =>
+    b.classList.toggle("active", b.dataset.sort === MODEL_STATE.sort));
+  $("#show-ok-btn").classList.toggle("active", MODEL_STATE.showOk);
+  $("#show-limited-btn").classList.toggle("active", MODEL_STATE.showLimited);
+}
+$("#show-ok-btn").onclick = () => { MODEL_STATE.showOk = !MODEL_STATE.showOk; syncChips(); renderModels(); };
+$("#show-limited-btn").onclick = () => { MODEL_STATE.showLimited = !MODEL_STATE.showLimited; syncChips(); renderModels(); };
+document.querySelectorAll("#sort-chips .chip-btn").forEach(b =>
+  b.onclick = () => {
+    MODEL_STATE.sort = b.dataset.sort;
+    if (overview){
+      if (!overview.settings) overview.settings = {};
+      overview.settings.route_strategy = MODEL_STATE.sort;
+    }
+    syncChips(); renderModels();
+    api("/api/settings", {route_strategy: MODEL_STATE.sort}).catch(()=>{});
+  });
+
+// 排序：收藏置顶 → 可用(ok) → 受限(limited) → 策略加权综合分 → 版本号 → 名称
+// 每种策略都同时考虑 智能(档位)/稳定(实测成功率)/速度(延迟)，只是权重不同（与后端 _STRATEGY_WEIGHTS 一致）
+const STRAT_W = {
+  quality:   [0.60, 0.30, 0.10],   // 智能优先
+  balanced:  [0.35, 0.40, 0.25],   // 均衡
+  stability: [0.20, 0.70, 0.10],   // 稳定优先
+  speed:     [0.10, 0.25, 0.65],   // 速度优先
+};
+const CAP_NORM = {3: 1.0, 2: 0.6, 1: 0.25};
+function compScore(m){
+  const s = overview?.settings?.route_strategy || "balanced";
+  const w = STRAT_W[s] || STRAT_W.balanced;
+  const cap = CAP_NORM[m.tier] ?? 0.6;
+  const lat = bestLat(m);
+  const spd = isFinite(lat) ? 400 / (400 + lat) : 0;
+  return w[0] * cap + w[1] * bestScore(m) + w[2] * spd;
+}
+function modelSort(a, b){
+  const pa = isPinned(a.id), pb = isPinned(b.id);
+  if (pa !== pb) return pa ? -1 : 1;
+  const rank = {ok: 0, limited: 1};
+  const sa = a.status || "ok", sb = b.status || "ok";
+  if (rank[sa] !== rank[sb]) return rank[sa] - rank[sb];
+  const d = compScore(b) - compScore(a);
+  if (d) return d;
+  return _versionCmp(a.id, b.id) || a.id.localeCompare(b.id);
+}
+// 从模型名末尾提取版本号（如 kimi-k3→3, kimi-k2.6→2.6, deepseek-v4-pro-0813→813）
+// 1) 先剥掉参数大小尾巴（8b/405b/671B 等），避免把参数量误当版本号
+// 2) 再取末尾最后出现的数字（含小数/整数/长数字），数字越大版本越新
+// 从模型名末尾提取版本号，数字越大版本越靠前
+function _versionCmp(a, b){
+  const va = _lastVersion(a), vb = _lastVersion(b);
+  if (va !== null && vb !== null && va !== vb) return vb - va;
+  return 0;
+}
+function _lastVersion(s){
+  const trimmed = s.replace(/-\d+[bB](?=[^\d.]|$)/g, '');
+  const re = /(\d+(?:\.\d+)+|\d+)/g;
+  let m, val = null;
+  while ((m = re.exec(trimmed)) !== null) val = parseFloat(m[1]);
+  return val;
+}
+function bestLat(m){ return Math.min(...(m.channels||[]).filter(c=>c.available).map(c=>c.latency_ms ?? Infinity)); }
+function bestScore(m){ return Math.max(...(m.channels||[]).map(c=>c.score ?? 0)); }
+
+// 搜索语法：裸词匹配模型名；provider:x 筛渠道；v: 筛视觉；t:3 筛档位
+function kwMatch(m, tokens){
+  if (!tokens.length) return true;
+  return tokens.every(t => {
+    const tq = t.toLowerCase();
+    if (tq === "v" || tq.startsWith("v:")) {
+      if (tq === "v") return m.vision;
+      const want = tq.slice(2) === "no" ? false : true;
+      return m.vision === want;
+    }
+    if (tq.startsWith("t:") || tq.startsWith("tier:")) {
+      const n = parseInt(tq.split(":")[1], 10);
+      return m.tier === n;
+    }
+    if (tq.startsWith("provider:") || tq.startsWith("p:")) {
+      const v = tq.split(":")[1] || "";
+      return (m.channels||[]).some(c => (c.channel_name||"").toLowerCase().includes(v));
+    }
+    return (m.id||"").toLowerCase().includes(tq);
+  });
+}
+
+function renderModels(){
+  const kw = $("#model-search").value.trim();
+  const tokens = kw ? kw.toLowerCase().split(/\s+/) : [];
+  const aliases = (overview?.aliases || []).map(a => ({
+    id: a.name, available: a.available, isAlias: true,
+    status: a.available ? "ok" : "limited",
+    tier: 2, channel_count: a.targets.length, channels: [], targets: a.targets }));
+  const all = [...aliases, ...(overview?.models || [])].filter(m => m.status !== "down");
+  // 先算可见计数（未按 ok/受限 开关收窄，供 chip 文案与空态提示）
+  const okN = all.filter(m => m.status === "ok" && kwMatch(m, tokens)).length;
+  const limN = all.filter(m => m.status === "limited" && kwMatch(m, tokens)).length;
+  const filtered = all
+    .filter(m => kwMatch(m, tokens))
+    .filter(m => (m.status === "ok" && MODEL_STATE.showOk) || (m.status === "limited" && MODEL_STATE.showLimited))
+    .sort(modelSort);
+  const total = filtered.length;
+  const maxPage = Math.max(0, Math.ceil(total / PAGE.size) - 1);
+  if (PAGE.n > maxPage) PAGE.n = maxPage;
+  const rows = filtered.slice(PAGE.n * PAGE.size, (PAGE.n + 1) * PAGE.size);
+  $("#model-count").textContent = `可用 ${okN} · 受限 ${limN}`;
+  $("#model-empty").style.display = total ? "none" : "block";
+  $("#model-empty").textContent = !okN && !limN
+    ? "还没有模型。请到「渠道」页添加渠道，保存后会自动测试连接；再点「扫描全部模型」确认哪些真能免费调用。"
+    : (MODEL_STATE.showOk && !MODEL_STATE.showLimited && limN
+        ? `另有 ${limN} 个模型暂时受限（限流/冷却中），点上方「受限」查看。`
+        : "当前筛选下没有符合条件的模型，试试调整上方的「可用/受限」开关或搜索词。");
+  $("#pg-info").textContent = total ? `${PAGE.n*PAGE.size+1}-${PAGE.n*PAGE.size+rows.length} / ${total}` : "";
+  $("#model-rows").innerHTML = rows.map((m, i) => {
+    const lat = bestLat(m);
+    const st = m.status === "ok" ? "ok" : "limited";
+    const stLabel = st === "ok" ? "免费可调" : "受限：暂时限流/冷却中";
+    const stTitle = st === "ok"
+      ? (m.test_ts ? `上次实测可调 ${fmtTime(m.test_ts)}` : "渠道健康、未做单模型实测")
+      : (m.test_reason || "限流/冷却中，稍后可恢复");
+    const stChip = st === "limited" ? '<span class="tag-chip" style="color:var(--warn); border-color:var(--warn)">受限</span>' : "";
+    // 特点 chips
+    const chips = [];
+    chips.push(MODEL_TIERS[m.tier] ? `<span class="tag-chip ok">${MODEL_TIERS[m.tier]}</span>` : `<span class="tag-chip">中档</span>`);
+    chips.push(isFinite(lat) ? `<span class="tag-chip">${fmtLatency(lat)}</span>` : `<span class="tag-chip">—</span>`);
+    if (m.vision) chips.push('<span class="tag-chip ok">视觉</span>');
+    if (m.context) chips.push(`<span class="tag-chip">${esc(m.context)}</span>`);
+    const u = m.usage24 || {};
+    if (u.requests) chips.push(`<span class="tag-chip">24h ${u.requests} 次</span>`);
+    // 来源渠道 chips（≤3 个与特点同一行，≥4 才换行）
+    const srcChips = (m.channels || []).slice(0, 4).map(c =>
+      `<span class="tag-chip ${c.available?'ok':''}" title="可用率 ${Math.round((c.score??0.7)*100)}% · ${fmtLatency(c.latency_ms)}">${esc(c.channel_name)}${(c.score!=null)?` ·${Math.round((c.score*100))}%`:''}</span>`).join("");
+    const more = (m.channels||[]).length > 4 ? `<span class="tag-chip">+${(m.channels||[]).length-4}</span>` : "";
+    const chChips = (m.channels || []).length ? srcChips + more : "";
+    const pinBtn = `<button class="btn${isPinned(m.id)?' pinned':''}" style="padding:4px 8px" title="收藏置顶（★=已收藏）" onclick="togglePin('${esc(m.id)}')">${isPinned(m.id)?'★':'☆'}</button>`;
+    const oneline = (m.channels||[]).length <= 3;
+    return `<tr>
+      <td class="muted small" style="width:44px">${PAGE.n*PAGE.size+i+1}</td>
+      <td>
+        <span class="light-dot ${st}" title="${esc(stTitle)}"></span>
+        <b style="font-size:14px" class="mono click-copy" onclick="copyText('${esc(m.id)}')" title="点击复制">${esc(m.id)}</b>
+        ${m.isAlias?' <span class="badge">别名</span>':''}${stChip}
+      </td>
+      <td><div class="small" style="display:flex; gap:5px; flex-wrap:wrap">${chips.join("")}${oneline ? (chChips ? '<span class="tag-sep"></span>' + chChips : "") : ""}</div>
+          ${(!oneline && chChips) ? '<div class="small" style="display:flex; gap:5px; flex-wrap:wrap; margin-top:6px">'+chChips+'</div>' : ''}</td>
+      <td style="white-space:nowrap"><span style="display:inline-flex; gap:6px">${pinBtn}<button class="btn" onclick="testModel('${esc(m.id)}', this)" ${m.isAlias?'disabled':''}>测试</button></span></td>
+    </tr>`;
+  }).join("");
+  // 测试台模型下拉：只列「当前可调」模型，按当前路由策略排序
+  const cur = $("#pg-model").value;
+  const opts = all.filter(m => m.status === "ok").sort(modelSort)
+    .map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`);
+  $("#pg-model").innerHTML = opts.join("") || '<option value="">（暂无可用模型）</option>';
+  if (cur && opts.find(o => o.includes(`value="${esc(cur)}"`))) $("#pg-model").value = cur;
+}
+$("#model-search").oninput = renderModels;
+$("#pg-prev").onclick = () => { if (PAGE.n > 0){ PAGE.n--; renderModels(); } };
+$("#pg-next").onclick = () => { const total = (overview?.models||[]).length + (overview?.aliases||[]).length;
+  if ((PAGE.n+1) * PAGE.size < total){ PAGE.n++; renderModels(); } };
+
+// ---- 单模型测试（按钮） ----
+async function testModel(model, btn){
+  if (btn) { btn.disabled = true; btn.textContent = "..."; }
+  try {
+    const r = await api("/api/models/test", {model});
+    toast(r.available ? `✔ ${model} 可用 · ${r.channel||""} ${fmtLatency(r.latency_ms||0)}`
+                       : `✘ ${model} 不可用：${(r.error||"").slice(0,120)}`);
+    await loadOverview();
+  } catch(e){ toast("测试失败："+e.message); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = "测试"; } }
+}
+// 批量：对当前显示页里未测试的模型各发一次
+$("#pg-test-all").onclick = async () => {
+  const targets = (overview?.models||[]).filter(m => !m.tested && m.any_channel_available);
+  if (!targets.length) { toast("没有未测试的模型"); return; }
+  if (!confirm(`将对 ${targets.length} 个未测试模型各发一次 1 token 探测（会消耗少量额度），继续？`)) return;
+  const btn = $("#pg-test-all"); btn.disabled = true; btn.textContent = "测试中…";
+  let ok = 0, fail = 0;
+  for (const m of targets){
+    try {
+      const r = await api("/api/models/test", {model: m.id});
+      if (r.available) ok++; else fail++;
+    } catch { fail++; }
+  }
+  btn.disabled = false; btn.textContent = "测试未测模型";
+  toast(`完成：可用 ${ok} 个，不可用 ${fail} 个`);
+  await loadOverview();
+};
+
+// ---- 设置 ----
+function initSettings(){
+  const sel = $("#set-strategy");
+  sel.innerHTML = Object.entries(STRATEGIES).map(([k,v])=>`<option value="${k}">${v}</option>`).join("");
+}
+function renderSettings(){
+  const s = overview?.settings || {};
+  const cur = s.route_strategy || "balanced";
+  if (!$("#set-strategy").value || !STRATEGIES[$("#set-strategy").value]) $("#set-strategy").value = STRATEGIES[cur] ? cur : "balanced";
+  $("#set-strategy").value = cur;
+  $("#set-probe").value = s.probe_used_models === false ? "0" : "1";
+  $("#set-preempt").value = s.adaptive_preemption === false ? "0" : "1";
+  // 同步模型页排序 chip 状态
+  MODEL_STATE.sort = STRATEGIES[cur] ? cur : "balanced";
+  syncChips();
+}
+// 排序 chip 处理已在上方统一绑定
+$("#set-save").onclick = async () => {
+  try {
+    await api("/api/settings", {route_strategy: $("#set-strategy").value,
+                                probe_used_models: $("#set-probe").value === "1",
+                                adaptive_preemption: $("#set-preempt").value === "1"});
+    toast("设置已保存并生效"); await loadOverview();
+  } catch(e){ toast("保存失败: "+e.message); }
+};
+// ---- 配置迁移 ----
+async function cfgExport(include_keys){
+  if (include_keys && !confirm("导出的文件将包含所有密钥明文，务必妥善保管、不要公开分享。确认导出？")) return;
+  try { const r = await api("/api/config/export", {include_keys}); toast("已导出到: " + r.path); }
+  catch(e){ toast("导出失败: "+e.message); }
+}
+$("#cfg-export-safe").onclick = () => cfgExport(false);
+$("#cfg-export-full").onclick = () => cfgExport(true);
+$("#cfg-import").onclick = async () => {
+  const data = $("#cfg-import-data").value.trim();
+  if (!data) { toast("请先粘贴导出的 JSON"); return; }
+  if (!confirm("导入会追加渠道与别名，是否继续？")) return;
+  try { const r = await api("/api/config/import", {data}); toast(`导入完成：新增 ${r.added} 个渠道`); $("#cfg-import-data").value=""; await loadOverview(); }
+  catch(e){ toast("导入失败: "+e.message); }
+};
+
+// ---- 渠道级扫描全部模型 ----
+const scanState = {running: false};
+async function scanChannel(cid){
+  if (scanState.running){ toast("已有扫描在进行中"); return; }
+  const ch = (overview?.channels||[]).find(c=>c.id===cid);
+  if (!ch){ toast("渠道不存在"); return; }
+  // 收集该渠道名下未测过的模型；全测过就提示
+  const models = overview?.models||[];
+  const untested = models.filter(m => (m.channels||[]).some(c=>c.channel_id===cid) && !m.tested);
+  const targets = untested.map(m=>m.id);
+  const N = targets.length;
+  if (!N){ toast("该渠道的模型都已测过，无需重复扫描"); return; }
+  if (N > 50 && !confirm(`该渠道有 ${N} 个模型未测。探测约需 ${Math.round(N*0.8)}-${N*2} 秒；失败探测不耗 token，成功的每个约 1 token。继续？`)) return;
+  const prog = $("#scanprog-"+cid);
+  const btn = $("#scan-btn-"+cid);
+  btn.disabled = true; btn.textContent = "扫描中…";
+  prog.style.display = ""; prog.style.color = "var(--muted)";
+  prog.textContent = `准备扫描 ${N} 个模型…`;
+  scanState.running = true;
+  let done = 0, ok = 0, fail = 0;
+  const worker = async () => {
+    while (true){
+      const m = targets[done];
+      if (m === undefined) return;
+      done++;
+      try {
+        const r = await api("/api/models/test", {model: m, channel_id: cid});
+        if (r.available) ok++; else fail++;
+      } catch { fail++; }
+      prog.textContent = `扫描中 ${done}/${N} · 可用 ${ok} · 不可用 ${fail}`;
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+  scanState.running = false;
+  prog.style.color = ok ? "var(--ok)" : "var(--bad)";
+  prog.textContent = `扫描完成：${N} 个模型，可用 ${ok}，不可用 ${fail}`;
+  btn.disabled = false; btn.textContent = "扫描全部模型";
+  toast(`扫描完成：可用 ${ok} / ${N}`);
+  await loadOverview();
+}
+
+// ---- 别名 ----
+$("#al-add").onclick = async () => {
+  const name = $("#al-name").value.trim();
+  const targets = $("#al-targets").value.split(",").map(s=>s.trim()).filter(Boolean);
+  if (!name || !targets.length) { toast("别名和目标模型都要填"); return; }
+  if (name.includes("/")) { toast("别名不能包含 /"); return; }
+  try {
+    await api("/api/aliases", {name, targets});
+    toast("别名已添加"); $("#al-name").value=""; $("#al-targets").value="";
+    await loadOverview();
+  } catch(e){ toast("添加失败: "+e.message); }
+};
+function renderAliases(){
+  const list = overview?.aliases || [];
+  $("#alias-rows").innerHTML = list.length ? list.map(a => `<tr>
+      <td class="mono">${esc(a.name)}</td>
+      <td class="muted small">${esc(a.targets.join("、"))}</td>
+      <td style="width:80px"><span class="dot ${a.available?'on':'off'}"></span>${a.available?'可用':'不可用'}</td>
+      <td style="width:70px"><button class="btn danger" onclick="delAlias('${esc(a.name)}')">删除</button></td>
+    </tr>`).join("") : '<tr><td class="empty">暂无别名。不同平台的同一模型可以用别名归并成组。</td></tr>';
+}
+async function delAlias(name){
+  if (!confirm("删除别名 " + name + "？")) return;
+  try { await api("/api/aliases/"+encodeURIComponent(name), undefined, "DELETE"); await loadOverview(); toast("已删除"); }
+  catch(e){ toast(e.message); }
+}
+
+// ---- 渠道 ----
+function initChannelForm(){
+  const sel = $("#ch-type");
+  sel.innerHTML = Object.entries(PRESETS).map(([k,v])=>`<option value="${k}">${v}</option>`).join("");
+  const sync = () => {
+    $("#ch-base").value = DEFAULT_BASE[sel.value] || "";
+    const url = KEY_URLS[sel.value] || "";
+    const link = $("#ch-keylink");
+    if (url){ link.href = url; link.style.display = ""; }
+    else { link.removeAttribute("href"); link.style.display = "none"; }
+  };
+  sel.onchange = sync;
+  sync();
+}
+const DEFAULT_BASE = {
+  zhipu:"https://open.bigmodel.cn/api/paas/v4",
+  openrouter:"https://openrouter.ai/api/v1",
+  gemini:"https://generativelanguage.googleapis.com/v1beta/openai",
+  openai:"https://api.openai.com/v1",
+  nim:"https://integrate.api.nvidia.com/v1",
+  siliconflow:"https://api.siliconflow.cn/v1",
+  groq:"https://api.groq.com/openai/v1",
+  cerebras:"https://api.cerebras.ai/v1",
+  mistral:"https://api.mistral.ai/v1",
+  cohere:"https://api.cohere.ai/compatibility/v1",
+  modelscope:"https://api-inference.modelscope.cn/v1",
+  huggingface:"https://router.huggingface.co/v1",
+  together:"https://api.together.xyz/v1",
+  zai:"https://api.z.ai/api/paas/v4",
+  agnes:"https://apihub.agnes-ai.com/v1",
+  custom:""};
+// 各平台官方 API Key 申请页（平台改版可能失效）
+const KEY_URLS = {
+  zhipu:"https://open.bigmodel.cn/usercenter/apikeys",
+  openrouter:"https://openrouter.ai/settings/keys",
+  gemini:"https://aistudio.google.com/apikey",
+  openai:"https://platform.openai.com/api-keys",
+  nim:"https://build.nvidia.com/",
+  siliconflow:"https://cloud.siliconflow.cn/account/ak",
+  groq:"https://console.groq.com/keys",
+  cerebras:"https://cloud.cerebras.ai/platform/api-keys",
+  mistral:"https://console.mistral.ai/api-keys",
+  cohere:"https://dashboard.cohere.com/api-keys",
+  modelscope:"https://modelscope.cn/my/myapitoken",
+  huggingface:"https://huggingface.co/settings/tokens",
+  together:"https://api.together.ai/settings/api-keys",
+  zai:"https://docs.z.ai/guides/llm/zai-api-key",
+  agnes:"https://agnes-ai.com/doc/quickstart",
+  custom:""};
+
+function renderChannels(){
+  const list = overview?.channels || [];
+  $("#channel-list").innerHTML = list.map(ch => {
+    let st, color = "var(--muted)";
+    if (!ch.enabled) st = '已停用';
+    else if (ch.valid === true) { st = '连接正常'; color = "var(--ok)"; }
+    else if (ch.valid === false) { st = '连接失败'; color = "var(--bad)"; }
+    else st = '未检测';
+    const stCls = ch.valid===true ? "on" : (ch.valid===false ? "off" : "unknown");
+    const quota = ch.enabled ? fmtQuota(ch.quota) : '<span class="muted small">—</span>';
+    return `<div class="card">
+      <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap">
+        <strong>${esc(ch.name)}</strong>
+        <span class="badge">${PRESETS[ch.type]||ch.type}</span>
+        <span class="small" style="color:${color}; display:flex; align-items:center"><span class="dot ${stCls}"></span>${st}</span>
+        <span class="muted small">${fmtLatency(ch.latency_ms)} · ${ch.models_count} 个模型（可用 ${ch.models_available_count ?? 0}）· 检查于 ${fmtTime(ch.last_check)}</span>
+        <span style="margin-left:auto; display:flex; gap:8px">
+          <button class="btn" onclick="testCh('${ch.id}')">测试</button>
+          <button class="btn" onclick="scanChannel('${ch.id}')" id="scan-btn-${ch.id}">扫描全部模型</button>
+          <button class="btn" onclick="quotaCh('${ch.id}')">刷新额度</button>
+          <button class="btn" onclick="editCh('${ch.id}')">编辑</button>
+          <button class="btn" onclick="toggleCh('${ch.id}', ${!ch.enabled})">${ch.enabled?"停用":"启用"}</button>
+          <button class="btn danger" onclick="delCh('${ch.id}')">删除</button>
+        </span>
+      </div>
+      <div class="mono small muted" style="margin-bottom:6px">${esc(ch.base_url)} · Key: ${esc(ch.key_masked)}</div>
+      <div class="small scan-prog" id="scanprog-${ch.id}" style="display:none; margin-bottom:6px"></div>
+      ${ch.error ? `<div class="small" style="color:var(--bad); margin-bottom:6px">${esc(ch.error)}</div>` : ""}
+      ${ch.quota_error ? `<div class="small" style="color:var(--warn); margin-bottom:6px">额度: ${esc(ch.quota_error)}</div>` : ""}
+      <div class="small">额度: ${quota} <span class="muted">（${fmtTime(ch.quota_ts)}）</span></div>
+    </div>`;
+  }).join("") || '<div class="card empty">还没有渠道，用上面的表单添加第一个。</div>';
+}
+
+function setChResult(html, color){
+  const el = $("#ch-result");
+  el.innerHTML = html; el.style.color = color || "";
+}
+function formBody(){
+  const b = { type: $("#ch-type").value, name: $("#ch-name").value,
+    base_url: $("#ch-base").value, api_key: $("#ch-key").value, enabled: $("#ch-enabled").checked };
+  if (editingId && !b.api_key) delete b.api_key;  // 编辑留空=不修改
+  return b;
+}
+$("#ch-save").onclick = async () => {
+  const btn = $("#ch-save");
+  btn.disabled = true; setChResult("保存中…", "var(--muted)");
+  try {
+    let id = editingId;
+    if (id) { await api("/api/channels/"+id, formBody(), "PUT"); toast("已更新"); }
+    else { const r = await api("/api/channels", formBody()); id = r.id; toast("已添加"); }
+    // 保存后自动做一次连接测试，结果直接显示在表单旁
+    try {
+      const r = await api(`/api/channels/${id}/test`, {});
+      setChResult(r.valid
+        ? `✔ 连接正常 · ${r.models_count} 个模型 · ${fmtLatency(r.latency_ms)}`
+        : `✘ 连接失败：${esc((r.error||"").slice(0,120))}`,
+        r.valid ? "var(--ok)" : "var(--bad)");
+    } catch(e){ setChResult("已保存，但自动测试失败："+esc(e.message), "var(--warn)"); }
+    resetForm(); await loadOverview();
+  } catch(e){
+    setChResult("✘ 保存失败："+esc(e.message), "var(--bad)");
+  }
+  btn.disabled = false;
+};
+$("#ch-test").onclick = async () => {
+  const btn = $("#ch-test");
+  btn.disabled = true; setChResult("测试中…", "var(--muted)");
+  try {
+    const r = await api("/api/channels/test-connection", formBody());
+    setChResult(r.valid
+      ? `✔ 连接正常 · ${r.models_count} 个模型 · ${fmtLatency(r.latency_ms)}`
+      : `✘ 连接失败：${esc((r.error||"").slice(0,150))}`,
+      r.valid ? "var(--ok)" : "var(--bad)");
+  } catch(e){ setChResult("✘ 测试失败："+esc(e.message), "var(--bad)"); }
+  btn.disabled = false;
+};
+$("#ch-cancel").onclick = resetForm;
+function resetForm(){ editingId = null; $("#ch-form-title").textContent="添加渠道";
+  $("#ch-name").value=""; $("#ch-key").value=""; $("#ch-base").value=DEFAULT_BASE[$("#ch-type").value]||"";
+  $("#ch-enabled").checked=true; $("#ch-cancel").style.display="none"; setChResult(""); }
+function editCh(id){
+  const ch = (overview?.channels||[]).find(c=>c.id===id); if(!ch) return;
+  editingId = id; $("#ch-form-title").textContent = "编辑渠道";
+  $("#ch-type").value = ch.type; $("#ch-name").value = ch.name;
+  $("#ch-base").value = ch.base_url; $("#ch-key").value = ""; $("#ch-key").placeholder = "留空则不修改";
+  $("#ch-enabled").checked = ch.enabled; $("#ch-cancel").style.display="inline-block";
+  window.scrollTo({top:0, behavior:"smooth"});
+}
+async function testCh(id){ toast("测试中…"); try{ const r = await api(`/api/channels/${id}/test`,{});
+  toast(r.valid ? `有效 · ${r.models_count} 个模型 · ${fmtLatency(r.latency_ms)}` : "无效: "+(r.error||"").slice(0,80)); await loadOverview(); }catch(e){toast(e.message);} }
+async function quotaCh(id){ try{ await api(`/api/channels/${id}/quota`,{}); toast("额度已刷新"); await loadOverview(); }catch(e){toast(e.message);} }
+async function toggleCh(id, enabled){ try{ await api("/api/channels/"+id, {enabled}, "PUT"); await loadOverview(); }catch(e){toast(e.message);} }
+async function delCh(id){ if(!confirm("确定删除该渠道？")) return;
+  try{ await api("/api/channels/"+id, undefined, "DELETE"); await loadOverview(); toast("已删除"); }catch(e){toast(e.message);} }
+
+// ---- 统计 ----
+async function loadStats(){
+  const days = $("#stat-days").value;
+  const s = await api("/api/usage?days="+days, undefined, "GET");
+  const t = s.totals || {};
+  const okCount = t.requests - t.errors;
+  const rate = t.requests ? (okCount*100/t.requests).toFixed(1)+"%" : "—";
+  $("#stat-cards").innerHTML = `
+    <div class="stat"><div class="num">${fmtNum(t.requests)}</div><div class="lbl">总请求数</div></div>
+    <div class="stat"><div class="num">${fmtNum(t.tokens)}</div><div class="lbl">总 Tokens</div></div>
+    <div class="stat"><div class="num" style="color:${t.errors?'var(--bad)':'inherit'}">${fmtNum(t.errors)}</div><div class="lbl">失败请求</div></div>
+    <div class="stat"><div class="num">${rate}</div><div class="lbl">成功率</div></div>`;
+  // 柱状图
+  const daily = s.daily || [];
+  const max = Math.max(1, ...daily.map(d=>d.requests));
+  $("#chart").innerHTML = daily.length ? daily.map(d => `
+    <div class="bar-wrap" title="${d.date}：${d.requests} 次请求，${fmtNum(d.tokens)} tokens，${d.errors} 次失败">
+      <div class="bar ${d.errors?'err':''}" style="height:${Math.max(2, d.requests*100/max)}%"></div>
+      <div class="bar-lbl">${d.date?.slice(5)}</div></div>`).join("")
+    : '<div class="empty">暂无数据</div>';
+  const rows = (arr, nameKey) => arr.length ? arr.map(r => `<tr>
+      <td class="mono">${esc(r[nameKey])}</td><td>${fmtNum(r.requests)} 次</td>
+      <td>${fmtNum(r.tokens)} tk</td><td class="muted small">${r.avg_latency?fmtLatency(Math.round(r.avg_latency)):"—"}</td></tr>`).join("")
+    : '<tr><td class="empty">暂无数据</td></tr>';
+  $("#stat-model").innerHTML = rows(s.by_model||[], "model");
+  $("#stat-channel").innerHTML = rows(s.by_channel||[], "name");
+}
+$("#stat-days").onchange = loadStats;
+
+// ---- 请求日志 ----
+async function loadLogs(){
+  const s = await api("/api/logs?limit=50", undefined, "GET");
+  const logs = s.logs || [];
+  $("#log-empty").style.display = logs.length ? "none" : "block";
+  $("#log-rows").innerHTML = logs.map(l => {
+    const err = l.error ? ' title="'+esc(l.error)+'"' : "";
+    const req = esc(l.model);
+    const used = l.upstream_model && l.upstream_model !== l.model
+      ? `<span class="mono small" style="color:var(--accent-dim)">${esc(l.upstream_model)}</span>`
+      : '<span class="muted small">同</span>';
+    return `<tr${err}>
+      <td class="muted small">${fmtTime(l.ts)}</td>
+      <td class="mono small">${req}</td>
+      <td class="small">${used}</td>
+      <td class="small">${esc(l.channel_name||"—")}</td>
+      <td>${fmtLatency(l.latency_ms)}</td>
+      <td>${fmtNum(l.prompt_tokens+l.completion_tokens)}</td>
+      <td>${l.success?'<span style="color:var(--ok)">成功</span>':'<span style="color:var(--bad)" title="点击看详情">失败</span>'}</td>
+    </tr>`;
+  }).join("");
+}
+$("#logs-refresh").onclick = loadLogs;
+
+// ---- 测试台 ----
+$("#pg-send").onclick = async () => {
+  const model = $("#pg-model").value;
+  const msg = $("#pg-msg").value.trim();
+  if (!model) { toast("暂无可用模型"); return; }
+  if (!msg) { toast("请输入消息"); return; }
+  const btn = $("#pg-send"), out = $("#pg-out");
+  btn.disabled = true; btn.textContent = "请求中…";
+  out.style.display = ""; out.textContent = "等待响应…";
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: {"Content-Type": "application/json",
+                "Authorization": "Bearer " + (overview?.gateway?.token || "")},
+      body: JSON.stringify({model, messages:[{role:"user", content:msg}]})
+    });
+    const data = await r.json().catch(()=>({}));
+    const lat = Math.round(performance.now() - t0);
+    if (!r.ok) {
+      out.textContent = "✕ 失败 (HTTP " + r.status + ")\n" + (data.detail || JSON.stringify(data));
+    } else {
+      const ch = r.headers.get("X-Api-Hub-Channel") || "?";
+      const text = data.choices?.[0]?.message?.content || "(空响应)";
+      const u = data.usage || {};
+      out.textContent = text + "\n\n————————————————\n"
+        + "渠道: " + ch + " · 延迟: " + lat + "ms · tokens: "
+        + (u.prompt_tokens||0) + " + " + (u.completion_tokens||0);
+    }
+  } catch(e){ out.textContent = "✕ 请求异常: " + e.message; }
+  btn.disabled = false; btn.textContent = "发送";
+};
+
+// ---- 启动 ----
+initChannelForm(); initSettings(); syncChips(); resetForm();
+loadOverview().catch(e => toast("加载失败: "+e.message));
+setInterval(() => loadOverview().catch(()=>{}), 30000);
+// 启动后渠道健康检查要几秒才完成：初始若没有渠道/模型，就加快轮询直到出现（最多约 30 秒）
+(async function waitForChannels(){
+  for (let i = 0; i < 12; i++){
+    if ((overview?.channels || []).length) return;
+    await new Promise(r => setTimeout(r, 2500));
+    try { await loadOverview(); } catch(e) { /* 服务可能仍在起，忽略 */ }
+  }
+})();
+</script>
+</body>
+</html>

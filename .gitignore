@@ -1,0 +1,11 @@
+# API Key 与本地数据，勿公开
+config.json
+.venv/
+data/
+__pycache__/
+*.pyc
+api-hub-export-*.json
+.pytest_cache/
+
+# 内部评估报告，不入库
+项目综合评估.md
