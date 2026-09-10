@@ -306,7 +306,8 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   document.querySelectorAll("nav button").forEach(x=>x.classList.remove("active"));
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
   b.classList.add("active"); $("#tab-"+b.dataset.tab).classList.add("active");
-  if (b.dataset.tab === "stats") { loadStats(); loadLogs(); }
+  if (b.dataset.tab === "stats") { loadStats(); loadLogs(false); startLogPolling(); }
+  else { stopLogPolling(); }
 });
 $("#gw-url").onclick = () => copyText(overview?.gateway?.base_url || "");
 
@@ -925,17 +926,20 @@ async function loadStats(){
 $("#stat-days").onchange = loadStats;
 
 // ---- 请求日志 ----
-async function loadLogs(){
-  const s = await api("/api/logs?limit=50", undefined, "GET");
-  const logs = s.logs || [];
-  $("#log-empty").style.display = logs.length ? "none" : "block";
-  $("#log-rows").innerHTML = logs.map(l => {
-    const err = l.error ? ' title="'+esc(l.error)+'"' : "";
-    const req = esc(l.model);
-    const used = l.upstream_model && l.upstream_model !== l.model
-      ? `<span class="mono small" style="color:var(--accent-dim)">${esc(l.upstream_model)}</span>`
-      : '<span class="muted small">同</span>';
-    return `<tr${err}>
+async function loadLogs(silent){
+  const btn = $("#logs-refresh");
+  if (!silent && btn) { btn.disabled = true; btn.textContent = "加载中…"; }
+  try {
+    const s = await api("/api/logs?limit=50", undefined, "GET");
+    const logs = s.logs || [];
+    $("#log-empty").style.display = logs.length ? "none" : "block";
+    $("#log-rows").innerHTML = logs.map(l => {
+      const err = l.error ? ' title="'+esc(l.error)+'"' : "";
+      const req = esc(l.model);
+      const used = l.upstream_model && l.upstream_model !== l.model
+        ? `<span class="mono small" style="color:var(--accent-dim)">${esc(l.upstream_model)}</span>`
+        : '<span class="muted small">同</span>';
+      return `<tr${err}>
       <td class="muted small">${fmtTime(l.ts)}</td>
       <td class="mono small">${req}</td>
       <td class="small">${used}</td>
@@ -944,9 +948,25 @@ async function loadLogs(){
       <td>${fmtNum(l.prompt_tokens+l.completion_tokens)}</td>
       <td>${l.success?'<span style="color:var(--ok)">成功</span>':'<span style="color:var(--bad)" title="点击看详情">失败</span>'}</td>
     </tr>`;
-  }).join("");
+    }).join("");
+    if (!silent && btn) toast(`已刷新：${logs.length} 条请求记录`);
+  } catch(e) {
+    if (!silent && btn) toast("日志加载失败：" + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "↻ 请求日志"; }
+  }
 }
-$("#logs-refresh").onclick = loadLogs;
+$("#logs-refresh").onclick = () => loadLogs(false);
+
+// 统计页打开时自动轮询日志，新请求记录自动出现；离开统计页停止轮询
+let _logTimer = null;
+function startLogPolling(){
+  if (_logTimer) return;  // 已在轮询中
+  _logTimer = setInterval(() => loadLogs(true), 3000);  // 静默刷新，不动按钮不弹 toast
+}
+function stopLogPolling(){
+  if (_logTimer) { clearInterval(_logTimer); _logTimer = null; }
+}
 
 // ---- 测试台 ----
 $("#pg-send").onclick = async () => {
