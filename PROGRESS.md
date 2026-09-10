@@ -1,125 +1,82 @@
 # API Hub · 项目进度
 
-> 大模型聚合网关：把多个免费大模型 API 聚合成一个 OpenAI 兼容 `/v1` 接口 + 本地管理界面 + 桌面托盘。开源，MIT。
-> 本文档记录**项目当前状态与待办**，下次调整前先读这里，再读 `app/` 里的代码。程序性"怎么修"的知识在 api-hub skill，别混。
+> 大模型聚合网关：把多个免费大模型 API 聚合成一个 OpenAI 兼容 `/v1` 接口 + 本地管理界面 + 桌面托盘。开源（MIT），仓库 `github.com/yezhangdeng01/free-api-hub`。
+> **下次继续前读这里**（当前状态 + 待办 + 机制要点），具体"怎么修"看 `api-hub` skill，逐轮修复细节看 `git log`。
 
 ## 一句话状态
 
-本地已完成「不可用/受限模型重启后冒充可用」+「故障切换慢（含上游挂起 5 分钟卡死）」+「统计页柱状图」修复，**尚未发版**。已 push v1.0.2，后续修复攒着等用户实测后一起发 v1.0.3。
+**v1.0.3 已发版（2026-09-11）**，工作区干净，代码可维护。本轮解决了三类真实用户痛点：① 不可用模型重启后冒充可用；② 上游挂起/魔搭账户级限额时故障切换太慢；③ 统计页体验 + 网关用法页去硬编码。无已知阻塞，见下方「待办」。
 
-## 最近一次工作（2026-09-11，第三轮）
+## 版本时间线（本次交接涉及）
 
-修复「网关读超时太长导致上游挂起时等满 5 分钟才切换」+「统计页柱状图」。
+| 版本 | 主题 | 关键改动 |
+|---|---|---|
+| v1.0.0 | 首发 | 聚合网关 + 管理界面 + 托盘，GitHub Actions 自动构建 Windows 绿色版 |
+| v1.0.1 | 措辞 + gitignore | README 完善；排除本地 venv |
+| v1.0.2 | 可用性语义 + 故障切换 | `available=state==ok`（limited 不再冒充可用）；`is_permanent_failure` 统一 4xx/429 判定；`restore_model_status` 归正旧数据 + 回写磁盘；connect 0.5 衰减降权；connect 超时 15s→8s；持久化（throttle/channel_down/原子写/托盘优雅退出/单实例锁）；OpenRouter 命名迁移；扫描串行限速 |
+| v1.0.3 | 挂起切换 + 账户级限额 + 统计 + 用法页 | read 超时 300s→120s（挂起 2min 切换）；魔搭 daily 型 429 → 整渠道冷却到明天（`mark_channel_quota_exhausted` + `channel_cool` 持久化）；柱状图数值标签 + 最小高度；请求日志按钮反馈 + 统计页 3s 轮询；网关用法页去硬编码（curl 加 `Bearer`、示例改 `auto:quality`、切换规则文案通用化） |
 
-### 上游挂起 5 分钟卡死（用户实测发现）
+## 待办（下次从这里接手）
 
-- **现象**：NIM/deepseek-v4-pro 连接成功但上游无响应，Hermes 一直显示「等待模型响应」，直到 301s 才判定失败切换（截图里两条 `301.0s`/`301.7s` 失败记录，Token=0）。
-- **根因**：`shared_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=8.0))` 的第一个参数 `300` 是**读超时**（read/write/pool），不是连接超时。连接成功但上游挂起（迟迟不返回状态行）时，客户端死等 300 秒读超时才抛异常 → 才 `continue` 切换。
-- **修复**：读超时降到 `120.0`。覆盖挂起场景（120s 内首字节不来就切换，比 300s 快 2.5 倍），且不误杀正常长生成（deepseek 成功约 50~64s；流式下 httpx read 超时是「chunk 间隔」，持续有数据才不触发）。
-- **注意**：connect 超时 8s（上一轮改的）与 read 超时 120s 是两回事。connect 管「建立连接」，read 管「发送后等响应」，别混。
-
-### 统计页柱状图
-
-- 柱子上方加数值标签（`.bar-val`）；`min-height` 2px→12px 避免小数据贴底；保留 hover tooltip。
-
-### 验证
-
-单测 34 passed；JS `node --check` 通过。
-
-## 上一轮修复（2026-09-10，第二轮）
-
-修复「重启后大量不可用模型变回可用」核心 bug（`mark_model_status` 里 `available = state != "down"` 导致 273 条「受限」模型冒充可用），并优化故障切换（魔搭受限时快速切路）。
-
-### 核心根因
-
-1. **`available` 字段语义错误**：`mark_model_status` 里 `available = state != "down"` → 273 条 `limited`（限流）的 `available=True`，全冒充「可用」，重启原样恢复。其中 242 条是「余额不足 / 404 batch 专用」等**永久不可用**被错标成「暂时受限」。
-2. **connect 失败降权不够**：`_update_score` 失败统一 `0.8*旧分`，魔搭受限后从 0.7→0.56，不够沉底；connect 超时 15 秒，每次要等很久才切换。
-
-### 修复清单
-
-| # | 机制 | 修复 | 文件 |
-|---|---|---|---|
-| 1 | `available` 语义错误 → limited 冒充可用 | `mark_model_status` 改为 `available = state == "ok"`，只有 ok 可路由；新增 `_PERMANENT_KEYWORDS` + `is_permanent_failure()`，统一判定「余额不足/402/403/404/405」→ `down` | `gateway.py` |
-| 2 | 旧数据归正（limited→down，available 修正） | `restore_model_status()` 启动时按 state 重新推导 available；永久型 limited 归正为 down（余额不足/404）；一次性回写磁盘 | `gateway.py` |
-| 3 | 扫描/真实请求的 4xx/429 判定接入统一 `is_permanent_failure` | `model_test` 里 `is_permanent_failure(404, ...)`；真实请求 `_classify` 里 429 余额不足 + `is_permanent_failure(429, ...)` | `main.py` |
-| 4 | connect 失败降权太慢（0.8）→ 魔搭受限不沉底 | `_update_score` 失败按 `kind` 区分：connect 失败用 0.5 衰减，快速沉底 | `gateway.py` |
-| 5 | connect 超时 15 秒太长→ 魔搭受限时白等 | `shared_client` connect 超时改为 8 秒 | `main.py` |
-
-### 验证结果
-
-- 单测 34 通过（含 2 个新增防回归用例）
-- 离线验证：归正后 `limited+available=True` 从 272 → **0 条**，state 分布 `down 441 / ok 334 / limited 48`
-- 预期效果：重启后「可用 N」数字真实反映现状（OpenRouter 可用从 378→约 334），魔搭受限时快速切路
-
-## 上一轮修复（2026-09-10，第一轮）
-
-修复「重启后不可用模型回绿」，解决 5 个机制断裂点：
-
-| # | 机制 | 修复 | 文件 |
-|---|---|---|---|
-| 1 | OpenRouter 模型 ID 命名变更（`CohereLabs/xxx`→`cohere/xxx`、`MiniMaxAI/xxx`→`minimax/xxx`），旧 down 状态失联 | 刷新时做**确定等价**迁移 `_migrate_named_models()`（归一化后完全一致才迁，异名/换版本不误迁） | `gateway.py` |
-| 2 | throttle 429 自学水位纯内存，重启清零 | `snapshot()/restore()/learned_pairs()` 落盘，恢复时给仍有效 (渠道,模型) seed 300s 保守冷却 | `throttle.py` |
-| 3 | channel_down 持久化不可靠 + 托盘 `os._exit` 跳过落盘 + 多实例覆盖 | `mark_channel_down/up` **即时落盘**；`_atomic_write` 原子写；托盘退出先 `save_runtime_state()`；加单实例锁 | `gateway.py`/`store.py`/`desktop.py` |
-| 4 | 渠道概况与渠道内模型 available 两套口径矛盾 | 渠道内模型 `available` 纳入模型级状态 | `gateway.py` |
-| 5 | 3 并发集中扫描打爆免费档限流 | 扫描改单 worker 串行 + 按渠道限速（Gemini 350ms/NIM 300ms/OpenRouter 200ms/其他 150ms） | `frontend/index.html` |
-
-完整排查见 `api-hub模型扫描异常排查报告.html`。
-
-## Git / 版本
-
-- 分支 `main`；最新 tag `v1.0.1`（HEAD `df8a367`）。
-- **工作区有未提交改动**（本次修复 + 更早的 opencode 渠道预设、OpenRouter endpoints 只读查询等），提交前需一起过一遍、分 commit。
-- **未发版**：等用户实测通过再 push + release。发布流程参考 PlanFlow 项目（删旧 tag + gh release 重建）。
+- [ ] **GitHub Actions 自动打包发版**：当前**没有** `.github/workflows/`，Windows 绿色版是手动 PyInstaller 打包 + 手动上传 asset。规模还小（自用小工具 + 分享给朋友），暂不必加。若将来发版频繁 / 要支持 mac/Linux 多平台，再上 Actions（`.github/workflows/build-windows.yml`：build + PyInstaller + 上传 asset + 打 tag 触发）。
+- [ ] **流式请求中途挂起**：现在 read 超时 120s 覆盖了「首字节前挂起」（截图 301s 场景）。但「流式已返回 200 + 吐了几个 chunk 后中途卡住」的场景，`_stream_gen` 的 `aiter_bytes()` 抛 ReadTimeout 会**断流而非干净切换**，Hermes 端看到的是断流。若实测遇到，需做「流中断后由客户端重试」或「网关预缓冲 N 字节再转发」。
+- [ ] **魔搭受限仍可能被选中**（历史遗留）：`candidates_for` 按 `channel_down`/`channel_cooling`/`cooldown` 过滤，魔搭"受限"若没触发这些（比如只是评分低但没冷却），仍可能进候选。已用 connect 0.5 衰减 + 账户级渠道冷却缓解；根因要靠健康检查更积极地把受限渠道降权。
+- [ ] **OpenRouter 改名无法自动迁移的模型**（`aya-expanse-32b`→`command-a`、`MiniMax-M2`→`minimax-m2.7` 等本体/版本也变的）：迁移只做确定等价，这几个需用户手动重扫。
+- [ ] **`model_status` 幽灵数据**（旧名、已不在任何渠道）：暂保留（避免误删 HF 渠道还在用的旧名），保守清理留待以后。
+- [ ] **扫描按钮命名**：按钮叫「扫描全部模型」，实为「只扫未测过的」。已加 toast + skip 原因提示缓解，按钮名本身可考虑改「扫描未测」。
 
 ## 运行与测试
 
 ```bash
 cd E:\文档\workbuddy\api-hub
-.venv\Scripts\python.exe -m pytest tests/ -q   # 34 passed，全部离线、不打外部 API
+.venv\Scripts\python.exe -m pytest tests/ -q   # 35 passed，全部离线、不打外部 API
 ```
 
-- 日常运行：双击 `API Hub.vbs`（静默托盘）；调试用 `run.bat`（带控制台）；源码态 `.venv\Scripts\python.exe desktop.py`。
-- 端口 8787（`config.json` 的 `port`）；日志 `data/api-hub.log`；密钥 DPAPI 密文存在 `config.json`。
+- 日常：双击 `API Hub.vbs`（静默托盘）；调试 `run.bat`（带控制台）；源码态 `.venv\Scripts\python.exe desktop.py`。
+- 端口 8787（`config.json` 的 `port`）；日志 `data/api-hub.log`；密钥 DPAPI 密文存 `config.json`。
+- **改完持久化/路由逻辑后务必彻底重启托盘**（任务管理器确认 `pythonw.exe desktop.py` 全消失再启动），否则跑的是旧代码。
 
 ## 代码地图
 
-- `app/gateway.py` — 核心状态机 + 候选路由 + `model_view`（三态视图）。全局状态表都在这。
-- `app/main.py` — FastAPI 入口：`/v1/*` 网关、`/api/*` 管理、`model_test`（扫描）、lifespan（启动恢复/停机落盘）、后台健康循环。
-- `app/throttle.py` — 429 自学限流水位（`_LEARN`/`_CALLS`），预判式换路。
+- `app/gateway.py` — 核心状态机 + 候选路由 + `model_view`（三态）+ 429 分类 + 账户级渠道冷却。
+- `app/main.py` — FastAPI 入口：`/v1/*` 网关 + 故障切换循环、`/api/*` 管理、`model_test`（扫描）、lifespan（启动恢复/停机落盘）、后台健康/探测循环、`shared_client` 超时配置。
+- `app/throttle.py` — 429 自学限流水位，预判式换路。
 - `app/store.py` — SQLite 用量 + `model_status.json`/`runtime_state.json` 落盘（`_atomic_write`）。
 - `app/providers.py` — 各平台 `/models` 列表、额度查询、OpenRouter 只读 endpoints。
-- `app/config.py` — 渠道预设 `PROVIDER_PRESETS`；敏感字段 DPAPI 加密（`vault.py`）。
-- `desktop.py` — pywebview 窗口 + pystray 托盘 + 单实例锁。`frontend/index.html` — 全部前端（单文件）。
+- `app/config.py` — 渠道预设 + 敏感字段 DPAPI 加密（`vault.py`）。
+- `desktop.py` — pywebview 窗口 + pystray 托盘 + 单实例锁。`frontend/index.html` — 全部前端（单文件，CRLF 行尾）。
 
 ## 状态持久化要点（改可用性/恢复逻辑前必读）
 
-模型可用性三态：`ok` 绿·可调 / `limited` 黄·限流冷却但仍属可用范畴 / `down` 红·402/403/下线等硬不可用。
+三态：`ok` 绿·可调 / `limited` 黄·暂时受限（限流/冷却，仍算可用范畴但**不可路由**）/ `down` 红·硬不可用（402/403/404/余额不足）。
 
-- `model_status`（模型级，key=model，跨渠道）→ `model_status.json`。`available` **由 state 唯一决定**（只有 `ok` 可路由）。
-- `channel_down`（渠道级，(模型,渠道)→理由）→ 硬不可用。`mark_channel_down/up` 即时落盘。
-- `cooldown`/`unverified`/`ratelimit`/`throttle._LEARN` → `runtime_state.json`。
-- 恢复顺序（lifespan）：`store.init()` → `restore_model_status()`（归正旧数据 + 回写磁盘）→ `restore_runtime_state()`（恢复 cooldown/unverified/channel_down/ratelimit/throttle，并 seed 保守冷却）。
+- **`available` 由 `state` 唯一决定（只有 `ok` 可路由）**，`restore_model_status` 启动归正旧数据 + 回写磁盘。
+- `model_status`（模型级）→ `model_status.json`；`channel_down`（渠道级硬失败）即时落盘；`cooldown`/`unverified`/`ratelimit`/`channel_cool`/`throttle._LEARN` → `runtime_state.json`（`channel_cool` 含账户级当天额度冷却到明天）。
+- 恢复顺序：`store.init()` → `restore_model_status()` → `restore_runtime_state()`（恢复各状态 + 给仍有效的 (渠道,模型) seed 300s 保守冷却，避免重启回绿）。
 
-## 已知问题 / 待办
-
-- [ ] **扫描按钮语义**：按钮叫「扫描全部模型」，实为「只扫未测过的」。本次已加 toast 提示 + skip 原因显示 + 非免费模型标记已测（死循环已修），但按钮名本身仍易误解，可考虑更名「扫描未测」。
-- [ ] OpenRouter 改名**无法自动迁移**的模型（`aya-expanse-32b`→`command-a`、`MiniMax-M2`→`minimax-m2.7` 等本体/版本也变的）需用户手动重扫那几个；迁移只做确定等价，不硬猜。
-- [ ] `model_status` 幽灵数据（旧名、已不在任何渠道）未做保守清理（保留是为避免误删 HF 渠道还在用的旧名）。
-- [ ] 魔搭受限后**候选列表仍然包含魔搭**（`candidates_for` 按 `channel_down`/`channel_cooling`/`cooldown` 过滤，但魔搭"受限"可能没触发这些）。现已通过 connect 失败 0.5 衰减快速沉底缓解，但根因可能需要魔搭自检/健康检查更积极降级。
-
-## 平台保护机制（Q 额度/限流相关，代码已有，勿误删）
+## 平台保护机制（额度/限流，代码已有，勿误删）
 
 | 平台 | 保护点 | 落点 |
 |---|---|---|
-| OpenRouter | ① 模型状态查询接口 `openrouter_endpoints()`（只读、免费、不耗额度，查上游提供方/是否免费/可用率）；② 扫描前预判：无免费提供方直接 skip 不烧余额；③ 付费模型 skip 时 `mark_channel_down` + `mark_model_status(down)` | `providers.py` / `main.py:model_test` |
-| 魔搭 ModelScope | ① 主动探测每轮≤5 个（其他渠道≤20）；② `last_probe_ok` 24h 去重（探测成功过不再重复探）；③ 渠道级 429 熔断（窗口内≥2 模型 429 → 账号级限流，整渠道冷却）；④ 前端扫描前弹确认框 | `main.py:probe_used_models` / `gateway.py` / `frontend` |
-| Gemini/NIM/OpenRouter 等按模型 RPM 限流 | 扫描单 worker 串行 + 按渠道限速（Gemini 350ms/NIM 300ms/OpenRouter 200ms/其他 150ms） | `frontend/index.html:scanChannel` |
-| 通用 429 | 分类冷却（分钟级/每日额度/余额不足）+ 渠道冷却 + throttle 自学水位预判换路 | `gateway.py` |
+| OpenRouter | ① `openrouter_endpoints()` 只读查上游提供方/免费/可用率（不耗额度）；② 扫描前预判无免费提供方直接 skip 不烧余额；③ 付费 skip 时 `mark_channel_down` + `mark_model_status(down)` | `providers.py` / `main.py:model_test` |
+| 魔搭 | ① 主动探测每轮≤5 个（其他渠道≤20）+ 24h 去重；② **daily 型 429（当天次数用完）→ `mark_channel_quota_exhausted` 整渠道冷却到明天**（账户级，不等第二个模型）；③ 渠道级 429 熔断；④ 前端扫描前确认框 | `main.py:probe_used_models/_classify` / `gateway.py` |
+| 按模型 RPM（Gemini/NIM/OpenRouter） | 扫描单 worker 串行 + 按渠道限速（Gemini 350ms/NIM 300ms/OpenRouter 200ms/其他 150ms） | `frontend:scanChannel` |
+| 通用 | read 超时 120s / connect 8s；connect 失败 0.5 衰减快速沉底；429 分类冷却 + throttle 自学预判 | `main.py` / `gateway.py` |
 
 ## 关键坑（每条都踩过）
 
-1. **改持久化逻辑后不要启动真实服务验证**——启动会 refresh_all + probe_used_models，烧免费额度/触发 429。用一次性离线脚本 `monkeypatch store.RUNTIME_STATE_PATH/MODEL_STATUS_PATH` 到临时目录验证，跑完删除。
-2. **Windows 上 `.py` 是 LF**；patch 工具模糊匹配可能把整文件行尾改成 CRLF（`git diff` 显 `\r`）。改完用 `python -c` 数 `b"\r\n"` 核对，混了就 `raw.replace(b"\r\n", b"\n")` 转回。`frontend/index.html` 本就是 CRLF，别误统一。
-3. **模型级 vs 渠道级粒度不同**：`model_status` 是 model 级，`channel_down`/`cooldown` 是 (model,channel) 级，两边口径必须一致，否则 UI 矛盾。
-4. **OpenRouter 模型 ID 会变**：迁移只做归一化后完全一致的确定等价；模型本体/版本也变的不迁（会错配），宁让用户重扫。
-5. **`available` 必须由 state 唯一决定**：之前 `available = state != "down"` 导致 limited 冒充可用。修复后 `available = state == "ok"`，`restore_model_status` 启动归正 + 回写磁盘。
+1. **改持久化逻辑别启动真实服务验证**（会 refresh_all + probe_used_models，烧免费额度）。用一次性离线脚本 `monkeypatch` `store.RUNTIME_STATE_PATH`/`MODEL_STATUS_PATH` 到临时目录验证；**别用 execute_code 的持久 kernel 会话反复改全局态**（会污染，出现假阴性），用独立 `terminal` 进程复核。
+2. **Windows `.py` 是 LF**，patch 模糊匹配可能整文件变 CRLF（`git diff` 显 `\r`）；改完数 `b"\r\n"` 核对，混了转回。`frontend/index.html` 本就是 CRLF，别误统一。
+3. **模型级 vs 渠道级粒度**：`model_status` 是 model 级，`channel_down`/`cooldown`/`channel_cool` 是 (model,channel) 级，口径必须一致。
+4. **OpenRouter 模型 ID 会变**：迁移只做归一化后完全一致的确定等价；本体/版本变的不迁，宁可让用户重扫。
+5. **`available` 必须由 state 唯一决定**：旧 `available = state != "down"` 导致 limited 冒充可用（300+ 假绿）。
+6. **`httpx.Timeout(read, connect)` 第一参数是 read 不是 connect**：魔搭/deepseek「连接成功但挂起」场景是 read 超时（曾 300s 死等），不是 connect。
+7. **账户级 vs 按模型限流两码事**：魔搭按每日次数，daily 型 429 是账户级（整 Key 都 429）；Gemini/NIM 按模型 RPM 是 minute 型。`classify_429` 返回的 label 决定走哪条冷却。
+
+## 发版流程（本项目）
+
+1. 改代码 → `pytest` 全绿 + `node --check` JS 通过 + `.py` 行尾 LF 核对。
+2. 分主题 commit（fix/feat/docs），`git push origin main`。
+3. 打 tag：`git tag vX.Y.Z && git push origin vX.Y.Z`。
+4. `gh release create vX.Y.Z --notes-file <临时md>`（或 `--generate-notes` 从 git log 自动生成），删除旧 release 可 `gh release delete`。
+5. Windows 绿色版（zip）**手动 PyInstaller 打包上传**（无 Actions），或让用户 clone 源码跑。
