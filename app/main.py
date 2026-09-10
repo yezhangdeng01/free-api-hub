@@ -50,7 +50,7 @@ logging.basicConfig(level=logging.INFO,
                     handlers=_log_handlers)
 logger = logging.getLogger("api-hub")
 
-shared_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=8.0))
+shared_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=8.0))
 
 
 # ---------------- 后台健康检查 ----------------
