@@ -266,11 +266,13 @@
       <h3 style="margin-top:14px">curl</h3>
       <pre id="guide-curl"></pre>
       <h3 style="margin-top:14px">自动切换规则</h3>
-      <p class="muted small" style="line-height:1.9">
-        · 请求按「可用渠道 → 延迟从低到高」的顺序尝试，失败自动换下一个渠道重试；<br>
-        · 失败的「模型 × 渠道」组合进入 120 秒冷却，冷却期内不再优先使用；<br>
-        · 健康检查每 10 分钟自动跑一次（可在 config.json 调整），也可手动点「刷新全部」；<br>
-        · 响应头 <span class="mono">X-Api-Hub-Channel</span> 会告诉你本次实际由哪个渠道服务。</p>
+            <p class="muted small" style="line-height:1.9">
+              · 请求按「可用渠道 → 延迟从低到高」的顺序尝试，失败自动换下一个渠道重试；<br>
+              · 失败的「模型 × 渠道」组合进入冷却（时长按错误类型：连接失败短、限流/当天额度用完等冷却到明）；<br>
+              · 健康检查自动定期运行（可在 config.json 调整），也可手动点「刷新全部」；<br>
+              · 响应头 <span class="mono">X-Api-Hub-Channel</span> 会告诉你本次实际由哪个渠道服务；<br>
+              · 模型名填 <span class="mono">auto</span> / <span class="mono">auto:quality</span> / <span class="mono">auto:speed</span> / <span class="mono">auto:stability</span>
+                时，网关会自动选最优真实模型并跨模型无感切换。</p>
       <h3 style="margin-top:14px">常用客户端配置（点击复制）</h3>
       <div id="guide-snippets"></div>
     </div>
@@ -340,22 +342,25 @@ function renderGuide(){
   const base = g.base_url || "", tok = g.token || "";
   $("#guide-url").textContent = base;
   $("#guide-token").textContent = tok || "(鉴权已关闭)";
+  // 示例模型名用 auto:quality（网关自动选最优 + 失败无感切换），
+  // 比写死某个具体模型名更贴合"通用规则"，模型下架/改名也不用改这里
   $("#guide-py").textContent =
     'from openai import OpenAI\n' +
     'client = OpenAI(base_url="' + base + '",\n' +
     '                api_key="' + tok + '")\n' +
-    'resp = client.chat.completions.create(model="glm-4-flash",\n' +
+    'resp = client.chat.completions.create(\n' +
+    '    model="auto:quality",  # 或换成 models 列表里任意一个模型名\n' +
     '    messages=[{"role": "user", "content": "你好"}])\n' +
     'print(resp.choices[0].message.content)';
   $("#guide-curl").textContent =
     'curl ' + base + '/chat/completions \\\n' +
     '  -H "Content-Type: application/json" \\\n' +
     '  -H "Authorization: Bearer ' + tok + '" \\\n' +
-    '  -d \'{"model":"glm-4-flash","messages":[{"role":"user","content":"你好"}]}\'';
+    '  -d \'{"model":"auto:quality","messages":[{"role":"user","content":"你好"}]}\'';
   // 常用客户端配置片段（借鉴 FreeLLMAPI 的 setup-* 思路）
   const snippets = [
     ["OpenAI 兼容工具（Cherry Studio / ChatBox / NextChat 等）",
-     'API 地址:  ' + base + '\nAPI Key:  ' + tok],
+     'API 地址:  ' + base + '\nAPI Key:  ' + tok + '\n模型名:    auto:quality（或 models 列表里任意模型）'],
     ["环境变量（OpenAI SDK 系工具通用）",
      'export OPENAI_BASE_URL="' + base + '"\nexport OPENAI_API_KEY="' + tok + '"'],
     ["Claude Code 等支持自定义网关的工具",
