@@ -14,6 +14,9 @@ def _reset():
     gateway.channels.clear()
     gateway.cooldown.clear()
     gateway.stats.clear()
+    gateway.channel_cool.clear()
+    gateway.channel_down.clear()
+    gateway.unverified.clear()
 
 
 def _chan(cid, models, latency=100):
@@ -74,6 +77,24 @@ def test_mark_result_cooldown_kinds():
     _reset()
     gateway.mark_result("m", "c1", True)  # 成功解除冷却
     assert ("m", "c1") not in gateway.cooldown
+
+
+def test_channel_quota_exhausted_cools_whole_channel(tmp_path, monkeypatch):
+    """账户级「当天额度用完」：整个渠道冷却，所有模型都不进候选，且冷却持久化。"""
+    import time as _t
+    from app import store as _store
+    _reset()
+    monkeypatch.setattr(_store, "RUNTIME_STATE_PATH", str(tmp_path / "rt.json"))
+    a = _chan("sc", ["m1", "m2"], latency=50)
+    cfg = _cfg([a])
+    # 触发账户级限额 → 整渠道冷却到明天
+    gateway.mark_channel_quota_exhausted("sc", "当日额度用完")
+    assert gateway.channel_cooling("sc")                      # 渠道在冷却
+    assert gateway.candidates_for("m1", cfg) == []            # m1 不进候选
+    assert gateway.candidates_for("m2", cfg) == []            # m2 也不进候选（全渠道被封）
+    # 冷却持久化：save_runtime_state 已写入 channel_cool，restore 能读回
+    gateway.restore_runtime_state()
+    assert gateway.channel_cooling("sc")
 
 
 def test_mark_result_scoring():

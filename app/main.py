@@ -422,16 +422,18 @@ def _classify(cid, name, upstream_model, requested_model, t0, errors, status, ra
     elif kind == "rate_limit":
         label, secs, text429 = gateway.classify_429(raw)
         cooldown_seconds = secs
-        # "余额不足"型 429 + 平台余额接口确认余额 ≤0 → 这不是限流，是需充值的硬不可用，
-        # 等到明天也不会自己恢复，按渠道级硬失败处理（充值后手动测试或真实成功才恢复）
-        if label == "daily" and _quota_exhausted(cid):
-            logger.warning("渠道[%s] 模型[%s] 余额不足型 429 且余额≤0，按硬不可用处理", name, upstream_model)
-            gateway.mark_channel_down(upstream_model, cid, "账户余额不足，需充值 (HTTP 429)")
-            gateway.mark_model_status(requested_model, False, "渠道余额不足，需充值", name, state="down")
-            gateway.mark_result(upstream_model, cid, False, kind="rate_limit")
+        # 「每天额度用完」型 429：账户级限额，整个渠道所有模型一起受限，冷却到明天。
+        # 与「余额不足」不同——余额接口可能仍有余额，只是当天免费调用次数用完了。
+        if label == "daily":
+            logger.warning("渠道[%s] 模型[%s] 当日额度用完 (daily 429)，整个渠道冷却到明天，"
+                           "该渠道下所有模型一并受限", name, upstream_model)
+            gateway.mark_channel_quota_exhausted(cid, text429)
+            gateway.mark_model_status(requested_model, False, text429, name, state="limited")
+            gateway.mark_result(upstream_model, cid, False, kind="rate_limit",
+                                cooldown_seconds=secs)
             store.log_usage(cid, name, requested_model, 0, 0, latency, False,
-                            f"HTTP 429 余额不足: {raw[:200]}", upstream_model=upstream_model)
-            errors.append(f"{name}: 余额不足 (HTTP 429){note}")
+                            f"HTTP 429 当日额度用完: {raw[:200]}", upstream_model=upstream_model)
+            errors.append(f"{name}: 当日额度用完 (HTTP 429){note}")
             return
         logger.warning("渠道[%s] 模型[%s] 限流 (429, %s)，冷却 %ds，Retry-After=%s",
                        name, upstream_model, label, secs, retry_after)
@@ -578,6 +580,15 @@ async def model_test(req: Request):
             gateway.note_ratelimit_headers(ch["id"], upstream_model, r.headers)
             if r.status_code == 429:
                 label429, secs429, _ = gateway.classify_429(r.text[:300])
+                # 「每天额度用完」型 429：账户级限额，整个渠道所有模型一起受限，冷却到明天
+                if label429 == "daily":
+                    gateway.mark_channel_quota_exhausted(ch["id"], "当日额度用完")
+                    gateway.mark_model_status(model, False, "当日额度用完，账户级限额",
+                                              ch.get("name"), state="limited")
+                    gateway.mark_result(upstream_model, ch["id"], False, kind="rate_limit",
+                                        cooldown_seconds=secs429)
+                    return {"available": False, "skipped": True, "channel": ch.get("name"),
+                            "error": "当日额度用完 (HTTP 429)，整个渠道冷却到明天"}
                 # 余额不足型 429（正文含"余额/充值/购买"等，或平台确认余额≤0）→ 硬不可用，等也不会恢复
                 if gateway.is_permanent_failure(429, r.text[:300]) or (
                         label429 == "daily" and _quota_exhausted(ch["id"])):

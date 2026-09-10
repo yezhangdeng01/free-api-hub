@@ -210,6 +210,21 @@ def channel_cooling(cid: str, now: float = None) -> bool:
     return channel_cool.get(cid, 0) > now
 
 
+def mark_channel_quota_exhausted(cid: str, reason: str = ""):
+    """账户级「当天额度用完」：整个渠道冷却到明天 00:05，无需等第二个模型撞 429。
+
+    魔搭等按「每日调用次数」限额的平台，一旦触发 daily 型 429，说明当天免费额度已用尽，
+    该 Key 下**所有**模型都会跟着 429（账户级，不是按模型级）。普通按模型 RPM 限流的平台
+    （Gemini/NIM 等）每个模型有独立额度，不会走到这里（它们的 429 是 minute 型）。
+    只有 `classify_429` 判为 `daily`（响应体含「今日/每日/额度已用完」等）才调用本函数。"""
+    # 冷却到下一个 00:05（额度按天刷新，留 5 分钟缓冲）
+    now = time.time()
+    t = time.localtime(now)
+    secs = (24 - t.tm_hour - 1) * 3600 + (60 - t.tm_min - 1) * 60 + (65 - t.tm_sec)
+    channel_cool[cid] = now + min(max(secs, 600), 86400)
+    save_runtime_state()
+
+
 def mark_model_status(model: str, available: bool, reason: str = "", channel: str = "",
                       state: str = None):
     """记一次模型级测试/调用的真实结果并持久化。
@@ -284,6 +299,7 @@ def save_runtime_state():
             "unverified": [f"{k[0]}|{k[1]}" for k in unverified],
             "channel_down": {f"{k[0]}|{k[1]}": v for k, v in channel_down.items()},
             "ratelimit": {f"{k[0]}|{k[1]}": v for k, v in ratelimit.items()},
+            "channel_cool": {cid: round(v, 1) for cid, v in channel_cool.items() if v > now},
             "throttle": throttle.snapshot(),
         })
     except Exception:
@@ -314,6 +330,10 @@ def restore_runtime_state():
         mid, _, cid = k.partition("|")
         if mid and cid and isinstance(v, dict) and "remaining" in v:
             ratelimit[(mid, cid)] = v
+    # 恢复渠道级冷却（含「账户级当天额度用完」的冷却到明天）
+    for cid, v in (data.get("channel_cool") or {}).items():
+        if v > now:
+            channel_cool[cid] = v
     # 恢复 429 自学水位（throttle），并给仍在有效期内的 (渠道,模型) 一个保守短冷却，
     # 避免重启后受限模型立刻回绿、再次集中撞限（这是 Gemini/NIM 重启变绿的直接原因）
     throttle.restore(data.get("throttle") or {})
