@@ -90,8 +90,9 @@
   pre .k { color: var(--accent); }
   .chart { display: flex; align-items: flex-end; gap: 6px; height: 140px; padding: 10px 4px 0; }
   .bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 5px; min-width: 0; }
-  .bar { width: 100%; max-width: 42px; background: linear-gradient(180deg, var(--accent), var(--accent-dim)); border-radius: 3px 3px 0 0; min-height: 2px; }
+  .bar { width: 100%; max-width: 42px; background: linear-gradient(180deg, var(--accent), var(--accent-dim)); border-radius: 3px 3px 0 0; min-height: 12px; position: relative; }
   .bar.err { background: linear-gradient(180deg, var(--bad), #7a4038); }
+  .bar-val { position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); font-size: 11px; color: var(--foreground); white-space: nowrap; margin-bottom: 3px; }
   .bar-lbl { font-size: 10.5px; color: var(--muted); white-space: nowrap; }
   .empty { color: var(--muted); text-align: center; padding: 28px 0; font-size: 13px; }
 </style>
@@ -909,7 +910,9 @@ async function loadStats(){
   const max = Math.max(1, ...daily.map(d=>d.requests));
   $("#chart").innerHTML = daily.length ? daily.map(d => `
     <div class="bar-wrap" title="${d.date}：${d.requests} 次请求，${fmtNum(d.tokens)} tokens，${d.errors} 次失败">
-      <div class="bar ${d.errors?'err':''}" style="height:${Math.max(2, d.requests*100/max)}%"></div>
+      <div class="bar ${d.errors?'err':''}" style="height:${Math.max(12, d.requests*100/max)}%">
+        <span class="bar-val">${d.requests}</span>
+      </div>
       <div class="bar-lbl">${d.date?.slice(5)}</div></div>`).join("")
     : '<div class="empty">暂无数据</div>';
   const rows = (arr, nameKey) => arr.length ? arr.map(r => `<tr>
