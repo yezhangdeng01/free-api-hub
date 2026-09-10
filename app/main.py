@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import capability
 from . import config as cfgmod
-from . import gateway, store, throttle
+from . import gateway, providers, store, throttle
 from .config import PROVIDER_PRESETS
 
 if getattr(sys, "frozen", False):
@@ -50,7 +50,7 @@ logging.basicConfig(level=logging.INFO,
                     handlers=_log_handlers)
 logger = logging.getLogger("api-hub")
 
-shared_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0))
+shared_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=8.0))
 
 
 # ---------------- 后台健康检查 ----------------
@@ -73,11 +73,24 @@ async def probe_used_models():
         if not ch.get("enabled", True):
             continue
         cs = gateway.channels.get(ch["id"])
-        if not cs or not cs.valid:
+        if not cs or not cs.valid or gateway.channel_cooling(ch["id"]):
             continue
-        targets = [m for m in used if m in cs.models
-                   and gateway.cooldown.get((m, ch["id"]), 0) <= now
-                   and (gateway.model_status.get(m) or {}).get("state") != "down"][:20]
+        # 魔搭等按每日请求次数计额度的平台：探测也在烧额度。
+        # 每轮最多探 5 个，且 24 小时内探测成功过的不再重复探
+        is_ms = ch.get("type") == "modelscope"
+        cap = 5 if is_ms else 20
+        targets = []
+        for m in used:
+            key = (m, ch["id"])
+            if m not in cs.models:
+                continue
+            if gateway.cooldown.get(key, 0) > now or key in gateway.channel_down:
+                continue
+            if is_ms and now - gateway.last_probe_ok.get(key, 0) < 86400:
+                continue
+            targets.append(m)
+            if len(targets) >= cap:
+                break
         if not targets:
             continue
         url = ch["base_url"].rstrip("/") + "/chat/completions"
@@ -89,22 +102,39 @@ async def probe_used_models():
                 t0 = time.time()
                 r = await shared_client.post(
                     url, json={"model": m, "messages": [{"role": "user", "content": "ping"}],
-                               "max_tokens": 1}, headers=headers)
+                               "max_tokens": 16 if ch.get("type") in ("openrouter", "opencode") else 1},
+                    headers=headers)
                 latency = int((time.time() - t0) * 1000)
+                gateway.note_ratelimit_headers(ch["id"], m, r.headers)
                 if r.status_code == 200:
                     gateway.mark_result(m, ch["id"], True, latency)
                     gateway.mark_model_status(m, True, "", ch.get("name"))
+                    gateway.last_probe_ok[(m, ch["id"])] = time.time()
                     ok_cnt += 1
                 else:
                     kind = _kind_of(r.status_code)
-                    gateway.mark_result(m, ch["id"], False, kind=kind,
-                                        retry_after=_parse_retry_after(r.headers))
-                    if r.status_code in (400, 402, 403):
-                        # 付费/权限/下线 → 硬不可用
-                        gateway.mark_model_status(m, False,
-                            f"HTTP {r.status_code}: {r.text[:160]}", ch.get("name"), state="down")
+                    if r.status_code == 429:
+                        _, secs, _ = gateway.classify_429(r.text[:300])
+                        gateway.mark_result(m, ch["id"], False, kind=kind,
+                                            cooldown_seconds=secs)
                     else:
-                        # 429/5xx → 暂时受限（冷却后会恢复）
+                        gateway.mark_result(m, ch["id"], False, kind=kind,
+                                            retry_after=_parse_retry_after(r.headers))
+                    if r.status_code in (400, 402, 403):
+                        # 付费/权限/下线 → 该渠道上此模型硬不可用（按渠道级记录），
+                        # 模型级也记为 down（与扫描口径一致），避免探测把硬失败覆盖成可用
+                        gateway.mark_channel_down(m, ch["id"],
+                            f"HTTP {r.status_code}: {r.text[:160]}")
+                        gateway.mark_model_status(m, False,
+                            f"渠道[{ch.get('name')}] 不可用 (HTTP {r.status_code})",
+                            ch.get("name"), state="down")
+                    elif r.status_code == 429:
+                        # 渠道级 429 计数（账号级限流熔断）
+                        gateway.note_channel_429(ch["id"], m,
+                                                 _parse_retry_after(r.headers))
+                        gateway.mark_model_status(m, True,
+                            f"暂时不可用 (HTTP {r.status_code})", ch.get("name"), state="limited")
+                    else:
                         gateway.mark_model_status(m, True,
                             f"暂时不可用 (HTTP {r.status_code})", ch.get("name"), state="limited")
                     if r.status_code in (401, 403):
@@ -160,6 +190,7 @@ async def _bg_loop():
     while True:
         try:
             await asyncio.sleep(30)
+            gateway.flush_runtime_state()  # 把挂起的冷却/失败状态落盘（脏了才写）
             cfg = cfgmod.load_config()
             check_iv = max(1, cfg.get("check_interval_minutes", 30)) * 60
             probe_iv = max(1, cfg.get("probe_interval_minutes", 60)) * 60
@@ -184,9 +215,11 @@ async def _bg_loop():
 async def lifespan(app: FastAPI):
     store.init()
     gateway.restore_model_status()  # 恢复已测模型状态，重启不丢
+    gateway.restore_runtime_state()  # 恢复冷却/待验证/渠道级硬失败（扫描结果重启不丢）
     task = asyncio.create_task(_bg_loop())
     yield
     task.cancel()
+    gateway.save_runtime_state()  # 停机前把内存状态落盘
     await shared_client.aclose()
 
 
@@ -292,11 +325,16 @@ async def chat_completions(request: Request):
             if resp.status_code != 200:
                 raw = (await resp.aread()).decode("utf-8", "ignore")[:300]
                 ra = _parse_retry_after(resp.headers)
+                gateway.note_ratelimit_headers(cid, upstream_model, resp.headers)
                 await resp.aclose()
                 _classify(cid, name, upstream_model, model, t0, errors,
                           resp.status_code, raw, ra)
                 continue
             gateway.mark_result(upstream_model, cid, True, int((time.time() - t0) * 1000))
+            gateway.note_ratelimit_headers(cid, upstream_model, resp.headers)
+            ms = gateway.get_model_status(upstream_model)
+            if ms is not None and ms.get("state") == "down":
+                gateway.mark_model_status(upstream_model, True, "", name)  # 真实成功 → 解除遗留 down
             return StreamingResponse(
                 _stream_gen(resp, cid, name, model, t0, upstream_model),
                 media_type="text/event-stream",
@@ -309,9 +347,11 @@ async def chat_completions(request: Request):
                 continue
             latency = int((time.time() - t0) * 1000)
             if r.status_code != 200:
+                gateway.note_ratelimit_headers(cid, upstream_model, r.headers)
                 _classify(cid, name, upstream_model, model, t0, errors,
                           r.status_code, r.text[:300], _parse_retry_after(r.headers))
                 continue
+            gateway.note_ratelimit_headers(cid, upstream_model, r.headers)
             try:
                 data = r.json()
             except Exception:
@@ -322,6 +362,9 @@ async def chat_completions(request: Request):
                 errors.append(f"{name}: 响应不是 JSON")
                 continue
             gateway.mark_result(upstream_model, cid, True, latency)
+            ms = gateway.get_model_status(upstream_model)
+            if ms is not None and ms.get("state") == "down":
+                gateway.mark_model_status(upstream_model, True, "", name)  # 真实成功 → 解除遗留 down
             u = data.get("usage") or {}
             store.log_usage(cid, name, model, u.get("prompt_tokens", 0),
                             u.get("completion_tokens", 0), latency, True,
@@ -351,28 +394,59 @@ def _kind_of(status: int) -> str:
     return "client"
 
 
+def _quota_exhausted(cid: str) -> bool:
+    """渠道账户余额是否已知 ≤ 0（只看平台余额接口查到的数据，没有就不猜）"""
+    cs = gateway.get_cs(cid)
+    q = getattr(cs, "quota", None)
+    if isinstance(q, dict) and q.get("remaining") is not None:
+        try:
+            return float(q["remaining"]) <= 0
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
 def _classify(cid, name, upstream_model, requested_model, t0, errors, status, raw, retry_after=None):
-    """按 HTTP 状态分类处理：鉴权失败直接停用渠道，限流按 Retry-After 冷却"""
+    """按 HTTP 状态分类处理：鉴权失败直接停用渠道，限流按响应体分类冷却（每日额度 vs 每分钟限流）"""
     latency = int((time.time() - t0) * 1000)
     note = f" (上游模型 {upstream_model})" if upstream_model != requested_model else ""
     kind = _kind_of(status)
+    cooldown_seconds = None
     if kind == "auth":
         cs = gateway.get_cs(cid)
         cs.valid = False
         cs.error = f"运行时检测: Key 无效或无权限 (HTTP {status})"
         logger.warning("渠道[%s] Key 鉴权失败 (HTTP %s)，暂停使用，等待下次健康检查", name, status)
-        gateway.mark_model_status(requested_model, False, f"渠道 Key 无效: HTTP {status}", name, state="down")
+        # 按 (模型, 渠道) 记录，不再把同名模型在其他渠道的状态一起标红
+        gateway.mark_channel_down(upstream_model, cid, f"Key 无效: HTTP {status}")
     elif kind == "rate_limit":
-        logger.warning("渠道[%s] 模型[%s] 限流 (429)，Retry-After=%s", name, upstream_model, retry_after)
+        label, secs, text429 = gateway.classify_429(raw)
+        cooldown_seconds = secs
+        # "余额不足"型 429 + 平台余额接口确认余额 ≤0 → 这不是限流，是需充值的硬不可用，
+        # 等到明天也不会自己恢复，按渠道级硬失败处理（充值后手动测试或真实成功才恢复）
+        if label == "daily" and _quota_exhausted(cid):
+            logger.warning("渠道[%s] 模型[%s] 余额不足型 429 且余额≤0，按硬不可用处理", name, upstream_model)
+            gateway.mark_channel_down(upstream_model, cid, "账户余额不足，需充值 (HTTP 429)")
+            gateway.mark_model_status(requested_model, False, "渠道余额不足，需充值", name, state="down")
+            gateway.mark_result(upstream_model, cid, False, kind="rate_limit")
+            store.log_usage(cid, name, requested_model, 0, 0, latency, False,
+                            f"HTTP 429 余额不足: {raw[:200]}", upstream_model=upstream_model)
+            errors.append(f"{name}: 余额不足 (HTTP 429){note}")
+            return
+        logger.warning("渠道[%s] 模型[%s] 限流 (429, %s)，冷却 %ds，Retry-After=%s",
+                       name, upstream_model, label, secs, retry_after)
         throttle.observe_429(cid, upstream_model)   # 供自学水位
-        gateway.mark_model_status(requested_model, True, f"暂时限流 (HTTP {status})", name, state="limited")
+        if gateway.note_channel_429(cid, upstream_model, retry_after):
+            logger.warning("渠道[%s] 窗口内多个模型连续 429，判定账号级限流，整个渠道熔断 10 分钟", name)
+        gateway.mark_model_status(requested_model, True, text429, name, state="limited")
     elif kind == "server":
         logger.warning("渠道[%s] 模型[%s] 上游服务错误 (%s)", name, upstream_model, status)
         gateway.mark_model_status(requested_model, True, f"上游暂时故障 (HTTP {status})", name, state="limited")
-    else:  # 4xx 客户端类（含 400/402/403/404）—— 通常是付费/权限/参数/已下线，记为硬不可用
-        gateway.mark_model_status(requested_model, False, f"HTTP {status}: {raw[:160]}", name, state="down")
+    else:  # 4xx 客户端类（含 400/402/403/404）—— 通常是付费/权限/参数/已下线
+        gateway.mark_channel_down(upstream_model, cid, f"HTTP {status}: {raw[:160]}")
         logger.warning("渠道[%s] 模型[%s] 请求被拒 (%s): %s", name, upstream_model, status, raw[:150])
-    gateway.mark_result(upstream_model, cid, False, None, kind=kind, retry_after=retry_after)
+    gateway.mark_result(upstream_model, cid, False, None, kind=kind,
+                        retry_after=retry_after, cooldown_seconds=cooldown_seconds)
     store.log_usage(cid, name, requested_model, 0, 0, latency, False,
                     f"HTTP {status}{note}: {raw[:200]}", upstream_model=upstream_model)
     errors.append(f"{name}: HTTP {status}"
@@ -433,7 +507,7 @@ async def model_test(req: Request):
         cs = gateway.channels.get(cid)
         if (not ch or not ch.get("enabled", True) or not cs or not cs.valid
                 or model not in cs.models):
-            gateway.mark_model_status(model, False, "该渠道无效或未提供此模型")
+            # 该渠道没这个模型 ≠ 模型全局不可用，不做全局标记（避免跨渠道污染）
             return {"available": False, "error": "渠道无效、已停用或未提供该模型"}
         candidates = [{"channel": ch, "model": model}]
     else:
@@ -446,40 +520,107 @@ async def model_test(req: Request):
     for cand in candidates:
         ch = cand["channel"]
         upstream_model = cand["model"]
-        upstream_model_for_body = model if upstream_model == model else upstream_model
+        is_or = ch.get("type") == "openrouter"
+        # 深探测渠道：OpenRouter / OpenCode 免费模型里推理类多，
+        # max_tokens=1 会被部分模型以 400 拒绝（0 可用的假象），改用 16-token 真生成 + 重试一次
+        deep = ch.get("type") in ("openrouter", "opencode")
         url = ch["base_url"].rstrip("/") + "/chat/completions"
         headers = {"Authorization": f"Bearer {ch['api_key']}",
                    "Content-Type": "application/json"}
-        try:
-            t0 = time.time()
-            r = await shared_client.post(
-                url,
-                json={"model": upstream_model_for_body,
-                      "messages": [{"role": "user", "content": "ping"}],
-                      "max_tokens": 1},
-                headers=headers)
-            latency = int((time.time() - t0) * 1000)
+        # OpenRouter 付费模型真探测会烧余额（余额还可能变成负数）。
+        # 渠道级扫描时先查免费的提供方元数据（只读、零成本），确认有免费提供方才发真请求
+        if is_or and cid:
+            eps = await providers.openrouter_endpoints(
+                shared_client, upstream_model, ch.get("api_key"))
+            if eps is not None and not any(e.get("free") for e in eps):
+                gateway.mark_channel_down(upstream_model, ch["id"], "非免费模型（所有提供方均收费）")
+                # 补模型级状态：非免费对免费网关即不可用，且必须写 model_status，
+                # 否则 tested 仍为 false，前端会反复把该模型当"未测"重新扫描（死循环）
+                gateway.mark_model_status(model, False, "非免费模型（所有提供方均收费）",
+                                          ch.get("name"), state="down")
+                return {"available": False, "skipped": True, "channel": ch.get("name"),
+                        "error": "跳过：非免费模型（所有提供方均收费），未消耗额度"}
+        attempts = 2 if deep else 1
+        result = None
+        for attempt in range(attempts):
+            try:
+                t0 = time.time()
+                r = await shared_client.post(
+                    url,
+                    json={"model": upstream_model,
+                          "messages": [{"role": "user", "content": "ping"}],
+                          "max_tokens": 16 if deep else 1},
+                    headers=headers)
+                latency = int((time.time() - t0) * 1000)
+            except Exception as e:
+                last_err = f"connect: {e}"
+                gateway.mark_result(upstream_model, ch["id"], False, kind="connect")
+                if attempt + 1 < attempts:
+                    continue
+                if cid:
+                    gateway.mark_model_status(model, False, last_err, ch.get("name"), state="limited")
+                    return {"available": False, "channel": ch.get("name"), "error": last_err}
+                result = {"available": False, "channel": ch.get("name"), "error": last_err}
+                break
             if r.status_code == 200:
+                gateway.note_ratelimit_headers(ch["id"], upstream_model, r.headers)
                 gateway.mark_model_status(model, True, "", ch.get("name"))
                 gateway.mark_result(upstream_model, ch["id"], True, latency)
-                return {"available": True, "channel": ch.get("name"),
-                        "latency_ms": latency}
+                out = {"available": True, "channel": ch.get("name"), "latency_ms": latency}
+                if ch.get("type") == "openrouter":
+                    eps = await providers.openrouter_endpoints(
+                        shared_client, upstream_model, ch.get("api_key"))
+                    note = providers.endpoints_note(eps)
+                    if note:
+                        out["note"] = note
+                return out
             last_err = f"HTTP {r.status_code}: {r.text[:200]}"
-            gateway.mark_result(upstream_model, ch["id"], False,
-                                kind=_kind_of(r.status_code),
-                                retry_after=_parse_retry_after(r.headers))
-            # 400/402/403 = 硬失败(down)；429/5xx = 暂时受限(limited，冷却后会恢复)
-            state = "down" if r.status_code in (400, 402, 403) else "limited"
-            gateway.mark_model_status(model, state == "ok", last_err, ch.get("name"), state=state)
-            if r.status_code in (400, 402, 403) or cid:
-                return {"available": state == "ok", "channel": ch.get("name"),
-                        "error": last_err, "status": r.status_code}
-        except Exception as e:
-            last_err = f"connect: {e}"
-            if cid:
-                gateway.mark_model_status(model, False, last_err, ch.get("name"), state="limited")
-                return {"available": False, "channel": ch.get("name"), "error": last_err}
-    return {"available": False, "error": last_err or "所有渠道均失败"}
+            gateway.note_ratelimit_headers(ch["id"], upstream_model, r.headers)
+            if r.status_code == 429:
+                label429, secs429, _ = gateway.classify_429(r.text[:300])
+                # 余额不足型 429（正文含"余额/充值/购买"等，或平台确认余额≤0）→ 硬不可用，等也不会恢复
+                if gateway.is_permanent_failure(429, r.text[:300]) or (
+                        label429 == "daily" and _quota_exhausted(ch["id"])):
+                    gateway.mark_channel_down(upstream_model, ch["id"],
+                                              "账户余额不足，需充值 (HTTP 429)")
+                    gateway.mark_model_status(model, False, "账户余额不足，需充值",
+                                              ch.get("name"), state="down")
+                    gateway.mark_result(upstream_model, ch["id"], False, kind="rate_limit")
+                    return {"available": False, "skipped": True, "channel": ch.get("name"),
+                            "error": "余额不足 (HTTP 429)，按不可用处理"}
+                gateway.note_channel_429(ch["id"], upstream_model,
+                                         _parse_retry_after(r.headers))
+                gateway.mark_result(upstream_model, ch["id"], False,
+                                    kind=_kind_of(r.status_code), cooldown_seconds=secs429)
+            else:
+                gateway.mark_result(upstream_model, ch["id"], False,
+                                    kind=_kind_of(r.status_code),
+                                    retry_after=_parse_retry_after(r.headers))
+            # 深探测渠道 429/5xx 通常是单次上游抽风，重试一次再定论
+            if (deep and attempt + 1 < attempts
+                    and r.status_code in (429, 500, 502, 503, 504)):
+                await asyncio.sleep(1.5)
+                continue
+            # 400/402/403/404/405（付费/权限/参数/已下线）+ 余额不足 429 → 永久不可用，记 down
+            hard = gateway.is_permanent_failure(r.status_code, r.text[:200])
+            if hard:
+                gateway.mark_channel_down(upstream_model, ch["id"], last_err)
+            state = "down" if hard else "limited"
+            gateway.mark_model_status(model, False, last_err, ch.get("name"), state=state)
+            out = {"available": False, "channel": ch.get("name"),
+                   "error": last_err, "status": r.status_code}
+            if ch.get("type") == "openrouter" and not hard:
+                # 附加免费只读的上游提供方体检信息，帮用户判断是模型问题还是提供方问题
+                eps = await providers.openrouter_endpoints(
+                    shared_client, upstream_model, ch.get("api_key"))
+                note = providers.endpoints_note(eps)
+                if note:
+                    out["note"] = note
+            if hard or cid:
+                return out
+            result = out  # 非强制渠道且暂时受限 → 继续尝试下一候选
+            break
+    return result or {"available": False, "error": last_err or "所有渠道均失败"}
 
 
 @app.post("/v1/embeddings")
@@ -566,6 +707,7 @@ async def overview():
             "valid": cs.valid, "error": cs.error, "last_check": cs.last_check,
             "latency_ms": cs.latency_ms, "models_count": len(cs.models),
             "models_available_count": gateway.channel_available_models(ch["id"]),
+            "cool_until": gateway.channel_cool.get(ch["id"], 0),
             "quota": cs.quota, "quota_ts": cs.quota_ts, "quota_error": cs.quota_error,
         })
     models = gateway.model_view(cfg)

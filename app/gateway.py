@@ -1,4 +1,5 @@
 """运行时状态：渠道健康、模型注册表、评分排序、错误分类冷却"""
+import collections
 import time
 
 from . import capability, providers, throttle
@@ -14,8 +15,21 @@ COOLDOWN_SECONDS = {
 DEFAULT_COOLDOWN = 120
 
 cooldown: dict = {}   # (上游模型ID, channel_id) -> 冷却截止时间
+unverified: set = set()  # 冷却到期但还没实测确认恢复的 (模型, 渠道)
 stats: dict = {}      # (上游模型ID, channel_id) -> {"score": 0~1, "latency": EMA毫秒}
 model_status: dict = {}  # model_id -> {"available": bool, "reason": str, "ts": float, "channel": str}
+channel_down: dict = {}  # (上游模型ID, channel_id) -> {"reason": str, "ts": float} 该渠道上此模型硬不可用
+# 上游响应头里的官方限流信息（Groq/NIM 等返回 x-ratelimit-*）：(模型, 渠道) -> {"remaining": int, "reset_ts": float}
+ratelimit: dict = {}
+last_probe_ok: dict = {}  # (模型, 渠道) -> 上次探测成功的 ts（魔搭等按次计费平台用于省探测预算）
+
+# ---- 渠道级 429 熔断（修魔搭等账号级限流：整个 Key 被限，所有模型一起 429）----
+_CH429_WINDOW = 600    # 10 分钟窗口
+_CH429_MIN_MODELS = 2  # 窗口内 ≥2 个不同模型撞 429 → 判定账号级限流
+_CH429_COOL = 600      # 渠道冷却 10 分钟
+_channel_429_events: dict = {}  # channel_id -> deque[(ts, model_id)]
+channel_cool: dict = {}  # channel_id -> 冷却截止时间
+channel_last_ok: dict = {}  # channel_id -> 最近一次成功请求的 ts（区分账号级/按模型限流）
 
 
 class ChannelState:
@@ -49,9 +63,151 @@ def sync_channels(cfg: dict):
     for key in list(cooldown):
         if key[1] not in ids:
             cooldown.pop(key, None)
+    unverified.difference_update(k for k in list(unverified) if k[1] not in ids)
     for key in list(stats):
         if key[1] not in ids:
             stats.pop(key, None)
+    for key in list(channel_down):
+        if key[1] not in ids:
+            channel_down.pop(key, None)
+    for key in list(ratelimit):
+        if key[1] not in ids:
+            ratelimit.pop(key, None)
+    for key in list(last_probe_ok):
+        if key[1] not in ids:
+            last_probe_ok.pop(key, None)
+    for cid in list(channel_cool):
+        if cid not in ids:
+            channel_cool.pop(cid, None)
+            _channel_429_events.pop(cid, None)
+    for cid in list(channel_last_ok):
+        if cid not in ids:
+            channel_last_ok.pop(cid, None)
+
+
+def mark_channel_down(mid: str, cid: str, reason: str):
+    """该渠道上的该模型硬不可用（402/403/404/400 等），按 (模型, 渠道) 记录，
+    不再污染同名模型在其他渠道的状态。恢复路径：真实请求成功或手动测试。"""
+    channel_down[(mid, cid)] = {"reason": (reason or "")[:200], "ts": time.time()}
+    save_runtime_state()   # 关键硬失败证据即时落盘，不排队等节流，保证扫描结果重启不丢
+
+
+def mark_channel_up(mid: str, cid: str):
+    channel_down.pop((mid, cid), None)
+    save_runtime_state()
+
+
+# ---- 429 响应体分类：区分"每分钟限流"（等一会就好）和"每日额度/余额用完"（等也没用）----
+_DAILY_429 = ("daily", "per day", "day limit", "monthly", "quota", "balance", "credit",
+              "recharge", "top up", "purchase",
+              "额度", "今日", "每日", "当日", "已用完", "用尽", "余额", "充值", "资源包")
+_MINUTE_429 = ("per minute", "per-min", "rpm", "per hour", "too frequent",
+               "每分钟", "频繁", "速率", "minute limit")
+
+
+def classify_429(body: str) -> tuple:
+    """解析 429 响应体 → (类型, 建议冷却秒数, 可读说明)。
+    daily → 冷却到明天凌晨；minute → 90 秒；认不出 → 默认 300 秒。"""
+    text = (body or "").lower()
+    if any(k in text for k in _DAILY_429):
+        # 冷却到下一个 00:05（额度一般按天刷新，留 5 分钟缓冲）
+        t = time.localtime()
+        secs = (24 - t.tm_hour - 1) * 3600 + (60 - t.tm_min - 1) * 60 + (65 - t.tm_sec)
+        return ("daily", min(max(secs, 600), 86400), "今日额度已用完，冷却至明天")
+    if any(k in text for k in _MINUTE_429):
+        return ("minute", 90, "每分钟限流，90 秒后重试")
+    return ("unknown", 300, "暂时限流")
+
+
+# 永久不可用判定：这些错误「冷却到明天」也不会自愈，应记 down 而非 limited
+_PERMANENT_KEYWORDS = (
+    "余额", "充值", "资源包", "已用完", "用尽", "购买", "balance", "credit",
+    "recharge", "top up", "purchase", "insufficient", "not have sufficient",
+    "never purchase", "only available", "非免费", "所有提供方均收费",
+)
+
+
+def is_permanent_failure(status: int, text: str = "") -> bool:
+    """HTTP 状态/响应体是否为「永久不可用」（down），而非「暂时受限」（limited）。
+
+    - 400/402/403/404/405：付费/权限/参数/已下线 → 等也不会恢复，记 down。
+    - 429 且正文含「余额/充值/购买」等：额度用尽需人工充值 → 记 down。
+    - 其余 429（每分钟限流）/5xx/连接失败 → 暂时受限，记 limited。"""
+    if status in (400, 402, 403, 404, 405):
+        return True
+    if status == 429:
+        t = (text or "").lower()
+        return any(k in t for k in _PERMANENT_KEYWORDS)
+    return False
+
+
+# ---- 上游 x-ratelimit-* 响应头（Groq/NIM 等）：官方给的剩余额度，比自学水位精确 ----
+def _parse_duration(s: str) -> float:
+    """解析 Groq 风格时长 "2m39.5s" / "1h" / "45s"，失败返回 0"""
+    import re
+    m = re.match(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?$", (s or "").strip())
+    if not m or not any(m.groups()):
+        return 0.0
+    h, mi, sec = m.groups()
+    return int(h or 0) * 3600 + int(mi or 0) * 60 + float(sec or 0)
+
+
+def note_ratelimit_headers(cid: str, mid: str, headers) -> bool:
+    """从响应头读官方限流信息并记录。返回 True 表示本次记录到有效数据。"""
+    try:
+        remaining = headers.get("x-ratelimit-remaining-requests")
+        if remaining is None:
+            remaining = headers.get("x-ratelimit-remaining")
+        if remaining is None:
+            return False
+        reset_raw = (headers.get("x-ratelimit-reset-requests")
+                     or headers.get("x-ratelimit-reset") or "")
+        secs = _parse_duration(reset_raw)
+        ratelimit[(mid, cid)] = {
+            "remaining": int(float(remaining)),
+            "reset_ts": time.time() + secs if secs else 0,
+        }
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def ratelimit_exhausted(mid: str, cid: str, now: float = None) -> bool:
+    """官方头显示剩余请求数为 0 且还没到重置时间 → 路由前直接跳过"""
+    st = ratelimit.get((mid, cid))
+    if not st or st["remaining"] > 0:
+        return False
+    now = now if now is not None else time.time()
+    if st["reset_ts"] and st["reset_ts"] <= now:
+        ratelimit.pop((mid, cid), None)  # 已重置，解除
+        return False
+    return True
+
+
+def note_channel_429(cid: str, mid: str, retry_after: int = None):
+    """渠道级 429 计数：窗口内 ≥2 个不同模型撞 429 → 判定账号级限流，整个渠道进冷却。
+    这样魔搭这类按 Key 限流的平台被限后，UI 会显示受限而不是全绿。
+    例外：渠道 2 分钟内刚有成功请求 → 更可能是"按模型限流"（Gemini 等免费档每个模型
+    有独立 RPM），账号级限流会让成功请求也一起停，所以有成功就不熔断。"""
+    now = time.time()
+    last_ok = channel_last_ok.get(cid)
+    if last_ok and now - last_ok < 120:
+        return False
+    dq = _channel_429_events.setdefault(cid, collections.deque(maxlen=500))
+    dq.append((now, mid))
+    while dq and dq[0][0] < now - _CH429_WINDOW:
+        dq.popleft()
+    distinct = {m for _, m in dq}
+    if len(distinct) >= _CH429_MIN_MODELS:
+        seconds = max(_CH429_COOL, min(retry_after or 0, 1800))
+        channel_cool[cid] = now + seconds
+        return True
+    return False
+
+
+def channel_cooling(cid: str, now: float = None) -> bool:
+    now = now if now is not None else time.time()
+    return channel_cool.get(cid, 0) > now
 
 
 def mark_model_status(model: str, available: bool, reason: str = "", channel: str = "",
@@ -59,10 +215,11 @@ def mark_model_status(model: str, available: bool, reason: str = "", channel: st
     """记一次模型级测试/调用的真实结果并持久化。
 
     state: 'ok' 免费可调 / 'limited' 暂时受限（429/5xx/连接，冷却后会恢复）/ 'down' 硬不可用。
-    available 与 state 联动：只有 'down' 才视作不可路由。"""
+    available 由 state 唯一决定：只有 'ok' 才可路由。'limited'（受限）也**不可路由**——
+    否则「余额不足/限流」的模型会冒充可用，一用就报错。"""
     if state is None:
         state = "ok" if available else "down"
-    model_status[model] = {"available": state != "down", "state": state,
+    model_status[model] = {"available": state == "ok", "state": state,
                            "reason": (reason or "")[:200],
                            "ts": time.time(), "channel": channel}
     try:
@@ -73,40 +230,226 @@ def mark_model_status(model: str, available: bool, reason: str = "", channel: st
 
 
 def restore_model_status():
-    """启动时从磁盘恢复已测状态（避免每次重启都要重新扫描）"""
+    """启动时从磁盘恢复已测状态，并修正旧数据的 available 语义。
+
+    历史 bug：旧版本把 'limited' 的 available 也写成 True，导致受限模型重启后冒充可用。
+    这里按 state 重新推导 available，并把「余额不足 / 402/403/404 / 非免费」这类永久不可用
+    从 limited 归正为 down，无需手动清库。归正后的正确结果会一次性回写磁盘。"""
     from . import store
-    for mid, entry in store.load_model_status().items():
-        if isinstance(entry, dict) and "available" in entry:
-            model_status[mid] = entry
+    # 复用永久不可用关键词，另加状态码串（reason 里是 "HTTP 402: ..." 这种文本）
+    _PERM_REASONS = _PERMANENT_KEYWORDS + ("402", "403", "404", "405")
+    dirty = False
+    raw = store.load_model_status()
+    # DEBUG: print dirty decision process
+    for mid, entry in raw.items():
+        if not isinstance(entry, dict) or "available" not in entry:
+            continue
+        entry = dict(entry)
+        st = entry.get("state")
+        reason = (entry.get("reason") or "").lower()
+        if st == "limited" and any(k in reason for k in _PERM_REASONS):
+            st = "down"
+        st = st or ("ok" if entry.get("available") else "down")
+        new_avail = (st == "ok")
+        if entry.get("state") != st or entry.get("available") != new_avail:
+            dirty = True
+        entry["state"] = st
+        entry["available"] = new_avail
+        model_status[mid] = entry
+    # DEBUG
+    if dirty:
+        import logging
+        logging.getLogger("api-hub").info(f"restore_model_status: 将回写磁盘，脏数据条数待统计")
+    if dirty:
+        # 一次性迁移：把修正后的正确状态回写磁盘，避免旧脏数据被别处读盘再次误用
+        try:
+            store._atomic_write(store.MODEL_STATUS_PATH, model_status)
+        except Exception:
+            import logging
+            logging.getLogger("api-hub").warning("归正后的模型状态回写失败，不影响内存态")
+
+
+# ---- 运行时状态持久化：冷却/待验证/渠道级硬失败落盘，重启不丢扫描结果 ----
+_save_ts = {"v": 0.0}
+_save_dirty = {"v": False}
+
+
+def save_runtime_state():
+    from . import store
+    now = time.time()
+    try:
+        store.persist_runtime_state({
+            "saved_at": round(now, 1),
+            "cooldown": {f"{k[0]}|{k[1]}": round(v, 1) for k, v in cooldown.items() if v > now},
+            "unverified": [f"{k[0]}|{k[1]}" for k in unverified],
+            "channel_down": {f"{k[0]}|{k[1]}": v for k, v in channel_down.items()},
+            "ratelimit": {f"{k[0]}|{k[1]}": v for k, v in ratelimit.items()},
+            "throttle": throttle.snapshot(),
+        })
+    except Exception:
+        pass  # 持久化失败不影响内存状态
+
+
+def restore_runtime_state():
+    """启动时恢复上一轮扫描/请求留下的失败与冷却记录"""
+    from . import store
+    data = store.load_runtime_state()
+    now = time.time()
+    n_cool = 0
+    for k, v in (data.get("cooldown") or {}).items():
+        if v > now:
+            mid, _, cid = k.partition("|")
+            if mid and cid:
+                cooldown[(mid, cid)] = v
+                n_cool += 1
+    for k in data.get("unverified") or []:
+        mid, _, cid = k.partition("|")
+        if mid and cid:
+            unverified.add((mid, cid))
+    for k, v in (data.get("channel_down") or {}).items():
+        mid, _, cid = k.partition("|")
+        if mid and cid:
+            channel_down[(mid, cid)] = v
+    for k, v in (data.get("ratelimit") or {}).items():
+        mid, _, cid = k.partition("|")
+        if mid and cid and isinstance(v, dict) and "remaining" in v:
+            ratelimit[(mid, cid)] = v
+    # 恢复 429 自学水位（throttle），并给仍在有效期内的 (渠道,模型) 一个保守短冷却，
+    # 避免重启后受限模型立刻回绿、再次集中撞限（这是 Gemini/NIM 重启变绿的直接原因）
+    throttle.restore(data.get("throttle") or {})
+    n_seeded = 0
+    for cid, mid in throttle.learned_pairs():
+        key = (mid, cid)
+        if cooldown.get(key, 0) <= now:
+            cooldown[key] = now + 300  # 与 rate_limit 默认冷却一致
+            n_seeded += 1
+    import logging
+    logging.getLogger("api-hub").info(
+        "已恢复运行时状态：冷却 %d，待验证 %d，渠道级硬失败 %d，限流头 %d，429 预判 %d（seed 冷却 %d）",
+        n_cool, len(unverified), len(channel_down), len(ratelimit),
+        len(throttle.learned_pairs()), n_seeded)
+
+
+def _request_save():
+    """落盘请求：节流合并写盘，扫描几百个模型时不会疯狂写盘；
+    关键状态（channel_down）已走 mark_channel_down 即时落盘，不受此处节流影响。"""
+    _save_dirty["v"] = True
+    if time.time() - _save_ts["v"] >= 1:  # 3s → 1s，缩小冷却/待验证状态的丢失窗口
+        _save_ts["v"] = time.time()
+        _save_dirty["v"] = False
+        save_runtime_state()
+
+
+def flush_runtime_state():
+    """后台循环定期调用：把挂起的脏状态落盘"""
+    if _save_dirty["v"]:
+        _save_dirty["v"] = False
+        _save_ts["v"] = time.time()
+        save_runtime_state()
 
 
 def get_model_status(model: str):
  return model_status.get(model)
 
 
-def _update_score(model: str, cid: str, ok: bool, latency_ms=None):
-    """滑动评分：成功 0.8*旧+0.2，失败 0.8*旧；延迟做 7:3 EMA"""
+def _update_score(model: str, cid: str, ok: bool, latency_ms=None, kind: str = None):
+    """滑动评分：成功 0.8*旧+0.2；失败按类型降分（连接类更狠，让受限/挂起的渠道快速沉底）。
+    延迟做 7:3 EMA。"""
     s = stats.setdefault((model, cid), {"score": 0.7, "latency": None})
-    s["score"] = round(s["score"] * 0.8 + (0.2 if ok else 0.0), 3)
+    if ok:
+        s["score"] = round(s["score"] * 0.8 + 0.2, 3)
+    else:
+        # 连接失败/超时：0.5 衰减，快速沉底，避免受限渠道霸占候选第一长时间白等
+        decay = 0.5 if kind in ("connect",) else 0.8
+        s["score"] = round(s["score"] * decay, 3)
     if ok and latency_ms:
         s["latency"] = latency_ms if s["latency"] is None else int(s["latency"] * 0.7 + latency_ms * 0.3)
 
 
 def mark_result(model: str, cid: str, ok: bool, latency_ms=None,
-                kind: str = None, retry_after: int = None):
-    """记录一次真实请求结果：成功解除冷却并加分，失败按类型冷却并扣分"""
-    _update_score(model, cid, ok, latency_ms)
+                kind: str = None, retry_after: int = None, cooldown_seconds: int = None):
+    """记录一次真实请求结果：成功解除冷却并加分，失败按类型冷却并扣分。
+    cooldown_seconds 由 429 响应体分类给出（每日额度/每分钟限流），优先级最高；
+    其次是上游 Retry-After 头；都没有才用按 kind 的默认冷却。"""
+    _update_score(model, cid, ok, latency_ms, kind=kind)
+    key = (model, cid)
     if ok:
-        cooldown.pop((model, cid), None)
+        cooldown.pop(key, None)
+        unverified.discard(key)      # 实测成功 → 恢复状态被确认
+        channel_down.pop(key, None)  # 之前硬失败的 (模型,渠道) 也随之恢复
+        channel_last_ok[cid] = time.time()
     else:
         seconds = COOLDOWN_SECONDS.get(kind, DEFAULT_COOLDOWN)
-        if retry_after and retry_after > 0:
+        if retry_after and retry_after > 0 and not cooldown_seconds:
             seconds = max(seconds, min(retry_after, 3600))
-        cooldown[(model, cid)] = time.time() + seconds
+        if cooldown_seconds:
+            seconds = cooldown_seconds
+        cooldown[key] = time.time() + seconds
+        unverified.add(key)  # 冷却到期后仍显示受限，直到实测/探测成功才转绿
+    _request_save()
 
 
 def get_stat(model: str, cid: str) -> dict:
     return stats.get((model, cid), {"score": 0.7, "latency": None})
+
+
+# ---------------- 模型 ID 命名变更 → 旧状态迁移 ----------------
+# OpenRouter 2025 年起把模型 ID 从 `Org/Model` 规范为 `vendor/model`（全小写）。
+# 已测的 down/limited 状态若还挂在旧命名上，重启 refresh 后会因旧 ID 不在新列表
+# 而失联，新名模型 test=false 默认可用 → 「不可用模型重启变绿」。
+# 这里在刷新拿到新列表时做「确定等价」的迁移，避免把不同模型错配。
+_ORG_VENDOR = {   # OpenRouter 旧 Org 前缀 → 新 vendor 前缀（已知确定等价）
+    "coherelabs": "cohere",
+    "minimaxai": "minimax",
+}
+
+
+def _model_key(mid: str) -> str:
+    """归一化模型 ID 用于跨命名匹配：小写、Org→vendor 前缀映射、分隔符统一为 '-'。"""
+    import re as _re
+    s = (mid or "").lower().strip()
+    prefix = s.split("/")[0]
+    if prefix in _ORG_VENDOR:
+        s = _ORG_VENDOR[prefix] + s[len(prefix):]
+    s = s.replace(" ", "-")
+    s = _re.sub(r"[:/_.]+", "-", s)
+    return s
+
+
+def _migrate_named_models(ch: dict, old_models: list, new_models: list):
+    """渠道模型列表刷新后，把旧命名的 down/limited 状态迁移到新命名。
+
+    仅当旧 ID 归一化 key 与某个新 ID 归一化 key 完全一致才迁移（含 Org→vendor
+    前缀映射），避免错配。仅对 openrouter 启用（其余渠道模型 ID 稳定）。"""
+    if ch.get("type") != "openrouter" or not old_models:
+        return
+    new_set = set(new_models)
+    # 新列表里每个归一化 key → 新 ID；key 重复则放弃该 key（歧义不迁移）
+    key_to_new = {}
+    for n in new_models:
+        k = _model_key(n)
+        key_to_new[k] = None if k in key_to_new else n
+    cid = ch["id"]
+    migrated = 0
+    for old_mid in list(model_status.keys()):
+        if old_mid in new_set:
+            continue
+        nk = key_to_new.get(_model_key(old_mid))
+        if nk:
+            model_status[nk] = model_status.pop(old_mid)
+            migrated += 1
+    for key in list(channel_down.keys()):
+        mid, kcid = key
+        if kcid != cid or mid in new_set:
+            continue
+        nk = key_to_new.get(_model_key(mid))
+        if nk:
+            channel_down[(nk, cid)] = channel_down.pop(key)
+            migrated += 1
+    if migrated:
+        import logging
+        logging.getLogger("api-hub").info(
+            "渠道[%s] 模型命名变更，已迁移 %d 条旧状态到新命名", ch.get("name"), migrated)
 
 
 async def refresh_channel(client, ch: dict) -> ChannelState:
@@ -115,6 +458,7 @@ async def refresh_channel(client, ch: dict) -> ChannelState:
     t0 = time.time()
     try:
         ids = await providers.fetch_models(client, ch["base_url"], ch["api_key"])
+        _migrate_named_models(ch, cs.models, ids)  # 命名变更 → 旧 down/limited 迁移到新名
         cs.models = ids
         cs.valid = True
         cs.error = None
@@ -222,13 +566,20 @@ def candidates_for(model: str, cfg: dict) -> list:
                 if not cs or cs.valid is not True or mid not in cs.models:
                     continue
                 key = (mid, ch["id"])
-                if key in seen:
+                if key in seen or key in channel_down:
                     continue
-                if not ignore_cooldown and cooldown.get(key, 0) > now:
+                # 官方 x-ratelimit 头显示额度耗尽且未重置 → 本轮跳过
+                if ratelimit_exhausted(mid, ch["id"], now):
                     continue
-                # 429 自学预判：预计这条会越线 → 本轮跳过（仍有兜底逻辑）
-                if not ignore_cooldown and preempt and throttle.blocked(ch["id"], mid):
+                # 渠道级熔断（账号级限流）：整条渠道先跳过
+                if channel_cooling(ch["id"], now):
                     continue
+                if not ignore_cooldown:
+                    if cooldown.get(key, 0) > now:
+                        continue
+                    # 429 自学预判：预计这条会越线 → 本轮跳过（仍有兜底逻辑）
+                    if preempt and throttle.blocked(ch["id"], mid):
+                        continue
                 seen.add(key)
                 out.append({"channel": ch, "model": mid})
 
@@ -245,7 +596,9 @@ def model_view(cfg: dict) -> list:
     """模型视图：状态三档 —— ok(免费可调/绿) / limited(暂时限流或冷却/黄) / down(硬不可用/红)
 
     语义：暂时超过额度被限流的模型仍算「可用」范畴，只是标注受限；仅 402/403/下线 等
-    硬失败才记为 down。"""
+    硬失败才记为 down，且按 (模型, 渠道) 粒度记录——只有所有渠道都硬失败才算整个模型 down。
+    冷却到期但未实测确认（unverified）、429 预判跳过（preempted）、渠道级熔断（账号级限流）
+    都会让该渠道显示受限，避免「界面绿色但实际用不了」。"""
     now = time.time()
     agg = {}
     for ch in cfg["channels"]:
@@ -254,16 +607,26 @@ def model_view(cfg: dict) -> list:
         cs = channels.get(ch["id"])
         if not cs:
             continue
+        ch_cool = channel_cooling(ch["id"], now)
+        preempt = cfg.get("adaptive_preemption", True)
         for m in cs.models:
+            key = (m, ch["id"])
             entry = agg.setdefault(m, [])
-            in_cool = cooldown.get((m, ch["id"]), 0) > now
-            ch_ok = bool(cs.valid) and not in_cool
+            in_cool = cooldown.get(key, 0) > now or key in unverified
+            ch_down = key in channel_down
+            preempted = bool(preempt and not in_cool and not ch_down
+                             and not ch_cool and throttle.blocked(ch["id"], m))
+            ms_m = model_status.get(m)
+            model_down = ms_m is not None and not ms_m.get("available")
             s = get_stat(m, ch["id"])
             entry.append({
                 "channel_id": ch["id"],
                 "channel_name": ch.get("name") or ch["type"],
-                "available": ch_ok,
-                "in_cooldown": in_cool,
+                "available": bool(cs.valid) and not ch_cool and not ch_down
+                             and not in_cool and not preempted and not model_down,
+                "in_cooldown": in_cool or ch_cool,
+                "down": ch_down,
+                "preempted": preempted,
                 "latency_ms": cs.latency_ms,
                 "score": s["score"],
             })
@@ -271,19 +634,20 @@ def model_view(cfg: dict) -> list:
     for m, chans in agg.items():
         ms = model_status.get(m)
         any_ok = any(c["available"] for c in chans)
-        any_cool = any(c["in_cooldown"] for c in chans)
+        any_cool = any(c["in_cooldown"] or c["preempted"] for c in chans)
+        all_down = bool(chans) and all(c["down"] for c in chans)
         tested = ms is not None
         reason = (ms.get("reason", "") if ms else "")
         ms_state = ms.get("state") if ms else None
-        if ms is not None and (ms_state == "down"
-                               or (ms_state is None and not ms.get("available"))):
-            status = "down"          # 402/403/下线 等硬失败
+        if all_down or (ms is not None and (ms_state == "down"
+                        or (ms_state is None and not ms.get("available")))):
+            status = "down"          # 全部渠道硬失败（402/403/下线 等）
             available = False
         elif any_ok:
             status = "ok"            # 免费且当前可调
             available = True
         elif any_cool or ms_state == "limited":
-            status = "limited"       # 暂时限流/冷却中，仍算可用范畴
+            status = "limited"       # 暂时限流/冷却/预判跳过中，仍算可用范畴
             available = False
         else:
             status = "down"
@@ -313,8 +677,11 @@ def alias_view(cfg: dict) -> list:
         for t in targets:
             for ch in cfg["channels"]:
                 cs = channels.get(ch["id"])
-                if (ch.get("enabled", True) and cs and cs.valid
-                        and t in cs.models and cooldown.get((t, ch["id"]), 0) <= now):
+                if (ch.get("enabled", True) and cs and cs.valid and t in cs.models
+                        and not channel_cooling(ch["id"], now)
+                        and (t, ch["id"]) not in channel_down
+                        and (t, ch["id"]) not in unverified
+                        and cooldown.get((t, ch["id"]), 0) <= now):
                     ok = True
                     break
             if ok:
@@ -365,9 +732,15 @@ def candidates_for_auto(strategy: str, cfg: dict) -> list:
         cs = channels.get(ch["id"])
         if not cs or not cs.valid:
             continue
+        if channel_cooling(ch["id"], now):
+            continue  # 渠道级熔断（账号级限流）中
         for m in cs.models:
             key = (m, ch["id"])
-            if key in seen or cooldown.get(key, 0) > now:
+            if key in seen or key in channel_down:
+                continue
+            if ratelimit_exhausted(m, ch["id"], now):
+                continue
+            if cooldown.get(key, 0) > now:
                 continue
             ms = model_status.get(m)
             if ms is not None and not ms.get("available"):
@@ -388,14 +761,17 @@ def list_reserved_auto() -> list:
 
 
 def channel_available_models(cid: str) -> int:
-    """某渠道「当前可用」的模型数：不在冷却且未被模型级标记为不可用"""
+    """某渠道「当前可用」的模型数：不在冷却、未被模型级标记不可用、渠道未熔断"""
     cs = channels.get(cid)
     if not cs:
+        return 0
+    if channel_cooling(cid):
         return 0
     now = time.time()
     avail = 0
     for m in cs.models:
-        if cooldown.get((m, cid), 0) > now:
+        key = (m, cid)
+        if cooldown.get(key, 0) > now or key in unverified or key in channel_down:
             continue
         ms = model_status.get(m)
         if ms is not None and not ms.get("available"):

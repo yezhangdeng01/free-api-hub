@@ -17,8 +17,6 @@
   header h1 span { color: var(--accent); }
   .chip { font-family: var(--mono); font-size: 12px; color: var(--muted); background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; user-select: none; }
   .chip:hover { color: var(--accent); border-color: var(--accent-dim); }
-  #refresh-btn { margin-left: auto; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
-  #refresh-btn:hover { border-color: var(--accent-dim); color: var(--accent); }
   nav { display: flex; gap: 4px; padding: 0 24px; background: var(--panel); border-bottom: 1px solid var(--border); }
   nav button { background: none; border: none; color: var(--muted); font-size: 14px; padding: 11px 18px; cursor: pointer; border-bottom: 2px solid transparent; }
   nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
@@ -103,7 +101,6 @@
   <h1>API <span>Hub</span> · 大模型聚合网关</h1>
   <div class="chip" id="gw-url" title="点击复制网关地址">加载中…</div>
   <div class="chip" id="gw-token" title="点击复制网关 Token（在第三方工具里当 API Key 用）" style="display:none">Token…</div>
-  <button id="refresh-btn">↻ 刷新全部</button>
 </header>
 <nav>
   <button data-tab="models" class="active">模型</button>
@@ -282,7 +279,7 @@
 
 <script>
 const $ = s => document.querySelector(s);
-const PRESETS = {zhipu:"智谱 GLM", openrouter:"OpenRouter", gemini:"Google Gemini", openai:"OpenAI", nim:"NVIDIA NIM", siliconflow:"硅基流动", groq:"Groq", cerebras:"Cerebras", mistral:"Mistral", cohere:"Cohere", modelscope:"魔搭 ModelScope", huggingface:"HuggingFace", together:"Together AI", zai:"智谱国际 Z.ai", agnes:"Agnes AI", custom:"自定义 (OpenAI 兼容)"};
+const PRESETS = {zhipu:"智谱 GLM", openrouter:"OpenRouter", gemini:"Google Gemini", openai:"OpenAI", nim:"NVIDIA NIM", siliconflow:"硅基流动", groq:"Groq", cerebras:"Cerebras", mistral:"Mistral", cohere:"Cohere", modelscope:"魔搭 ModelScope", opencode:"OpenCode Zen", huggingface:"HuggingFace", together:"Together AI", zai:"智谱国际 Z.ai", agnes:"Agnes AI", custom:"自定义 (OpenAI 兼容)"};
 const STRATEGIES = {balanced:"均衡（稳定优先，兼顾速度）", quality:"智能优先（先强模型）", stability:"稳定优先（成功率最高）", speed:"速度优先（延迟最低）"};
 const MODEL_TIERS = {1:"轻量", 2:"中档", 3:"智能"};
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -311,11 +308,6 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   if (b.dataset.tab === "stats") { loadStats(); loadLogs(); }
 });
 $("#gw-url").onclick = () => copyText(overview?.gateway?.base_url || "");
-$("#refresh-btn").onclick = async () => {
-  $("#refresh-btn").textContent = "刷新中…";
-  try { await api("/api/refresh", {}); toast("已刷新模型与额度"); } catch(e){ toast("刷新失败: "+e.message); }
-  await loadOverview(); $("#refresh-btn").textContent = "↻ 刷新全部";
-};
 
 async function api(path, body, method){
   const opt = body !== undefined
@@ -572,8 +564,9 @@ async function testModel(model, btn){
   if (btn) { btn.disabled = true; btn.textContent = "..."; }
   try {
     const r = await api("/api/models/test", {model});
-    toast(r.available ? `✔ ${model} 可用 · ${r.channel||""} ${fmtLatency(r.latency_ms||0)}`
-                       : `✘ ${model} 不可用：${(r.error||"").slice(0,120)}`);
+    const note = r.note ? `\n${r.note}` : "";
+    toast(r.available ? `✔ ${model} 可用 · ${r.channel||""} ${fmtLatency(r.latency_ms||0)}${note}`
+                       : `✘ ${model} 不可用：${(r.error||"").slice(0,120)}${note}`);
     await loadOverview();
   } catch(e){ toast("测试失败："+e.message); }
   finally { if (btn) { btn.disabled = false; btn.textContent = "测试"; } }
@@ -582,16 +575,21 @@ async function testModel(model, btn){
 $("#pg-test-all").onclick = async () => {
   const targets = (overview?.models||[]).filter(m => !m.tested && m.any_channel_available);
   if (!targets.length) { toast("没有未测试的模型"); return; }
-  if (!confirm(`将对 ${targets.length} 个未测试模型各发一次 1 token 探测（会消耗少量额度），继续？`)) return;
+  if (!confirm(`将对 ${targets.length} 个未测试模型各发一次探测（会消耗少量额度），继续？`)) return;
   const btn = $("#pg-test-all"); btn.disabled = true; btn.textContent = "测试中…";
-  let ok = 0, fail = 0;
-  for (const m of targets){
-    try {
-      const r = await api("/api/models/test", {model: m.id});
-      if (r.available) ok++; else fail++;
-    } catch { fail++; }
-  }
-  btn.disabled = false; btn.textContent = "测试未测模型";
+  let ok = 0, fail = 0, done = 0;
+  const worker = async () => {
+    while (done < targets.length){
+      const m = targets[done++];
+      try {
+        const r = await api("/api/models/test", {model: m.id});
+        if (r.available) ok++; else fail++;
+      } catch { fail++; }
+      await new Promise(r => setTimeout(r, 200));  // 串行限速，避免集中撞限流
+    }
+  };
+  await worker();  // 单 worker 串行（原 3 路并发会集中打爆限流）
+  btn.disabled = false; btn.textContent = "测试未测";
   toast(`完成：可用 ${ok} 个，不可用 ${fail} 个`);
   await loadOverview();
 };
@@ -638,43 +636,73 @@ $("#cfg-import").onclick = async () => {
 };
 
 // ---- 渠道级扫描全部模型 ----
-const scanState = {running: false};
+// 扫描进度按渠道存状态：卡片被重新渲染后（loadOverview 会重建 DOM）也能恢复显示
+const scanState = {};
+function renderScanLine(cid){
+  const el = $("#scanprog-"+cid);
+  const st = scanState[cid];
+  if (!el || !st) return;
+  el.style.display = "";
+  el.style.color = st.running ? "var(--muted)" : (st.ok ? "var(--ok)" : "var(--bad)");
+  const skipNote = st.skip ? (st.skipNote ? `（${st.skipNote}）` : "") : "";
+  el.textContent = st.running
+    ? `扫描中 ${st.done}/${st.N} · 可用 ${st.ok} · 不可用 ${st.fail}` + (st.skip ? ` · 跳过 ${st.skip}` : "")
+    : `上次扫描：${st.N} 个，可用 ${st.ok}，不可用 ${st.fail}` + (st.skip ? `，跳过 ${st.skip}${skipNote}` : "");
+}
 async function scanChannel(cid){
-  if (scanState.running){ toast("已有扫描在进行中"); return; }
+  if (scanState[cid]?.running){ toast("已有扫描在进行中"); return; }
   const ch = (overview?.channels||[]).find(c=>c.id===cid);
   if (!ch){ toast("渠道不存在"); return; }
-  // 收集该渠道名下未测过的模型；全测过就提示
+  // 优先只扫未测过的；全测过时允许整渠道重扫（覆盖旧结果，比如换了探测参数后想重验）
   const models = overview?.models||[];
-  const untested = models.filter(m => (m.channels||[]).some(c=>c.channel_id===cid) && !m.tested);
-  const targets = untested.map(m=>m.id);
+  const mine = models.filter(m => (m.channels||[]).some(c=>c.channel_id===cid));
+  const untested = mine.filter(m => !m.tested).map(m=>m.id);
+  let targets;
+  if (untested.length){
+    targets = untested;
+    // 说明「扫描全部」实为只扫未测：已测过的不重扫（省额度），避免用户看到几百个模型却只扫了几个的困惑
+    if (mine.length > untested.length){
+      toast(`该渠道 ${mine.length} 个模型中 ${mine.length - untested.length} 个已测过，本次只扫描未测的 ${untested.length} 个`);
+    }
+  } else if (mine.length){
+    if (!confirm(`该渠道的 ${mine.length} 个模型都已测过。\n要全部重新扫描一遍吗？会覆盖现有测试结果（之前判为不可用的也会重试）。`)) return;
+    targets = mine.map(m=>m.id);
+  } else {
+    toast("该渠道没有模型"); return;
+  }
   const N = targets.length;
-  if (!N){ toast("该渠道的模型都已测过，无需重复扫描"); return; }
-  if (N > 50 && !confirm(`该渠道有 ${N} 个模型未测。探测约需 ${Math.round(N*0.8)}-${N*2} 秒；失败探测不耗 token，成功的每个约 1 token。继续？`)) return;
-  const prog = $("#scanprog-"+cid);
+  // 魔搭免费额度按每日请求次数计算，扫描本身就在烧额度——必须明确确认
+  if (ch.type === 'modelscope' && !confirm(`魔搭的免费额度按"每日请求次数"计算，本次扫描将消耗约 ${N} 次请求额度。\n已确认可用的模型 24 小时内后台不会重复探测，但扫描本身无法省。\n确定要继续吗？`)) return;
+  if (N > 50 && !confirm(`本次要探测 ${N} 个模型。已启用串行限速避免触发平台风控，约需 ${Math.round(N*1.5)}-${Math.round(N*4)} 秒；失败探测不耗 token，成功的每个约 1 token。继续？`)) return;
   const btn = $("#scan-btn-"+cid);
-  btn.disabled = true; btn.textContent = "扫描中…";
-  prog.style.display = ""; prog.style.color = "var(--muted)";
-  prog.textContent = `准备扫描 ${N} 个模型…`;
-  scanState.running = true;
-  let done = 0, ok = 0, fail = 0;
+  if (btn) { btn.disabled = true; btn.textContent = "扫描中…"; }
+  scanState[cid] = {running: true, N, done: 0, ok: 0, fail: 0, skip: 0, skipNote: ""};
+  renderScanLine(cid);
+  // 限速：串行 + 按渠道类型设置请求间隔，避免打爆 Gemini/NIM/OpenRouter 免费档 RPM
+  // （这些平台按模型独立限流，集中高速扫描必然触发 429/账号风控）
+  const PACE = {gemini: 350, nim: 300, openrouter: 200};
+  const pace = PACE[ch.type] || 150;
   const worker = async () => {
-    while (true){
-      const m = targets[done];
+    while (scanState[cid] && scanState[cid].done < N){
+      const m = targets[scanState[cid].done];
       if (m === undefined) return;
-      done++;
+      scanState[cid].done++;
       try {
         const r = await api("/api/models/test", {model: m, channel_id: cid});
-        if (r.available) ok++; else fail++;
-      } catch { fail++; }
-      prog.textContent = `扫描中 ${done}/${N} · 可用 ${ok} · 不可用 ${fail}`;
+        if (r.available) scanState[cid].ok++;
+        else if (r.skipped){ scanState[cid].skip++; scanState[cid].skipNote = (r.error||"").replace(/^跳过[:：]?\s*/, "").slice(0, 30); }   // 非免费/余额不足等无需探测
+        else scanState[cid].fail++;
+      } catch { scanState[cid].fail++; }
+      renderScanLine(cid);
+      if (pace) await new Promise(r => setTimeout(r, pace));
     }
   };
-  await Promise.all([worker(), worker(), worker()]);
-  scanState.running = false;
-  prog.style.color = ok ? "var(--ok)" : "var(--bad)";
-  prog.textContent = `扫描完成：${N} 个模型，可用 ${ok}，不可用 ${fail}`;
-  btn.disabled = false; btn.textContent = "扫描全部模型";
-  toast(`扫描完成：可用 ${ok} / ${N}`);
+  await worker();  // 单 worker 串行（原 3 路并发会集中打爆限流）
+  scanState[cid].running = false;
+  renderScanLine(cid);
+  const btn2 = $("#scan-btn-"+cid);  // 期间 DOM 可能已重渲染，重新拿一次
+  if (btn2) { btn2.disabled = false; btn2.textContent = "扫描全部模型"; }
+  toast(`扫描完成：可用 ${scanState[cid].ok} / ${N}（结果保留在渠道卡片上）`);
   await loadOverview();
 }
 
@@ -731,6 +759,7 @@ const DEFAULT_BASE = {
   mistral:"https://api.mistral.ai/v1",
   cohere:"https://api.cohere.ai/compatibility/v1",
   modelscope:"https://api-inference.modelscope.cn/v1",
+  opencode:"https://opencode.ai/zen/v1",
   huggingface:"https://router.huggingface.co/v1",
   together:"https://api.together.xyz/v1",
   zai:"https://api.z.ai/api/paas/v4",
@@ -749,6 +778,7 @@ const KEY_URLS = {
   mistral:"https://console.mistral.ai/api-keys",
   cohere:"https://dashboard.cohere.com/api-keys",
   modelscope:"https://modelscope.cn/my/myapitoken",
+  opencode:"https://opencode.ai/auth",
   huggingface:"https://huggingface.co/settings/tokens",
   together:"https://api.together.ai/settings/api-keys",
   zai:"https://docs.z.ai/guides/llm/zai-api-key",
@@ -759,18 +789,20 @@ function renderChannels(){
   const list = overview?.channels || [];
   $("#channel-list").innerHTML = list.map(ch => {
     let st, color = "var(--muted)";
+    const cooled = ch.cool_until && ch.cool_until > Date.now()/1000;
     if (!ch.enabled) st = '已停用';
+    else if (cooled) { st = '限流熔断中（账号级限流）'; color = "var(--warn)"; }
     else if (ch.valid === true) { st = '连接正常'; color = "var(--ok)"; }
     else if (ch.valid === false) { st = '连接失败'; color = "var(--bad)"; }
     else st = '未检测';
-    const stCls = ch.valid===true ? "on" : (ch.valid===false ? "off" : "unknown");
+    const stCls = cooled ? "off" : (ch.valid===true ? "on" : (ch.valid===false ? "off" : "unknown"));
     const quota = ch.enabled ? fmtQuota(ch.quota) : '<span class="muted small">—</span>';
     return `<div class="card">
       <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap">
         <strong>${esc(ch.name)}</strong>
         <span class="badge">${PRESETS[ch.type]||ch.type}</span>
         <span class="small" style="color:${color}; display:flex; align-items:center"><span class="dot ${stCls}"></span>${st}</span>
-        <span class="muted small">${fmtLatency(ch.latency_ms)} · ${ch.models_count} 个模型（可用 ${ch.models_available_count ?? 0}）· 检查于 ${fmtTime(ch.last_check)}</span>
+        <span class="muted small">${fmtLatency(ch.latency_ms)} · ${ch.models_count} 个模型（已测 ${(overview?.models||[]).filter(m=>(m.channels||[]).some(c=>c.channel_id===ch.id)&&m.tested).length} · 可用 ${ch.models_available_count ?? 0}）· 检查于 ${fmtTime(ch.last_check)}</span>
         <span style="margin-left:auto; display:flex; gap:8px">
           <button class="btn" onclick="testCh('${ch.id}')">测试</button>
           <button class="btn" onclick="scanChannel('${ch.id}')" id="scan-btn-${ch.id}">扫描全部模型</button>
@@ -787,6 +819,8 @@ function renderChannels(){
       <div class="small">额度: ${quota} <span class="muted">（${fmtTime(ch.quota_ts)}）</span></div>
     </div>`;
   }).join("") || '<div class="card empty">还没有渠道，用上面的表单添加第一个。</div>';
+  // 卡片重建后恢复扫描进度/上次扫描结果（否则扫描中刷新一次界面进度就消失）
+  (overview?.channels||[]).forEach(ch => renderScanLine(ch.id));
 }
 
 function setChResult(html, color){
@@ -801,20 +835,27 @@ function formBody(){
 }
 $("#ch-save").onclick = async () => {
   const btn = $("#ch-save");
+  const isNew = !editingId;
   btn.disabled = true; setChResult("保存中…", "var(--muted)");
   try {
     let id = editingId;
     if (id) { await api("/api/channels/"+id, formBody(), "PUT"); toast("已更新"); }
     else { const r = await api("/api/channels", formBody()); id = r.id; toast("已添加"); }
     // 保存后自动做一次连接测试，结果直接显示在表单旁
+    let conn = null;
     try {
-      const r = await api(`/api/channels/${id}/test`, {});
-      setChResult(r.valid
-        ? `✔ 连接正常 · ${r.models_count} 个模型 · ${fmtLatency(r.latency_ms)}`
-        : `✘ 连接失败：${esc((r.error||"").slice(0,120))}`,
-        r.valid ? "var(--ok)" : "var(--bad)");
+      conn = await api(`/api/channels/${id}/test`, {});
+      setChResult(conn.valid
+        ? `✔ 连接正常 · ${conn.models_count} 个模型 · ${fmtLatency(conn.latency_ms)}`
+        : `✘ 连接失败：${esc((conn.error||"").slice(0,120))}`,
+        conn.valid ? "var(--ok)" : "var(--bad)");
     } catch(e){ setChResult("已保存，但自动测试失败："+esc(e.message), "var(--warn)"); }
     resetForm(); await loadOverview();
+    // 新加渠道且连接正常 → 主动询问是否立刻扫描，省得用户去渠道卡里找按钮
+    if (isNew && conn?.valid && (conn.models_count||0) > 0
+        && confirm(`连接正常，拉到 ${conn.models_count} 个模型。\n"连接正常"只代表 Key 有效，不代表每个模型都能真调用。\n要现在就扫描全部模型、找出真正可用的吗？`)) {
+      scanChannel(id);
+    }
   } catch(e){
     setChResult("✘ 保存失败："+esc(e.message), "var(--bad)");
   }

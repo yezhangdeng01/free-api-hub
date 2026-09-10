@@ -16,6 +16,7 @@ from app import config as cfgmod
 from app.main import app
 
 _window_ref = {"w": None}
+_lock_sock = None  # 单实例锁 socket（进程退出自动释放）
 
 
 def _startup_cmd() -> str:
@@ -110,6 +111,13 @@ def _tray_loop(port: int):
 
         def on_quit(icon, item):
             icon.stop()
+            try:
+                from app import gateway
+                # os._exit(0) 会跳过 FastAPI lifespan 的停机落盘，这里手动把
+                # 冷却/渠道级硬失败/429 预判等状态写盘，避免最后一批扫描结果丢失
+                gateway.save_runtime_state()
+            except Exception:
+                pass
             os._exit(0)
 
         menu = pystray.Menu(
@@ -134,6 +142,24 @@ def wait_port(port: int, timeout: float = 20.0) -> bool:
         except OSError:
             time.sleep(0.2)
     return False
+
+
+def _acquire_single_instance_lock(port: int) -> bool:
+    """单实例锁：绑定一个固定本地端口，失败说明已有实例在跑。
+
+    避免多实例各自拉起 uvicorn / 后台循环，互相覆盖 data/runtime_state.json 等状态文件。"""
+    global _lock_sock
+    lock_port = port + 1000  # 与网关端口错开，避免冲突
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", lock_port))
+        s.listen(1)
+        _lock_sock = s
+        return True
+    except OSError:
+        s.close()
+        return False
 
 
 def _launch_log(msg: str):
@@ -164,6 +190,10 @@ def main():
     silent = "--silent" in sys.argv
     cfg = cfgmod.load_config()
     port = cfg["port"]
+    if not _acquire_single_instance_lock(port):
+        _launch_log("检测到已有 API Hub 实例在运行，本实例退出（请留意右下角托盘图标）。")
+        print("[API Hub] 已有实例在运行，退出。")
+        return
     _launch_log("尝试启动服务…" + ("（静默模式）" if silent else ""))
     threading.Thread(target=_serve, args=(port,), daemon=True).start()
 

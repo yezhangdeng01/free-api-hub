@@ -100,3 +100,58 @@ def observed(cid: str, model: str) -> dict:
         if not pre:
             return {}
         return {k: v for k, v in pre.items() if k != "samples"}
+
+
+def snapshot() -> dict:
+    """把学习水位序列化（key: 'cid|model'），供运行时状态落盘。
+
+    只在 samples >= _MIN_SAMPLES 且未遗忘时导出；纯「已发出的调用」滑动窗口
+    (_CALLS) 属于瞬态，重启后本就应清零，不落盘。"""
+    now = time.time()
+    with _lock:
+        out = {}
+        for (cid, model), pre in _LEARN.items():
+            if pre.get("samples", 0) < _MIN_SAMPLES:
+                continue
+            if now - pre.get("learned", 0) > _FORGET_SEC:
+                continue
+            out[f"{cid}|{model}"] = {
+                "rpm": pre.get("rpm"), "rpd": pre.get("rpd"),
+                "samples": pre.get("samples", 0), "learned": pre.get("learned", 0),
+            }
+        return out
+
+
+def restore(data: dict):
+    """从落盘数据恢复学习水位（重启后保留 429 预判，避免受限模型立刻回绿再撞限）。
+
+    过期（超过 _FORGET_SEC）的旧学习值不恢复，保留「长期没撞 429 就遗忘」的语义。"""
+    if not data:
+        return
+    now = time.time()
+    with _lock:
+        for k, v in data.items():
+            if not isinstance(v, dict):
+                continue
+            cid, _, model = k.partition("|")
+            if not cid or not model:
+                continue
+            learned = v.get("learned")
+            if not isinstance(learned, (int, float)) or now - learned > _FORGET_SEC:
+                continue
+            _LEARN[(cid, model)] = {
+                "rpm": v.get("rpm"), "rpd": v.get("rpd"),
+                "samples": max(int(v.get("samples", _MIN_SAMPLES)), _MIN_SAMPLES),
+                "learned": learned,
+            }
+
+
+def learned_pairs() -> list:
+    """返回仍在有效期内的 (cid, model) 组合（供重启后 seed 保守冷却，避免立即回绿）。"""
+    now = time.time()
+    with _lock:
+        out = []
+        for (cid, model), pre in _LEARN.items():
+            if pre.get("samples", 0) >= _MIN_SAMPLES and now - pre.get("learned", 0) <= _FORGET_SEC:
+                out.append((cid, model))
+        return out

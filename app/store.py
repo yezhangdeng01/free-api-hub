@@ -13,6 +13,7 @@ else:
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(ROOT, "data", "usage.db")
 MODEL_STATUS_PATH = os.path.join(ROOT, "data", "model_status.json")
+RUNTIME_STATE_PATH = os.path.join(ROOT, "data", "runtime_state.json")
 _lock = threading.Lock()
 _ms_cache = None
 
@@ -57,14 +58,35 @@ def load_model_status() -> dict:
     return _ms_cache
 
 
+def _atomic_write(path: str, data):
+    """临时文件 + os.replace 原子替换，避免写盘中断留下损坏的半截 JSON"""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
 def persist_model_status(model: str, entry: dict):
     """写一条模型状态到磁盘（每次 mark_model_status 后调用）"""
     global _ms_cache
     d = load_model_status()
     d[model] = entry
     with _lock:
-        with open(MODEL_STATUS_PATH, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=1)
+        _atomic_write(MODEL_STATUS_PATH, d)
+
+
+# ---------------- 网关运行时状态持久化（冷却/待验证/渠道级硬失败，重启不丢） ----------------
+def load_runtime_state() -> dict:
+    try:
+        with open(RUNTIME_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def persist_runtime_state(data: dict):
+    with _lock:
+        _atomic_write(RUNTIME_STATE_PATH, data)
 
 
 def model_usage_24h() -> dict:

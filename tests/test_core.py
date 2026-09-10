@@ -155,6 +155,71 @@ def test_model_view_statuses():
     assert view["model-c"]["status"] == "ok" and view["model-c"]["available"] is True
 
 
+def test_model_status_available_semantics():
+    """回归：limited（受限）绝不允许 available=True，否则「余额不足/限流」的模型会冒充可用。
+    这是「重启后一大批不可用模型冒充可用，一用就报错」的病根。"""
+    # limited → available 必须 False（只有 ok 才可路由）
+    gateway.mark_model_status("m-limited", True, "余额不足，请充值", "c", state="limited")
+    assert gateway.model_status["m-limited"]["available"] is False
+    assert gateway.model_status["m-limited"]["state"] == "limited"
+    # ok → available True
+    gateway.mark_model_status("m-ok", True, "", "c", state="ok")
+    assert gateway.model_status["m-ok"]["available"] is True
+    # down → False
+    gateway.mark_model_status("m-down", False, "HTTP 402", "c", state="down")
+    assert gateway.model_status["m-down"]["available"] is False
+
+
+def test_is_permanent_failure():
+    from app.gateway import is_permanent_failure
+    assert is_permanent_failure(402) is True
+    assert is_permanent_failure(403) is True
+    assert is_permanent_failure(404) is True   # batch 专用等，等也不会恢复
+    assert is_permanent_failure(405) is True
+    assert is_permanent_failure(429, "余额不足，请充值") is True
+    assert is_permanent_failure(429, "Resource has been exhausted. Please recharge") is True
+    assert is_permanent_failure(429, "rate limit exceeded per minute") is False
+    assert is_permanent_failure(500) is False   # 5xx 暂时故障
+    assert is_permanent_failure(503) is False
+
+
+def test_restore_reclassifies_legacy_limited():
+    """回归：旧数据里 limited 且 reason 含「余额/404」等永久失败，重启时应归正为 down。"""
+    import time as _t
+    now = _t.time()
+    gateway.model_status.clear()
+    # 模拟旧版脏数据：limited 但 available=True（历史 bug 写出的）
+    gateway.model_status = {
+        "glm-4.5": {"state": "limited", "available": True, "reason": "余额不足，请充值", "ts": now},
+        "google/x:batch": {"state": "limited", "available": True, "reason": "HTTP 404: only available", "ts": now},
+        "m-ok": {"state": "ok", "available": True, "reason": "", "ts": now},
+    }
+    # 直接调用归正逻辑（复刻 restore_model_status 内部）——通过 monkeypatch store 太绕，这里测纯函数化部分
+    # 用 restore_model_status 但先 monkeypatch store.load_model_status
+    from app import store
+    store._ms_cache = None
+    import json, tempfile, os
+    old_path = store.MODEL_STATUS_PATH
+    tmp = os.path.join(tempfile.gettempdir(), "ms_reclass.json")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(gateway.model_status, f, ensure_ascii=False)
+    store.MODEL_STATUS_PATH = tmp
+    try:
+        store._ms_cache = None
+        gateway.model_status.clear()
+        gateway.restore_model_status()
+        assert gateway.model_status["glm-4.5"]["state"] == "down"
+        assert gateway.model_status["glm-4.5"]["available"] is False
+        assert gateway.model_status["google/x:batch"]["state"] == "down"
+        assert gateway.model_status["m-ok"]["state"] == "ok"
+        assert gateway.model_status["m-ok"]["available"] is True
+    finally:
+        store.MODEL_STATUS_PATH = old_path
+        store._ms_cache = None
+        os.remove(tmp)
+    gateway.model_status.clear()
+
+
 def test_reserved_auto_set():
     from app.gateway import RESERVED_AUTO, list_reserved_auto
     assert "auto" in RESERVED_AUTO and "auto:balanced" not in RESERVED_AUTO
@@ -251,3 +316,44 @@ def test_frontier_ignores_small_sku_and_family():
     assert cap._observed_frontier.get("gpt", 0) == 4  # mini 被忽略，4o 是 4 代
     assert cap.tier_of("gpt-5") == 3  # 静态默认仍兜底
     cap._observed_frontier.clear()
+
+
+# ---------------- 扫描状态跨重启持久化（修复：不可用/受限模型重启后回绿） ----------------
+def test_throttle_snapshot_restore_roundtrip():
+    import time as _t
+    from app import throttle as th
+    th._CALLS.clear(); th._LEARN.clear()
+    cid, mid = "c1", "m1"
+    now = _t.time()
+    for _ in range(10):
+        th.record_call(cid, mid, now - 30)
+    th.observe_429(cid, mid, now)
+    for _ in range(12):
+        th.record_call(cid, mid, now + 1800 - 60)
+    th.observe_429(cid, mid, now + 1800)  # 样本 ≥2 → 启用预判
+    snap = th.snapshot()
+    assert "c1|m1" in snap
+    # 模拟重启：清内存后恢复
+    th._CALLS.clear(); th._LEARN.clear()
+    th.restore(snap)
+    assert (cid, mid) in th.learned_pairs()
+
+
+def test_model_name_migration():
+    import time as _t
+    from app.gateway import _migrate_named_models
+    gateway.model_status.clear(); gateway.channel_down.clear()
+    now = _t.time()
+    gateway.model_status["Meta-Llama/Llama-3.3-70B-Instruct"] = {
+        "available": False, "state": "down", "reason": "403", "ts": now, "channel": "OpenRouter"}
+    gateway.channel_down[("Meta-Llama/Llama-3.3-70B-Instruct", "or1")] = {"reason": "x", "ts": now}
+    old = ["Meta-Llama/Llama-3.3-70B-Instruct", "CohereLabs/aya-expanse-32b"]
+    new = ["meta-llama/llama-3.3-70b-instruct", "cohere/command-a"]
+    _migrate_named_models({"id": "or1", "type": "openrouter", "name": "OpenRouter"}, old, new)
+    # 纯大小写改名 → 迁移
+    assert "meta-llama/llama-3.3-70b-instruct" in gateway.model_status
+    assert "Meta-Llama/Llama-3.3-70B-Instruct" not in gateway.model_status
+    assert ("meta-llama/llama-3.3-70b-instruct", "or1") in gateway.channel_down
+    # 模型本体不同（aya vs command-a）→ 不误迁
+    assert "cohere/command-a" not in gateway.model_status
+    gateway.model_status.clear(); gateway.channel_down.clear()

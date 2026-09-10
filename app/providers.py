@@ -113,3 +113,57 @@ def _num(x):
         return round(float(x), 4)
     except (TypeError, ValueError):
         return None
+
+
+async def openrouter_endpoints(client: httpx.AsyncClient, model_id: str, api_key: str = None):
+    """OpenRouter 专用（只读、免费、不耗额度）：查某模型的所有上游提供方及近期可用率。
+
+    GET /api/v1/models/{id}/endpoints → 每个提供方的 status(0=正常)、uptime_last_5m/30m/1d、
+    max_prompt_tokens、是否免费。返回 list[dict]；查询失败返回 None。
+    :free 等变体 slug 若 404，会去掉冒号后缀重试一次。
+    """
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    for slug in (model_id, model_id.split(":")[0]):
+        try:
+            r = await client.get(f"https://openrouter.ai/api/v1/models/{slug}/endpoints",
+                                 headers=headers, timeout=25)
+        except Exception:
+            return None
+        if r.status_code == 404 and ":" in model_id and slug != model_id:
+            continue
+        if r.status_code != 200:
+            return None
+        eps = (r.json().get("data") or {}).get("endpoints") or []
+        out = []
+        for e in eps:
+            p = e.get("pricing") or {}
+            try:
+                free = float(p.get("prompt") or 0) == 0 and float(p.get("completion") or 0) == 0
+            except (TypeError, ValueError):
+                free = False
+            out.append({
+                "provider": e.get("provider_name") or e.get("name") or "?",
+                "status": e.get("status"),          # 0=正常，非 0=降级
+                "free": free,
+                "uptime_5m": e.get("uptime_last_5m"),
+                "uptime_30m": e.get("uptime_last_30m"),
+                "uptime_1d": e.get("uptime_last_1d"),
+                "max_prompt_tokens": e.get("max_prompt_tokens"),
+            })
+        return out
+    return None
+
+
+def endpoints_note(eps) -> str:
+    """把提供方状态压缩成一行可读摘要，供测试结果/错误信息附加"""
+    if not eps:
+        return ""
+    parts = []
+    for e in eps[:4]:
+        up = e.get("uptime_1d")
+        state = "正常" if e.get("status") == 0 else "降级"
+        pct = f",1d可用率{up:.0f}%" if isinstance(up, (int, float)) else ""
+        tag = "免费" if e.get("free") else "付费"
+        parts.append(f"{e['provider']}({tag},{state}{pct})")
+    more = f" 等{len(eps)}家" if len(eps) > 4 else ""
+    return "上游: " + ", ".join(parts) + more
