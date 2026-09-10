@@ -67,6 +67,10 @@ PROVIDER_PRESETS = {
         "label": "魔搭 ModelScope",
         "base_url": "https://api-inference.modelscope.cn/v1",
     },
+    "opencode": {
+        "label": "OpenCode Zen",
+        "base_url": "https://opencode.ai/zen/v1",
+    },
     "huggingface": {
         "label": "HuggingFace Router",
         "base_url": "https://router.huggingface.co/v1",
