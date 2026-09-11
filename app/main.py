@@ -273,19 +273,22 @@ async def v1_models():
     models = gateway.model_view(cfg)
     aliases = gateway.alias_view(cfg)
 
-    def sort_key(item_id: str, comp: float) -> tuple:
-        """与前端 modelSort 对齐：置顶 → 综合分 → 版本号 → 名称"""
+    def sort_key(item_id: str, comp: float, usable: int = 0) -> tuple:
+        """与前端 modelSort 对齐：置顶 → **可用优先** → 综合分 → 版本号 → 名称
+
+        「可用优先」不能省：auto 是按这个顺序逐个试的，受限/不可用的排前面等于白等一轮。"""
         is_pin = 1 if item_id in pinned else 0
         ver = gateway._last_version(item_id) or -1.0
-        return (-is_pin, -comp, -ver, item_id)
+        return (-is_pin, usable, -comp, -ver, item_id)
 
     items = []
     for m in models:
-        items.append((m["id"], gateway._model_composite(m, strategy)))
+        items.append((m["id"], gateway._model_composite(m, strategy),
+                      0 if m.get("status") == "ok" else 1))
     for a in aliases:
-        items.append((a["name"], gateway._model_composite({"tier": 2, "channels": []}, strategy)))
-    items.sort(key=lambda x: sort_key(x[0], x[1]))
-    ids = reserved + [mid for mid, _ in items]
+        items.append((a["name"], gateway._model_composite({"tier": 2, "channels": []}, strategy), 0))
+    items.sort(key=lambda x: sort_key(x[0], x[1], x[2]))
+    ids = reserved + [x[0] for x in items]
     return {"object": "list",
             "data": [{"id": mid, "object": "model", "owned_by": "api-hub"} for mid in ids]}
 

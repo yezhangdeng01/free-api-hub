@@ -66,6 +66,7 @@ OpenRouter 返回里的 `benchmarks.artificial_analysis.intelligence_index`—�
 | 智能优先 quality | cap | 0.10 ≈ AA 3.5 分 | 稳定 0.60 / 速度 0.40 |
 | 稳定优先 stability | stab | 0.08 | 智能 0.60 / 速度 0.40 |
 | 速度优先 speed | spd | 0.10 | 智能 0.55 / 稳定 0.45 |
+| **视觉 vision**（auto:vision） | cap | 0.10 | 稳定 0.60 / 速度 0.40 |
 | 均衡 balanced | 无（三维直接加权） | — | 0.35 / 0.40 / 0.25 |
 
 - **为什么用带宽而不是严格主键**：主维度是连续分，严格「同等再比次要」几乎永不成立
@@ -81,6 +82,24 @@ OpenRouter 返回里的 `benchmarks.artificial_analysis.intelligence_index`—�
 - 速度：流式请求在 `_stream_gen` 记 TTFT（`gateway.mark_ttft`）→ 没 TTFT 用实测总延迟 →
   最后退回渠道健康检查延迟。
 - 排序硬分组（在策略分之前）：收藏置顶 → 可用(ok) → 受限(limited) → 策略分 → 版本号 → 名称。
+
+### auto 路由 = 按排序逐个试（「能用的排前面」在哪一层保证）
+`/v1/chat/completions` 收到 `auto` / `auto:quality` / `auto:stability` / `auto:speed` / `auto:vision`
+时走 `candidates_for_auto(strategy, cfg)`，然后 **for 循环逐个尝试**（失败就冷却该组合并试下一个）。
+所以「能用的排前面」是在**候选层**保证的：冷却中 / 渠道熔断 / 429 预判 / 模型级 down 的
+(模型×渠道) 组合**根本不会进候选列表**。
+
+- `/v1/models` 与界面 `modelSort` 都按 `置顶 → 可用(ok) → 受限(limited) → 策略分 → 版本号 → 名称` 排，
+  与候选顺序口径一致（`/v1/models` 之前漏了「可用优先」，已补）。
+- ⚠️ **收藏是硬置顶**：收藏的模型一律排在未收藏之前（组内才按策略分）。后果：`auto:quality` 下
+  你收藏但能力弱的模型会先被试（例：收藏了 agnes-3.0-flash 就会先于未收藏的 gemini-3.8-flash）。
+  想改成「不参与置顶」或「只在均衡策略下置顶」随时说。
+- **视觉分组**：`auto:vision` 只保留 `capability.meta_of(m)["vision"]` 为真的模型，再按视觉策略排。
+  用途：Hermes 的「辅助视觉模型」直接填 `auto:vision`，连不上自动换下一个能看图的。
+  ⚠️ 没有「视觉能力」专用榜单——这里用 AA 智能指数当**强弱代理**（强模型的视觉一般也强），
+  加上「能看图」硬门槛。若要精确控制顺序，用 `model_tiers` 显式覆盖（覆盖会改档位标签**并**
+  改排序分：覆盖档位 → 该档顶值，见 `_OVERRIDE_ANCHOR`）。
+- 界面「视觉」分组 chip = `auto:vision` 的预览（同一套排序），提示行里点一下可复制 `auto:vision`。
 
 ### 模型表格列
 `# / 模型 / 特点 / 收藏 / 测试未测`（表头不放「单次测试」文字，`thead th` 垂直居中，
@@ -164,6 +183,8 @@ cd E:\文档\workbuddy\api-hub
 ## 关键坑（每条都踩过）
 
 1. **改持久化逻辑别启动真实服务验证**（会 refresh_all + probe_used_models，烧免费额度）。用一次性离线脚本 `monkeypatch` `store.RUNTIME_STATE_PATH`/`MODEL_STATUS_PATH` 到临时目录验证；**别用 execute_code 的持久 kernel 会话反复改全局态**（会污染，出现假阴性），用独立 `terminal` 进程复核。**验证启动/端口逻辑就用 stub app**（把 `desktop.app` 换成带 lifespan 计数的 FastAPI，不碰真实渠道）。
+   **测试里同理**：`tests/test_api.py` 的 `client` fixture 会触发 lifespan，退出时 `save_runtime_state()`——
+   已把 `MODEL_STATUS_PATH`/`RUNTIME_STATE_PATH` 重定向到临时目录，别再改回去（否则 pytest 会写脏用户真实状态）。
 2. **Windows `.py` 是 LF**，patch 模糊匹配可能整文件变 CRLF（`git diff` 显 `\r`）；改完数 `b"\r\n"` 核对，混了转回。`frontend/index.html` 本就是 CRLF，别误统一。
 3. **模型级 vs 渠道级粒度**：`model_status` 是 model 级，`channel_down`/`cooldown`/`channel_cool` 是 (model,channel) 级，口径必须一致。
 4. **OpenRouter 模型 ID 会变**：迁移只做归一化后完全一致的确定等价；本体/版本变的不迁，宁可让用户重扫。

@@ -125,6 +125,11 @@
           <button class="chip-btn warn-dot" id="show-limited-btn" title="暂时限流/冷却中的免费模型（黄点）">● 受限</button>
         </span>
         <span class="vdiv"></span>
+        <span style="display:flex; gap:6px" id="group-chips">
+          <button class="chip-btn" data-group="all" title="全部模型">全部</button>
+          <button class="chip-btn" data-group="vision" title="只看能看图的模型（顺序即 auto:vision 的实际切换顺序）">视觉</button>
+        </span>
+        <span class="vdiv"></span>
         <span style="display:flex; gap:6px" id="sort-chips">
           <button class="chip-btn" data-sort="balanced">均衡</button>
           <button class="chip-btn" data-sort="quality">智能优先</button>
@@ -137,6 +142,7 @@
           <button class="btn" id="pg-next">›</button>
         </span>
       </div>
+      <div class="muted small" id="group-hint" style="display:none; padding:0 0 8px"></div>
       <table>
         <thead><tr><th style="width:44px">#</th><th>模型</th><th>特点</th>
           <th style="width:74px; text-align:center">收藏</th>
@@ -275,8 +281,9 @@
               · 失败的「模型 × 渠道」组合进入冷却（时长按错误类型：连接失败短、限流/当天额度用完等冷却到明）；<br>
               · 健康检查自动定期运行（可在 config.json 调整），也可手动点「刷新全部」；<br>
               · 响应头 <span class="mono">X-Api-Hub-Channel</span> 会告诉你本次实际由哪个渠道服务；<br>
-              · 模型名填 <span class="mono">auto</span> / <span class="mono">auto:quality</span> / <span class="mono">auto:speed</span> / <span class="mono">auto:stability</span>
-                时，网关会自动选最优真实模型并跨模型无感切换。</p>
+              · 模型名填 <span class="mono">auto</span> / <span class="mono">auto:quality</span> / <span class="mono">auto:speed</span> / <span class="mono">auto:stability</span> / <span class="mono">auto:vision</span>
+                时，网关会自动选最优真实模型并跨模型无感切换（按「模型」页里的排序顺序逐个尝试，
+                能用的排前面；<span class="mono">auto:vision</span> 只挑能看图的模型，适合当 Hermes 的辅助视觉模型）。</p>
       <h3 style="margin-top:14px">常用客户端配置（点击复制）</h3>
       <div id="guide-snippets"></div>
     </div>
@@ -380,7 +387,7 @@ function renderGuide(){
 // ---- 模型（分页；排序与状态逻辑见下方 MODEL_STATE 区块） ----
 const PAGE = {size: 100, n: 0};
 // ---- 模型：状态/收藏/搜索语法/排序 ----
-const MODEL_STATE = {sort: "balanced", showOk: true, showLimited: true};
+const MODEL_STATE = {sort: "balanced", showOk: true, showLimited: true, group: "all"};
 // 收藏持久化在后端 config.json（overview.pinned），不依赖浏览器 localStorage
 function pinList(){ return overview?.pinned || []; }
 function isPinned(id){ return pinList().includes(id); }
@@ -412,9 +419,14 @@ async function migratePins(){
 function syncChips(){
   document.querySelectorAll("#sort-chips .chip-btn").forEach(b =>
     b.classList.toggle("active", b.dataset.sort === MODEL_STATE.sort));
+  document.querySelectorAll("#group-chips .chip-btn").forEach(b =>
+    b.classList.toggle("active", b.dataset.group === MODEL_STATE.group));
   $("#show-ok-btn").classList.toggle("active", MODEL_STATE.showOk);
   $("#show-limited-btn").classList.toggle("active", MODEL_STATE.showLimited);
 }
+// 分组：全部 / 视觉（视觉组 = auto:vision 的预览：只列能看图的模型，按视觉策略排序）
+document.querySelectorAll("#group-chips .chip-btn").forEach(b =>
+  b.onclick = () => { MODEL_STATE.group = b.dataset.group; syncChips(); renderModels(); });
 $("#show-ok-btn").onclick = () => { MODEL_STATE.showOk = !MODEL_STATE.showOk; syncChips(); renderModels(); };
 $("#show-limited-btn").onclick = () => { MODEL_STATE.showLimited = !MODEL_STATE.showLimited; syncChips(); renderModels(); };
 document.querySelectorAll("#sort-chips .chip-btn").forEach(b =>
@@ -437,6 +449,7 @@ const STRAT_SPEC = {
   quality:   {primary: 0, band: 0.10, tie: [0.60, 0.40]},   // 智能优先：能力接近时看稳定6/速度4
   stability: {primary: 1, band: 0.08, tie: [0.60, 0.40]},   // 稳定优先：稳定接近时看智能6/速度4
   speed:     {primary: 2, band: 0.10, tie: [0.55, 0.45]},   // 速度优先：速度接近时看智能5.5/稳定4.5
+  vision:    {primary: 0, band: 0.10, tie: [0.60, 0.40]},   // 视觉分组：只看能看图的，能力优先+均衡（= auto:vision）
   balanced:  {weights: [0.35, 0.40, 0.25]},                 // 均衡：三维加权
 };
 const OTHER_DIMS = [[1, 2], [0, 2], [0, 1]];                // 主维度 → 剩下两维
@@ -444,7 +457,9 @@ const CAP_NORM = {3: 0.76, 2: 0.28, 1: 0.10};               // 无榜分时的�
 // 模型分 = 「该模型最优渠道」的策略分。逐渠道算完取最大，不能用
 // 「稳定分取最好的渠道 + 延迟取最快的渠道」拼分——那会拼出一个不存在的组合。
 function compScore(m){
-  const s = overview?.settings?.route_strategy || "balanced";
+  // 视觉分组下按视觉策略排序（= auto:vision 的实际顺序），其余按当前路由策略
+  const s = MODEL_STATE.group === "vision" ? "vision"
+            : (overview?.settings?.route_strategy || "balanced");
   const spec = STRAT_SPEC[s] || STRAT_SPEC.balanced;
   const cap = m.cap_score ?? CAP_NORM[m.tier] ?? 0.28;      // 连续能力分（后端按 AA 榜分算好）
   const chans = m.channels || [];
@@ -524,10 +539,22 @@ function renderModels(){
     status: a.available ? "ok" : "limited",
     tier: 2, channel_count: a.targets.length, channels: [], targets: a.targets }));
   const all = [...aliases, ...(overview?.models || [])].filter(m => m.status !== "down");
+  // 视觉分组：只列能看图的模型（别名不算）
+  const inGroup = m => MODEL_STATE.group !== "vision" || !!m.vision;
   // 先算可见计数（未按 ok/受限 开关收窄，供 chip 文案与空态提示）
-  const okN = all.filter(m => m.status === "ok" && kwMatch(m, tokens)).length;
-  const limN = all.filter(m => m.status === "limited" && kwMatch(m, tokens)).length;
+  const okN = all.filter(m => m.status === "ok" && inGroup(m) && kwMatch(m, tokens)).length;
+  const limN = all.filter(m => m.status === "limited" && inGroup(m) && kwMatch(m, tokens)).length;
+  const gh = $("#group-hint");
+  if (MODEL_STATE.group === "vision"){
+    gh.style.display = "block";
+    gh.innerHTML = "视觉分组：只列能看图的模型，顺序就是 <b>实际切换顺序</b>（能力优先，同档看稳定/速度）。"
+      + 'Hermes 的「辅助视觉模型」填 <span class="mono click-copy" title="点击复制" '
+      + "onclick=\"copyText('auto:vision')\">auto:vision</span>，连不上会自动换下一个能看图的模型。";
+  } else {
+    gh.style.display = "none";
+  }
   const filtered = all
+    .filter(inGroup)
     .filter(m => kwMatch(m, tokens))
     .filter(m => (m.status === "ok" && MODEL_STATE.showOk) || (m.status === "limited" && MODEL_STATE.showLimited))
     .sort(modelSort);

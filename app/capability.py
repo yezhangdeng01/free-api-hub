@@ -86,13 +86,29 @@ _BENCH_MIN_N = 20          # 榜分样本不足时沿用上面的默认阈值
 # 无榜分时按档位给的「能力分锚点」：取该档位在归一化尺度上的**下沿**（保守，
 # 不让没上榜的模型凭档位挤到榜上有名的模型前面）
 _TIER_ANCHOR = {3: 0.76, 2: 0.28, 1: 0.10}
+# 用户在 model_tiers 里显式指定的档位 → 给该档**顶值**（他们说了算，不再保守压低）
+_OVERRIDE_ANCHOR = {3: 1.0, 2: 0.6, 1: 0.2}
 
 
-def capability_score(model_id: str, tier: int = None) -> float:
-    """0~1 能力分（连续）。有 AA 榜分就按观测分布归一化（p10→0、p90→1）；
-    没有榜分才按档位锚点给保守值。
+def override_tier(model_id: str, overrides: dict = None):
+    """config.json `model_tiers` 的显式指定（正则 → 档位）；没命中返回 None"""
+    for pat, t in (overrides or {}).items():
+        try:
+            if re.search(pat, model_id or "", re.I) and int(t) in (1, 2, 3):
+                return int(t)
+        except (re.error, ValueError, TypeError):
+            continue
+    return None
 
+
+def capability_score(model_id: str, tier: int = None, overrides: dict = None) -> float:
+    """0~1 能力分（连续）。优先级：用户显式覆盖 > AA 榜分归一化 > 档位锚点。
+
+    榜分按观测分布归一化（p10→0、p90→1）；无榜分时用档位锚点（保守）。
     「智能优先」用这个连续分排序——只按 3 档太钝（同档里 AA 41.2 与 33.9 差 7 分）。"""
+    ov = override_tier(model_id, overrides)
+    if ov is not None:
+        return _OVERRIDE_ANCHOR.get(ov, 0.6)
     s = _bench.get(norm_id(model_id))
     if s is not None and _bench_p90 > _bench_p10:
         return max(0.0, min(1.0, (s - _bench_p10) / (_bench_p90 - _bench_p10)))
@@ -199,12 +215,9 @@ def tier_of(model_id: str, overrides: dict = None) -> int:
     """
     if not model_id:
         return 2
-    for pat, t in (overrides or {}).items():
-        try:
-            if re.search(pat, model_id, re.I) and int(t) in (1, 2, 3):
-                return int(t)
-        except (re.error, ValueError, TypeError):
-            continue
+    ov = override_tier(model_id, overrides)
+    if ov is not None:
+        return ov
     # 1) 非对话模型（图片/视频/音频/向量/翻译/安全）：不能拿来聊天就别占智能档
     if _UTIL.search(model_id):
         return 1

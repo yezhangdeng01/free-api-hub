@@ -579,6 +579,7 @@ _STRATEGY_SPEC = {
     "quality":   {"primary": "cap",  "band": 0.10, "tie": (0.60, 0.40)},  # 智能优先：能力接近时看稳定6/速度4
     "stability": {"primary": "stab", "band": 0.08, "tie": (0.60, 0.40)},  # 稳定优先：稳定接近时看智能6/速度4
     "speed":     {"primary": "spd",  "band": 0.10, "tie": (0.55, 0.45)},  # 速度优先：速度接近时看智能5.5/稳定4.5
+    "vision":    {"primary": "cap",  "band": 0.10, "tie": (0.60, 0.40)},  # 视觉：只看能看图的模型，能力优先+均衡
     "balanced":  {"weights": (0.35, 0.40, 0.25)},                         # 均衡：三维直接加权
 }
 _DIM_IDX = {"cap": 0, "stab": 1, "spd": 2}
@@ -649,7 +650,7 @@ def _composite(c, cfg, strategy: str) -> float:
     cs_lat = (channels.get(c["channel"]["id"]).latency_ms) or 9999
     lat = s.get("ttft") or s["latency"] or cs_lat
     tier = capability.tier_of(c["model"], cfg.get("model_tiers"))
-    cap = capability.capability_score(c["model"], tier)
+    cap = capability.capability_score(c["model"], tier, cfg.get("model_tiers"))
     speed = _SPEED_K / (_SPEED_K + lat) if lat else 0.0
     return _score_dims((cap, eff_score(s), speed), strategy)
 
@@ -772,7 +773,7 @@ def model_view(cfg: dict) -> list:
             "channel_count": len(chans),
             "tier": _tier,
             "aa": capability.bench_of(m),              # Artificial Analysis 智能指数（没上榜 → None）
-            "cap_score": capability.capability_score(m, _tier),   # 连续能力分（排序用）
+            "cap_score": capability.capability_score(m, _tier, cfg.get("model_tiers")),   # 连续能力分（排序用）
             "channels": chans,
         })
     models.sort(key=lambda x: (x["status"] != "ok", x["id"]))
@@ -816,6 +817,9 @@ RESERVED_AUTO = {
     "auto:quality": "quality",
     "auto:stability": "stability",
     "auto:speed": "speed",
+    # 视觉分组：只挑「能看图」的模型，再按能力优先 + 稳定/速度均衡排序。
+    # 用途：Hermes 的「辅助视觉模型」直接填 auto:vision（失败自动换下一个能看图的模型）。
+    "auto:vision": "vision",
 }
 
 
@@ -828,13 +832,17 @@ def auto_strategy_of(model: str) -> str:
 
 
 def candidates_for_auto(strategy: str, cfg: dict) -> list:
-    """给「auto」请求生成候选：所有当前可用 (模型, 渠道) 组合。
+    """给「auto」请求生成候选：**所有当前可用 (模型, 渠道) 组合**，按策略排序。
 
-    排序规则与 /v1/models 一致：收藏的模型优先（组内仍按策略综合分），
-    然后才是未收藏模型。这样「列表里排前面的」就是「实际会被先用到的」——
-    若用户收藏了某模型，auto 会先试它，失败才轮到其余模型。"""
+    注意这里就是 auto 的「切换顺序」——`main.chat_completions` 会从这个列表**逐个尝试**
+    直到成功，所以「能用的排前面」在本函数里已经保证：冷却中 / 渠道熔断 / 429 预判 /
+    模型级 down 的 (模型,渠道) 全部被过滤掉，列表里不会出现用不了的组合。
+
+    排序规则与界面一致：收藏的模型优先（组内仍按策略综合分），然后才是未收藏模型。
+    strategy="vision" 时额外只保留「能看图」的模型（Hermes 辅助视觉模型用）。"""
     now = time.time()
     pinned = set(cfg.get("pinned") or [])
+    need_vision = strategy == "vision"
     out, seen = [], set()
     preempt = cfg.get("adaptive_preemption", True)
     for ch in cfg["channels"]:
@@ -849,6 +857,8 @@ def candidates_for_auto(strategy: str, cfg: dict) -> list:
             key = (m, ch["id"])
             if key in seen or key in channel_down:
                 continue
+            if need_vision and not capability.meta_of(m)["vision"]:
+                continue  # 视觉分组：只留能看图的
             if ratelimit_exhausted(m, ch["id"], now):
                 continue
             if cooldown.get(key, 0) > now:

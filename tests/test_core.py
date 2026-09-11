@@ -162,6 +162,32 @@ def test_strategy_primary_with_tolerance_band(monkeypatch):
     assert 0 < b < 1, b
 
 
+def test_auto_vision_filters_and_orders(monkeypatch):
+    """auto:vision：候选**只含能看图**的模型，顺序 = 视觉策略（能力优先，同档看稳定/速度）"""
+    from app import capability as cap
+    _reset()
+    monkeypatch.setattr(cap, "_bench", {"vl-strong": 40.0, "vl-weak": 20.0})
+    ch = _chan("c1", ["vl-strong", "vl-weak", "text-only"], latency=100)
+    cfg = _cfg([ch])
+    for m, ttft in (("vl-strong", 3000), ("vl-weak", 300), ("text-only", 100)):
+        gateway.stats[(m, "c1")] = {"score": 0.7, "latency": None, "ttft": ttft, "n": 5}
+    got = [c["model"] for c in gateway.candidates_for_auto("vision", cfg)]
+    # text-only 被滤掉；能力档高的在前（虽然它更慢）——视觉优先是「能力优先」
+    assert got == ["vl-strong", "vl-weak"], got
+    # 非视觉策略不受影响
+    assert "text-only" in [c["model"] for c in gateway.candidates_for_auto("quality", cfg)]
+
+
+def test_tier_override_wins_over_bench(monkeypatch):
+    """用户显式 model_tiers 覆盖优先于榜分（否则覆盖了档位、排序却不跟着变）"""
+    from app import capability as cap
+    monkeypatch.setattr(cap, "_bench", {"some-weak-vlm": 12.0})
+    ov = {"some-weak-vlm": 3}
+    assert cap.tier_of("some-weak-vlm", ov) == 3
+    assert cap.capability_score("some-weak-vlm", 3, ov) == 1.0        # 覆盖 → 该档顶值
+    assert cap.capability_score("some-weak-vlm", 1, None) < 0.5       # 不覆盖 → 按榜分（12 → 0.12）
+
+
 def test_tier_from_bench_score(monkeypatch):
     """有权威榜单分（AA 智能指数）就用榜分定档，没有才回退命名启发式"""
     from app import capability as cap
@@ -410,7 +436,8 @@ def test_restore_reclassifies_legacy_limited():
 def test_reserved_auto_set():
     from app.gateway import RESERVED_AUTO, list_reserved_auto
     assert "auto" in RESERVED_AUTO and "auto:balanced" not in RESERVED_AUTO
-    assert sorted(list_reserved_auto()) == ["auto", "auto:quality", "auto:speed", "auto:stability"]
+    assert sorted(list_reserved_auto()) == ["auto", "auto:quality", "auto:speed",
+                                            "auto:stability", "auto:vision"]
 
 
 # ---------------- throttle：429 自学水位 ----------------
