@@ -813,8 +813,9 @@ def list_model_ids(cfg: dict) -> list:
 # 客户端可用的「特殊模型名」：请求这些名字时由网关自动选最优真实模型，
 # 并在请求失败时自动跨模型切换（用户感觉是「无感 failover」）。
 RESERVED_AUTO = {
-    "auto": "balanced",          # 默认 = 均衡（简短别名）
-    "auto:balanced": "balanced",  # 与视图名统一：每个视图都有 auto:<名> 写法（auto ≡ auto:balanced）
+    # 命名与「模型」页视图一一对应：每个视图都有 auto:<名> 写法（不再保留裸 `auto` 简写，
+    # 用户拍板：`auto:balanced` 已经对应均衡，再留一个 `auto` 就是重复）。
+    "auto:balanced": "balanced",
     "auto:quality": "quality",
     "auto:stability": "stability",
     "auto:speed": "speed",

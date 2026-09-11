@@ -451,12 +451,13 @@ def test_restore_reclassifies_legacy_limited():
 
 
 def test_reserved_auto_set():
-    """auto:<视图名> 一一对应（与界面视图名统一）：auto ≡ auto:balanced"""
-    from app.gateway import RESERVED_AUTO, list_reserved_auto, auto_strategy_of, is_reserved_auto
-    assert auto_strategy_of("auto") == auto_strategy_of("auto:balanced") == "balanced"
+    """auto:<视图名> 与「模型」页视图一一对应；裸 `auto` 已删除（与 auto:balanced 重复）"""
+    from app.gateway import list_reserved_auto, auto_strategy_of, is_reserved_auto
+    assert auto_strategy_of("auto:balanced") == "balanced"
     assert auto_strategy_of("auto:vision") == "vision"
     assert is_reserved_auto("auto:balanced") and is_reserved_auto("auto:vision")
-    assert sorted(list_reserved_auto()) == ["auto", "auto:balanced", "auto:quality",
+    assert not is_reserved_auto("auto")        # 删掉后裸 auto 会当普通模型名查（查不到 → 404）
+    assert sorted(list_reserved_auto()) == ["auto:balanced", "auto:quality",
                                             "auto:speed", "auto:stability", "auto:vision"]
 
 

@@ -51,7 +51,7 @@ def test_v1_models_usable_first(client, monkeypatch):
     monkeypatch.setattr(cfgmod, "load_config", lambda: {
         "channels": [], "aliases": {}, "route_strategy": "quality",
         "pinned": [], "auth_enabled": False, "api_token": "", "port": 8787})
-    monkeypatch.setattr(gateway, "list_reserved_auto", lambda: ["auto"])
+    monkeypatch.setattr(gateway, "list_reserved_auto", lambda: ["auto:balanced"])
     monkeypatch.setattr(gateway, "alias_view", lambda cfg: [])
     monkeypatch.setattr(gateway, "model_view", lambda cfg: [
         {"id": "a-limited-strong", "status": "limited", "tier": 3, "cap_score": 1.0,
@@ -60,7 +60,7 @@ def test_v1_models_usable_first(client, monkeypatch):
          "channels": [{"available": True, "eff_score": 0.4, "latency_ms": 3000}]},
     ])
     ids = [m["id"] for m in client.get("/v1/models", headers=H).json()["data"]]
-    assert ids == ["auto", "b-ok-weak", "a-limited-strong"], ids
+    assert ids == ["auto:balanced", "b-ok-weak", "a-limited-strong"], ids
 
 
 def test_settings_health_check_interval(client, monkeypatch):

@@ -84,12 +84,17 @@ OpenRouter 返回里的 `benchmarks.artificial_analysis.intelligence_index`—�
 - 排序硬分组（在策略分之前）：收藏置顶 → 可用(ok) → 受限(limited) → 策略分 → 版本号 → 名称。
 
 ### auto 路由 = 按排序逐个试（「能用的排前面」在哪一层保证）
-`RESERVED_AUTO`：`auto:balanced`（= 简写 `auto`，均衡）/ `auto:quality` / `auto:stability` / `auto:speed` /
-`auto:vision`——每个界面视图名都有对应的 `auto:<名>` 写法，命名与界面统一（对照表在「网关用法」页）。
-`/v1/chat/completions` 收到 `auto` / `auto:quality` / `auto:stability` / `auto:speed` / `auto:vision`
-时走 `candidates_for_auto(strategy, cfg)`，然后 **for 循环逐个尝试**（失败就冷却该组合并试下一个）。
+`RESERVED_AUTO` 共 **5 个**：`auto:balanced` / `auto:quality` / `auto:stability` / `auto:speed` /
+`auto:vision`——正好与「模型」页的 5 个视图一一对应，命名统一。
+**裸 `auto` 已删除**（用户拍板：`auto:balanced` 已对应均衡，再留一个 `auto` 就是重复）：
+现在请求 `auto` 会被当普通模型名去查，查不到就 404；同理界面上不要再写 `auto`。
+`/v1/chat/completions` 收到这 5 个名字时走 `candidates_for_auto(strategy, cfg)`，
+然后 **for 循环逐个尝试**（失败就冷却该组合并试下一个）。
 所以「能用的排前面」是在**候选层**保证的：冷却中 / 渠道熔断 / 429 预判 / 模型级 down 的
 (模型×渠道) 组合**根本不会进候选列表**。
+⚠️ 删别名是**破坏性**改动：客户端里填过 `auto` 的地方都要改成 `auto:balanced`（用户自己的 Hermes
+配置用的是 `auto:quality`，`fallback_providers` 里那个 `model: auto` 是 freellm 聚合器 31415 的别名、
+与网关无关）。Hermes 侧 `providers.apihub.models.auto` 这条发现缓存也一并 unset 了。
 
 - `/v1/models` 与界面 `modelSort` 都按 `置顶 → 可用(ok) → 受限(limited) → 策略分 → 版本号 → 名称` 排，
   与候选顺序口径一致（`/v1/models` 之前漏了「可用优先」，已补）。
