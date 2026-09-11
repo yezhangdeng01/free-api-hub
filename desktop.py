@@ -6,6 +6,7 @@
 """
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -60,9 +61,13 @@ def set_autostart(enable: bool) -> bool:
 
 def _show_window(initial_hidden: bool = False):
     import webview
-    if webview.windows and not window_is_destroyed():
-        _window_ref["w"].show()
-        return _window_ref["w"]
+    w = _window_ref["w"]
+    # 窗口已存在且仍存活 → 只显示 + 聚焦，绝不重复创建。
+    # （旧判断用 w.destroyed 属性，但 pywebview 的 Window 类根本没有该属性，
+    #   getattr(w, "destroyed", True) 恒为 True，导致每点一次托盘就多一个窗口）
+    if w is not None and w in webview.windows:
+        w.show()
+        return w
     w = webview.create_window(
         "API Hub · 大模型聚合网关", f"http://127.0.0.1:{cfgmod.load_config()['port']}",
         width=1320, height=900, min_size=(960, 640), hidden=initial_hidden)
@@ -84,8 +89,38 @@ def _show_window(initial_hidden: bool = False):
 
 
 def window_is_destroyed():
+    import webview
     w = _window_ref["w"]
-    return w is None or getattr(w, "destroyed", True)
+    return w is None or w not in webview.windows
+
+
+def _launch_cmd() -> list[str]:
+    """本次启动进程对应的命令行（用于重启/唤起）。exe 打包态直接 exe 路径。"""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    exe = sys.executable
+    if exe.lower().endswith("python.exe"):
+        exe = exe[:-4] + "w.exe"
+    return [exe, os.path.abspath(__file__)]
+
+
+def _restart():
+    """重启服务：落盘当前状态 → 起新进程 → 立即退出本进程。
+
+    新进程由单实例锁接管（本进程退出后端口才释放，新进程最多重试等端口）。
+    用 pythonw（无控制台）拉起可完全脱离托盘退出后的控制台句柄。"""
+    try:
+        from app import gateway
+        gateway.save_runtime_state()  # 最后一批扫描/冷却状态别丢
+    except Exception:
+        pass
+    try:
+        subprocess.Popen(_launch_cmd(), close_fds=True)
+    except Exception as e:
+        print(f"[API Hub] 重启失败: {e}")
+        _launch_log(f"重启失败: {e}")
+        return
+    os._exit(0)
 
 
 def _tray_loop(port: int):
@@ -100,6 +135,27 @@ def _tray_loop(port: int):
 
         def on_show(icon, item):
             _show_window()
+
+        def on_settings(icon, item):
+            # 设置页即「渠道」标签里的「网关设置」卡片：唤起窗口并切到该标签。
+            # 切换放到独立线程：evaluate_js 会等页面就绪（最多 20s），
+            # 若在 pystray 回调线程里同步执行会卡住托盘菜单。
+            _show_window()
+
+            def _goto_channels():
+                w = _window_ref["w"]
+                if w is None:
+                    return
+                try:
+                    w.evaluate_js(
+                        "document.querySelector('nav button[data-tab=\"channels\"]').click()")
+                except Exception:
+                    pass  # 页面未就绪时忽略，窗口已显示用户可手动点
+
+            threading.Thread(target=_goto_channels, daemon=True).start()
+
+        def on_restart(icon, item):
+            _restart()
 
         def on_hide(icon, item):
             if _window_ref["w"] is not None and not window_is_destroyed():
@@ -122,6 +178,8 @@ def _tray_loop(port: int):
 
         menu = pystray.Menu(
             pystray.MenuItem("显示窗口", on_show, default=True),
+            pystray.MenuItem("设置", on_settings),
+            pystray.MenuItem("重启服务", on_restart),
             pystray.MenuItem("隐藏窗口", on_hide),
             pystray.MenuItem("开机自启", on_autostart,
                              checked=lambda item: autostart_enabled()),
