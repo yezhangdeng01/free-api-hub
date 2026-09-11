@@ -111,14 +111,21 @@ OpenRouter 返回里的 `benchmarks.artificial_analysis.intelligence_index`—�
   **整排 chip 都是「视图」= 只决定列表排序，不切换路由策略**（路由策略在 Agent 端按模型名选，
   `auto:balanced` / `auto:quality` / …）。点 chip **不发** `/api/settings`；视图选择存 localStorage
   （`apihub.view`），刷新后保持；首次打开若没有记录，则用 `route_strategy` 当默认视图。
-  - 视图名 ↔ Agent 端模型名对照表放在「网关用法」页（界面里不再挂提示行——用户嫌挤）。
+  视图名 ↔ Agent 端模型名对照表：**只写在本文档**，界面里既不放提示行也不放对照表（用户嫌冗余：
+  「自动切换规则」那几句已经说清了）。
   - 坑：`renderSettings()` 每次 `loadOverview()` 都会跑，早先在里面无条件
     `MODEL_STATE.sort = route_strategy` → 在视觉视图里点「测试」（测完会 loadOverview）就被打回均衡。
     现在改成**只在首次加载时初始化**（`MODEL_STATE.viewInited`）。
 - 「可用 / 受限」计数直接写在两个开关上（`● 可用 18` / `● 受限 91`），搜索框旁只显示 `共 N 个`
   ——这样任何视图（含视觉）都能一眼看到当前视图的可用/受限分布。
-- **设置页**：删掉「路由策略」下拉（`auto:*` 由模型名决定，这个下拉没有意义）；
-  新增「健康检查间隔（分钟）」（写 `check_interval_minutes`，1~1440 越界忽略，后台循环每轮重读配置，即时生效）。
+- **设置页**：「路由策略」下拉已删（`auto:*` 由模型名决定，界面下拉只会让人以为能在界面改路由）；
+  「模型主动探测」与「429 限流预判」两个开关也删了（用户拍板：默认开启就好，不需要设置项）——
+  两者在 config.json 里仍是 `probe_used_models` / `adaptive_preemption`（默认 true），要关才去改。
+  现在整个卡片只剩**一个设置项**：`健康检查间隔`，用**下拉框**（10/15/30/60/120/240/360 分钟，
+  与其它设置项同款控件；配置里若是自定义值就动态补一个选项，免得选不中）。保存只发
+  `check_interval_minutes`，后台循环每轮重读 config，**保存即生效、不用重启**。
+- **「网关用法」页不放假表**：别名↔视图↔排序口径的对照表曾被加上又被点名删掉——「自动切换规则」
+  那几句文字已经说清了，再加表就是冗余。示例/文案的「别写死、删功能要同步删文案」约定见陷阱 7。
 - **渠道名短写**（`chName()`）：魔搭 ModelScope→魔搭、HuggingFace Router→HF、NVIDIA NIM→NIM、
   Google Gemini→Gemini、智谱 GLM→GLM、Agnes AI→Agnes；规则兜底：`xxx AI/Router/API` 去尾、
   「中文 + 英文」保留中文。**完整名保留在 chip 的 hover 里**。

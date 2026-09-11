@@ -185,23 +185,28 @@
     </div>
     <div class="card">
       <h2>网关设置</h2>
-      <div class="form-grid" style="grid-template-columns: 1.2fr 1fr 1.2fr auto">
-        <div><label>健康检查间隔（分钟）</label>
-          <input type="number" min="1" max="1440" id="set-check-iv" placeholder="30" style="width:100%"></div>
-        <div><label>模型主动探测</label>
-          <select id="set-probe"><option value="1">开启（推荐）</option><option value="0">关闭</option></select></div>
-        <div><label>429 限流预判（自学习水位）</label>
-          <select id="set-preempt"><option value="1">开启（推荐）</option><option value="0">关闭</option></select></div>
+      <div class="form-grid" style="grid-template-columns: 1fr auto">
+        <div><label>健康检查间隔</label>
+          <select id="set-check-iv">
+            <option value="10">10 分钟（最及时）</option>
+            <option value="15">15 分钟</option>
+            <option value="30">30 分钟（推荐）</option>
+            <option value="60">1 小时</option>
+            <option value="120">2 小时</option>
+            <option value="240">4 小时</option>
+            <option value="360">6 小时（最省流量）</option>
+          </select></div>
         <div style="padding-bottom:0"><button class="btn primary" id="set-save">保存设置</button></div>
       </div>
       <p class="muted small" style="margin-top:8px; line-height:1.8">
-        健康检查：定期拉一遍各渠道「免费模型列表」并测连通性（只读元数据，不消耗额度）。间隔越小越及时，也越费网络。<br>
-        模型主动探测：给「从没调用过」的免费模型各发一次 1 token 请求，确认它真能调（不是摆设）。<br>
-        429 限流预判：每撞一次 429 就记住「撞之前这一分钟/一天实际打过的量」，之后接近这个水位就提前换路，
-        而不是等被打回再冷却。<br>
+        健康检查：定期拉一遍各渠道「免费模型列表」并测连通性（只读元数据，不消耗额度）。间隔越小越及时，也越费网络；保存即生效。<br>
+        「模型主动探测」（给从没调用过的免费模型各发一次 1 token 请求，确认它不是摆设）与
+        「429 限流预判」（撞过一次 429 就记住当时用量，之后接近这个水位提前换路，而不是等被打回再冷却）
+        <b>默认开启</b>，无需设置，需要关就在 config.json 里把 <span class="mono">probe_used_models</span> /
+        <span class="mono">adaptive_preemption</span> 设为 false。<br>
         能力档位是启发式估算（按模型名 + AA 榜分），可在 config.json 的
         <span class="mono">model_tiers</span> 里用正则手动覆盖；<span class="mono">route_strategy</span>
-        现在只作为「显式写真实模型名时渠道排序」的兜底（<span class="mono">auto:*</span> 由模型名决定，见「网关用法」页）。
+        只作为「显式写真实模型名时渠道排序」的兜底（<span class="mono">auto:*</span> 由模型名决定，见「网关用法」页）。
       </p>
     </div>
     <div class="card">
@@ -285,17 +290,6 @@
                 <span class="mono">auto:vision</span> 时，网关会自动选最优真实模型并跨模型无感切换
                 （按「模型」页对应视图的排序逐个尝试，能用的排前面；<span class="mono">auto:vision</span>
                 只挑能看图的模型，适合当 Hermes 的辅助视觉模型）。</p>
-      <table style="margin-top:10px; width:auto">
-        <thead><tr><th>模型名（填哪里都行）</th><th>「模型」页对应视图</th><th>排序口径</th></tr></thead>
-        <tbody>
-          <tr><td class="mono">auto:balanced</td><td>均衡</td><td>智能/稳定/速度三项加权</td></tr>
-          <tr><td class="mono">auto:quality</td><td>智能优先</td><td>先看能力（AA 分），同档看稳定/速度</td></tr>
-          <tr><td class="mono">auto:stability</td><td>稳定优先</td><td>先看成功率，同档看能力/速度</td></tr>
-          <tr><td class="mono">auto:speed</td><td>速度优先</td><td>先看延迟，同档看能力/稳定</td></tr>
-          <tr><td class="mono">auto:vision</td><td>视觉</td><td>只挑能看图的模型，再按能力优先排序</td></tr>
-          <tr><td class="mono">auto</td><td>—</td><td>auto:balanced 的简写，等价</td></tr>
-        </tbody>
-      </table>
       <h3 style="margin-top:14px">常用客户端配置（点击复制）</h3>
       <div id="guide-snippets"></div>
     </div>
@@ -686,9 +680,14 @@ function initSettings(){}
 function renderSettings(){
   const s = overview?.settings || {};
   const cur = s.route_strategy || "balanced";   // 已不可在界面改，仅作视图默认值来源
-  $("#set-check-iv").value = s.check_interval_minutes ?? 30;
-  $("#set-probe").value = s.probe_used_models === false ? "0" : "1";
-  $("#set-preempt").value = s.adaptive_preemption === false ? "0" : "1";
+  // 健康检查间隔用下拉框（与其它设置项同款控件）；若配置里是自定义值，补一个选项免得选不中
+  const ivSel = $("#set-check-iv"), iv = String(s.check_interval_minutes ?? 30);
+  if (!Array.from(ivSel.options).some(o => o.value === iv)){
+    const o = document.createElement("option");
+    o.value = iv; o.textContent = iv + " 分钟（当前配置）";
+    ivSel.appendChild(o);
+  }
+  ivSel.value = iv;
   // 视图 chip：**只在首次加载时初始化**（用户上次选的视图 → 否则用当前路由策略）。
   // 之后不再跟着 route_strategy 走——否则任何 loadOverview（比如单次测试完刷新）
   // 都会把视图打回均衡（曾出现：视觉视图里点测试 → 跳回均衡）。
@@ -700,12 +699,8 @@ function renderSettings(){
 }
 // 排序 chip 处理已在上方统一绑定（点是纯视图，不写路由策略）
 $("#set-save").onclick = async () => {
-  const iv = Number($("#set-check-iv").value);
-  if (!(iv >= 1 && iv <= 1440)) { toast("健康检查间隔请填 1~1440 分钟"); return; }
   try {
-    await api("/api/settings", {check_interval_minutes: Math.round(iv),
-                                probe_used_models: $("#set-probe").value === "1",
-                                adaptive_preemption: $("#set-preempt").value === "1"});
+    await api("/api/settings", {check_interval_minutes: Number($("#set-check-iv").value)});
     toast("设置已保存并生效"); await loadOverview();
   } catch(e){ toast("保存失败: "+e.message); }
 };
