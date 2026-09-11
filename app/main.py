@@ -50,7 +50,13 @@ logging.basicConfig(level=logging.INFO,
                     handlers=_log_handlers)
 logger = logging.getLogger("api-hub")
 
-shared_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=8.0))
+
+def _new_client() -> httpx.AsyncClient:
+    """网关共享上游客户端：read 120s / connect 8s（上游挂起 2 分钟就换路）。"""
+    return httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=8.0))
+
+
+shared_client = _new_client()
 
 
 # ---------------- 后台健康检查 ----------------
@@ -213,6 +219,12 @@ async def _bg_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global shared_client
+    # aclose() 过的 client 无法复用，之后所有上游请求都会报
+    # "Cannot send a request, as the client has been closed."（表现为全部渠道连接失败）。
+    # 正常生命周期里不会走到这里，作为启动兜底重建。
+    if shared_client.is_closed:
+        shared_client = _new_client()
     store.init()
     gateway.restore_model_status()  # 恢复已测模型状态，重启不丢
     gateway.restore_runtime_state()  # 恢复冷却/待验证/渠道级硬失败（扫描结果重启不丢）

@@ -2,7 +2,7 @@
 
 - 双击启动（无控制台）：API Hub.vbs
 - 关闭窗口 → 最小化到托盘常驻（服务不中断）
-- 托盘菜单：显示窗口 / 隐藏窗口 / 开机自启 / 退出
+- 托盘：左键单击图标 = 显示并置前窗口；右键菜单 = 打开配置文件夹 / 重启服务 / 开机自启 / 退出
 """
 import os
 import socket
@@ -87,12 +87,6 @@ def _show_window(initial_hidden: bool = False):
     except Exception:
         pass  # 旧版 pywebview 不支持取消关闭 → 走下方 keep-alive 兜底
     return w
-
-
-def window_is_destroyed():
-    import webview
-    w = _window_ref["w"]
-    return w is None or w not in webview.windows
 
 
 def _bring_to_front(w):
@@ -180,6 +174,28 @@ def _restart():
     os._exit(0)
 
 
+def _build_menu(cb: dict):
+    """托盘菜单。
+
+    「显示窗口」是 default 项：pystray 用**左键单击图标**触发 default 项
+    （win32 后端 `_on_notify` 里 WM_LBUTTONUP → `Icon.__call__` → `Menu.__call__`）。
+    它 visible=False 所以不出现在右键菜单里——菜单里再列一遍是冗余的
+    （而且 win32 会把 default 项渲染成灰色不可点，用户看着像坏的）。
+    注意：Menu.__call__ 遍历的是全部 items（含 invisible），所以隐藏它不影响左键。
+    「隐藏窗口」已去掉：窗口的 X 就是隐藏到托盘。
+    """
+    import pystray
+    return pystray.Menu(
+        pystray.MenuItem("显示窗口", cb["show"], default=True, visible=False),
+        pystray.MenuItem("打开配置文件夹", cb["settings"]),
+        pystray.MenuItem("重启服务", cb["restart"]),
+        pystray.MenuItem("开机自启", cb["autostart"],
+                         checked=lambda item: autostart_enabled()),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("退出", cb["quit"]),
+    )
+
+
 def _tray_loop(port: int):
     try:
         import pystray
@@ -205,10 +221,6 @@ def _tray_loop(port: int):
         def on_restart(icon, item):
             _restart()
 
-        def on_hide(icon, item):
-            if _window_ref["w"] is not None and not window_is_destroyed():
-                _window_ref["w"].hide()
-
         def on_autostart(icon, item):
             set_autostart(not autostart_enabled())
             icon.update_menu()
@@ -224,21 +236,17 @@ def _tray_loop(port: int):
                 pass
             os._exit(0)
 
-        menu = pystray.Menu(
-            pystray.MenuItem("打开配置文件夹", on_settings),
-            pystray.MenuItem("重启服务", on_restart),
-            pystray.MenuItem("隐藏窗口", on_hide),
-            pystray.MenuItem("开机自启", on_autostart,
-                             checked=lambda item: autostart_enabled()),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("退出", on_quit),
-        )
+        menu = _build_menu({
+            "show": on_show, "settings": on_settings, "restart": on_restart,
+            "autostart": on_autostart, "quit": on_quit,
+        })
         pystray.Icon("api-hub", img, "API Hub", menu).run()
     except Exception as e:
         print(f"[API Hub] 托盘不可用（不影响使用）: {e}")
 
 
-def wait_port(port: int, timeout: float = 20.0) -> bool:
+def wait_port(port: int, timeout: float = 45.0) -> bool:
+    # 45s：_bind_listen 最多等 25s（旧实例退出/端口释放），再留服务启动时间
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -255,16 +263,23 @@ def _acquire_single_instance_lock(port: int) -> bool:
     避免多实例各自拉起 uvicorn / 后台循环，互相覆盖 data/runtime_state.json 等状态文件。"""
     global _lock_sock
     lock_port = port + 1000  # 与网关端口错开，避免冲突
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        s.bind(("127.0.0.1", lock_port))
-        s.listen(1)
-        _lock_sock = s
-        return True
-    except OSError:
-        s.close()
-        return False
+    # 不加 SO_REUSEADDR：Windows 上它允许绑定**已被占用**的端口，单实例锁会失效
+    # （第二个实例照样绑得上 → 两个实例抢 8787 → 后启动的那个 bind 失败 → 404）。
+    # 锁端口不接受任何连接、不存在 TIME_WAIT，普通 bind 就是独占的。
+    # 短重试：重启时新进程可能比旧进程退出还快，给它几秒释放窗口。
+    deadline = time.time() + 5.0
+    while True:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", lock_port))
+            s.listen(1)
+            _lock_sock = s
+            return True
+        except OSError:
+            s.close()
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.5)
 
 
 def _launch_log(msg: str):
@@ -278,35 +293,72 @@ def _launch_log(msg: str):
         pass
 
 
+def _port_has_listener(port: int) -> bool:
+    """端口上是否还有活跃监听者（旧实例尚未退出）。连接被拒 = 没人监听。"""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
+def _bind_listen(port: int, timeout: float = 25.0):
+    """等旧实例退出后绑定监听端口，返回可直接交给 uvicorn 的 socket。
+
+    两个 Windows 特有的坑，这一版是踩出来的：
+    1) uvicorn 单进程模式内部走 asyncio.create_server，而 Windows 上
+       `reuse_address` 为 False（posix 才 True）；旧实例刚被 os._exit 杀掉、
+       前端那条 8787 连接还在 TIME_WAIT 时，bind 直接 [Errno 10048] → sys.exit(3)；
+    2) uvicorn 的 lifespan startup 在 bind **之前** 跑。所以「在 uvicorn.run 外面
+       重试」等于每失败一次就跑一遍 app 启动+关闭：shutdown 里 aclose() 掉模块级
+       shared_client，而启动时建的后台健康线程还活着 → 之后全渠道报
+       "Cannot send a request, as the client has been closed."。
+    正确做法：先把 socket 抢下来（SO_REUSEADDR 绕过 TIME_WAIT），再交给 uvicorn，
+    这样 app 的 lifespan 只跑一次。
+
+    注意 Windows 的 SO_REUSEADDR 也允许和**活跃监听者**抢占同一端口（Linux 不允许），
+    所以先做连接探测确认没有活跃监听者，避免新旧实例同时监听 8787。
+    """
+    deadline = time.time() + timeout
+    while True:
+        if not _port_has_listener(port):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+                s.listen(128)
+                return s
+            except OSError as e:
+                s.close()
+                _launch_log(f"绑定 {port} 失败: {e}")
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.4)
+
+
 def _serve(port: int):
     # log_config=None：跳过 uvicorn 内部日志 dictConfig。
     # pythonw（无控制台，sys.stderr 为 None）下它会在配置 formatter 时抛
     # ValueError: Unable to configure formatter 'default'，直接禁用最稳。
-    #
-    # 端口占用重试：Windows 下 asyncio.create_server 默认 reuse_address=False，
-    # 重启时旧进程被杀但 webview 前端还保持 8787 活跃连接，进程退出后这些
-    # TCP 连接进入 TIME_WAIT（系统层面 15~60s 才真正释放），新进程立即
-    # bind 撞 [Errno 10048]，uvicorn sys.exit(3)，服务挂 → 前端 404。
-    # 这里重试（延迟递增）给 TIME_WAIT 释放窗口，最长约 30s。
-    import time as _time
-    for attempt in range(8):
+    sock = _bind_listen(port)
+    if sock is None:
+        _launch_log(f"服务未启动：端口 {port} 等 {25}s 仍被占用（旧实例没退出？）")
+        return
+    config = uvicorn.Config(app, host="127.0.0.1", port=port,
+                            log_level="warning", log_config=None)
+    server = uvicorn.Server(config)
+    try:
+        server.run(sockets=[sock])
+        if not server.started:
+            # 端口已抢到却起不来 = app 的 lifespan startup 抛错（详情见 data/api-hub.log）
+            _launch_log("服务未启动：uvicorn startup 失败（见 data/api-hub.log）")
+    except BaseException as e:  # 绑定失败等：pythonw 无控制台，必须落盘
+        _launch_log(f"uvicorn 异常退出: {type(e).__name__}: {e}")
+    finally:
         try:
-            uvicorn.run(app, host="127.0.0.1", port=port,
-                        log_level="warning", log_config=None)
-            return  # 正常退出（被外部关闭）
-        except SystemExit as e:
-            # uvicorn 启动失败 sys.exit(STARTUP_FAILURE=3)。
-            # 端口 TIME_WAIT 重试：第一次直接试，之后延迟递增
-            if attempt < 7:
-                delay = 2.0 * (attempt + 1)
-                _launch_log(f"端口 {port} 占用（TIME_WAIT），{delay:.0f}s 后重试（第 {attempt + 2}/8 次）")
-                _time.sleep(delay)
-                continue
-            _launch_log(f"uvicorn 端口 {port} 重试 8 次仍失败，退出: {e}")
-            return
-        except BaseException as e:
-            _launch_log(f"uvicorn 异常退出: {type(e).__name__}: {e}")
-            return
+            sock.close()
+        except OSError:
+            pass
 
 
 def main():
