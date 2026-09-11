@@ -15,39 +15,63 @@
 | v1.0.1 | 措辞 + gitignore | README 完善；排除本地 venv |
 | v1.0.2 | 可用性语义 + 故障切换 | `available=state==ok`（limited 不再冒充可用）；`is_permanent_failure` 统一 4xx/429 判定；`restore_model_status` 归正旧数据 + 回写磁盘；connect 0.5 衰减降权；connect 超时 15s→8s；持久化（throttle/channel_down/原子写/托盘优雅退出/单实例锁）；OpenRouter 命名迁移；扫描串行限速 |
 | v1.0.3 | 挂起切换 + 账户级限额 + 统计 + 用法页 | read 超时 300s→120s（挂起 2min 切换）；魔搭 daily 型 429 → 整渠道冷却到明天（`mark_channel_quota_exhausted` + `channel_cool` 持久化）；柱状图数值标签 + 最小高度；请求日志按钮反馈 + 统计页 3s 轮询；网关用法页去硬编码 |
-| **v1.0.4（未发）** | **重启 404 根因 + 托盘左键 + 档位/排序/表格列** | ① `_serve` 改为「先 `_bind_listen` 抢端口（SO_REUSEADDR 绕过 TIME_WAIT + 探测活跃监听者），再 `uvicorn.Server(config).run(sockets=[sock])`」——**删掉了 v1.0.3 那版在 `uvicorn.run` 外面重试的做法**（它每次都重跑 lifespan，`aclose()` 掉 `shared_client` → 全渠道 "client has been closed"）；② 单实例锁去掉 SO_REUSEADDR（Windows 上会让锁失效）+ 5s 重试；③ `wait_port` 20s→45s；④ 托盘「显示窗口」改为 default+invisible（恢复左键唤起，且不占右键菜单），删「隐藏窗口」（X 就是隐藏）；⑤ `app/main.py` lifespan 兜底重建被 `aclose()` 过的 `shared_client`；⑥ **档位算法重构 + 排序同源化 + 表格列改「收藏/单次测试」**（见下节「档位与排序」）；新增 `tests/test_desktop.py` 与档位/排序回归测试 |
+| **v1.0.4（未发）** | **重启 404 根因 + 托盘左键 + 档位/排序/表格列** | ① `_serve` 改为「先 `_bind_listen` 抢端口（SO_REUSEADDR 绕过 TIME_WAIT + 探测活跃监听者），再 `uvicorn.Server(config).run(sockets=[sock])`」——**删掉了 v1.0.3 那版在 `uvicorn.run` 外面重试的做法**（它每次都重跑 lifespan，`aclose()` 掉 `shared_client` → 全渠道 "client has been closed"）；② 单实例锁去掉 SO_REUSEADDR（Windows 上会让锁失效）+ 5s 重试；③ `wait_port` 20s→45s；④ 托盘「显示窗口」改为 default+invisible（恢复左键唤起，且不占右键菜单），删「隐藏窗口」（X 就是隐藏）；⑤ `app/main.py` lifespan 兜底重建被 `aclose()` 过的 `shared_client`；⑥ 档位/排序/表格列（收藏·单次测试）；⑦ **档位改为「AA 榜分优先 + 启发式兜底」**（榜分从 OpenRouter `/models` 白拿）+ 稳定分加样本量置信度 + 速度分改用首字节 TTFT + 渠道评分持久化；新增 `tests/test_desktop.py` 与档位/排序/评分回归测试 |
 
 ## 档位与排序（2026-09-11 第二批，改前必读）
 
-### 能力档位 `app/capability.py`
-三条轴，先命中先返回：**规模 → 家族代际 → 兜底**。
+### 能力档位 `app/capability.py`（2026-09-11 第二批重构：**榜分优先，启发式兜底**）
+判定顺序，先命中先返回：
 
-1. **轻量(1) 只由规模决定**（与代际无关）：小尺寸 SKU（mini/nano/tiny/haiku/micro/small）、
-   名字里写明 ≤9B、非对话模型（guard/embed/rerank/translate/transcribe/image/video/audio/lyria…）。
-2. **家族代际只降一档**（判「同代」用**主版本号**：3.6 与 3.8 同属第 3 代）：
-   同代旗舰=3 / 同代加速档 flash·turbo=2 / 同代缩水档 lite·air=1；
-   落后代=2，落后代且带 flash/lite 标记=1。**例外**：gemini/glm 的 flash 是同代主力 → 不降档。
-3. **名字里写明 10~200B → 封顶中档**（同代 ≠ 同尺寸）；≥200B 或 ultra → 可判智能。
-4. 无名家族只信规模：≥200B/ultra → 3；lite/air → 1；**flash/turbo → 2**（是同代快速档，不是小模型）。
+1. `config.json` 的 `model_tiers` 正则覆盖（用户手调，最高优先级）。
+2. **非对话模型**（image/video/audio/music/embed/rerank/guard/translate/transcribe/ocr…）→ 轻量 1。
+3. **Artificial Analysis 智能指数**（`_bench`）：**有榜分就用榜分定档**——
+   ≥ `_bench_hi` → 3、≥ `_bench_mid` → 2、否则 1。阈值是观测分布的**分位数（p72 / p40）**，
+   AA 换算法（v4.2→v5）或换版本时自动适应；样本 <20 时用默认 33 / 17。
+4. 小尺寸 SKU（mini/nano/tiny/haiku/micro/small）或名字写明 ≤9B → 轻量 1。
+5. 已知家族（gpt/o/qwen/gemini/claude/grok/deepseek/kimi/glm/minimax）：
+   同代**且够新**（次版本在 `_FRONTIER_BAND=0.05` 内）→ 旗舰 3 / 加速档 flash·turbo 2 / 缩水档 lite·air 1；
+   落后代或同代早期次版本 → 降一档（2，带 flash/lite 标记则 1）。
+   例外 `_FLASH_OK_FAMILIES = {gemini, glm, deepseek}`：这些家族的 flash 是同代主力，不降档。
+   名字写明 10~200B → 封顶中档。
+6. 无名家族：**默认轻量**（不认识就保守压低），只有「旗舰像」（ultra/super/max/pro/large/xlarge/xl
+   或 ≥200B）才给中档。
 
-踩过的坑：家族版本正则的分隔符必须与厂商命名一致（`qwen3.8` 无连字符、`gemini-3.5` 有），
+**榜分怎么来的（白拿）**：`providers.fetch_models()` 调渠道 `/models` 时顺带收割
+OpenRouter 返回里的 `benchmarks.artificial_analysis.intelligence_index`——
+不用额外申请密钥、不多发一次请求（439 个模型里约 90 个有分）。
+跨渠道对齐用 `capability.norm_id()`：去厂商前缀 + 去 `:free/:batch` 后缀 + 转小写，
+`ZhipuAI/GLM-5.3-Flash` / `z-ai/glm-5.3-flash:batch` / `models/gemini-3.8-flash` 都能对上。
+榜单来源与备选见下节「榜单」。
+
+**命名启发式的坑**：家族版本正则的分隔符必须与厂商命名一致（`qwen3.8` 无连字符、`gemini-3.5` 有），
 写宽了会把参数量当版本号 —— `DeepSeek-R1-Distill-Qwen-14B` 曾被读成「qwen 第 14 代」，
-整个 qwen 家族的前沿被顶到 14，所有 qwen 模型集体降档。用户可用 `config.json` 的
-`model_tiers` 正则覆盖（`{"qwen.*max": 3, ".*-flash": 1}`）。
+整个 qwen 家族的前沿被顶到 14。用户可用 `model_tiers` 覆盖任何一条。
+
+### 榜单（权威性来源，2026-09 核对）
+- **Artificial Analysis 智能指数**（业界通用「AA 榜」）：综合 reasoning/coding/知识/科学/agent 等 10 项评测，
+  当前是 v4.2 版本。**已集成**：走 OpenRouter `/api/v1/models` 的 `benchmarks` 字段（见上），免费。
+  若将来需要更细的分数，AA 自身有 Data API（免费档 100 请求/天，需申请 key；Pro 档才有逐项评测分）。
+- **LMArena（Arena 榜）**：人类盲评 Elo，有公开数据集 `lmarena-ai/leaderboard-dataset`（HF，含 `overall` 排名）。
+  未集成——它是「偏好」而非「能力」，且要下载数据集；若以后想加，可作为第二信号。
+- 结论：**先用 AA 榜分（免费且零额外请求）**，其它来源按需再加。
 
 ### 排序（FE `compScore` / BE `_model_composite` / 路由 `_composite` 三处同口径）
-- 模型分 = **逐渠道算综合分，取最大的那条**（不能用「稳定分取最好的渠道 + 延迟取最快的渠道」拼分，
-  那会拼出一个任何请求都拿不到的组合）。
-- 综合分 = w智能·档位归一化 + w稳定·渠道评分EMA + w速度·400/(400+延迟ms)；
-  权重 `_STRATEGY_WEIGHTS`（FE 的 `STRAT_W` 与之镜像）：quality .60/.30/.10、balanced .35/.40/.25、
+- 模型分 = **逐渠道算综合分，取最大的那条**（不能「稳定分取最好的渠道 + 延迟取最快的渠道」拼分）。
+- 综合分 = w智能·档位归一化 + w稳定·**eff_score** + w速度·400/(400+响应毫秒)；
+  权重 `_STRATEGY_WEIGHTS`（FE `STRAT_W` 镜像）：quality .60/.30/.10、balanced .35/.40/.25、
   stability .20/.70/.10、speed .10/.25/.65；档位归一化 {3:1.0, 2:0.6, 1:0.25}。
-- 延迟优先取**该模型在该渠道的实测延迟**（`stats[...]["latency"]`），没实测才退回渠道健康检查延迟
-  （`model_view` 里 `s["latency"] or cs.latency_ms`）。三处口径必须一致，否则界面顺序 ≠ 实际选路。
+- **响应速度取「首字节时间 TTFT」优先**：流式请求在 `_stream_gen` 记 TTFT（`gateway.mark_ttft`），
+  没 TTFT 用实测总延迟，最后退回渠道健康检查延迟。健康检查量的是「列模型接口快不快」，与吐字速度弱相关。
+- **稳定分带样本量置信度** `eff_score()`：`0.7 + (score-0.7) * n/(n+3)`——测 1 次成功不再等价于测 50 次；
+  偶发 1 次连接失败也不再直接打到谷底。老持久化数据没有 `n` 按 6 个样本算，升级不归零。
+- **渠道评分会持久化**（`runtime_state.json` 的 `stats`，只存实测过的条目）：稳定分/延迟/TTFT/样本数跨重启累计，
+  否则「稳定优先」每次重启都从 0.7 重来。
 - 排序硬分组：收藏置顶 → 可用(ok) → 受限(limited) → 综合分 → 版本号 → 名称（后端 `/v1/models` 与前端一致）。
 
 ### 模型表格列
 `# / 模型 / 特点 / 收藏 / 单次测试`。「测试未测」（批量对未测模型各发一次 1 token 探测）按钮放在
-**「单次测试」列表头**里（原来是工具栏按钮），不在行内。
+**「单次测试」列表头**里。特点列里档位标签后跟 `AA xx.x`（Artificial Analysis 智能指数，没上榜则不显示），
+档位/延迟标签都带 title 说明。
 
 ## 待办（下次从这里接手）
 
@@ -57,12 +81,9 @@
 - [ ] **OpenRouter 改名无法自动迁移的模型**（`aya-expanse-32b`→`command-a`、`MiniMax-M2`→`minimax-m2.7` 等本体/版本也变的）：迁移只做确定等价，这几个需用户手动重扫。
 - [ ] **`model_status` 幽灵数据**（旧名、已不在任何渠道）：暂保留（避免误删 HF 渠道还在用的旧名），保守清理留待以后。
 - [ ] **`classify_429` 对「余额不足」误判为 daily**：GLM 余额不足的 429 会被判成 daily → `mark_channel_quota_exhausted` 把整渠道冷却到明天（截图里的「限流熔断中（账号级限流）」就是它）。永久性欠费应走 `is_permanent_failure` → `down`，不该占用 channel_cool。观察到即可修。
-- [ ] **排序算法增强（已评审，待用户拍板）**：
-      ① **稳定分没有样本量概念**：`stats[..].score` 是 EMA（初始 0.7，成功 +20%，连接失败 ×0.5），
-         「测过 1 次就成功」与「测过 50 次 100% 成功」会趋同；建议加样本数 `n` 并做置信度打折
-         （`conf = n/(n+3)`）或按近 7 天成功率重算。
-      ② **速度分用的是健康检查（`/models` 探测）延迟，不是生成延迟**：建议优先真实调用延迟，
-         并在流式请求里记录首字节时间 TTFT 作为速度分输入。
+- [ ] **排序算法增强（③④ 待用户拍板；①② 已完成）**：
+      ~~① 稳定分加样本量置信度~~ ✅ 已做（`eff_score` + 样本数持久化）；
+      ~~② 速度分改用首字节时间~~ ✅ 已做（`mark_ttft` + TTFT 优先）；
       ③ **权重是拍脑袋值**（balanced .35/.40/.25 等）：若主要当 Hermes 后端用，可考虑更偏速度
          （如 balanced → .30/.30/.40）；需用户确认。
       ④ **档位归一化 {3:1.0, 2:0.6, 1:0.25}**：轻量 0.25 惩罚很重，若想「中档和智能差距更小」可改 {1.0,0.7,0.35}。
@@ -104,7 +125,7 @@ cd E:\文档\workbuddy\api-hub
 - `app/main.py` — FastAPI 入口：`/v1/*` 网关 + 故障切换循环、`/api/*` 管理、`model_test`（扫描）、lifespan（启动恢复/停机落盘）、`_bg_loop` 后台健康/探测循环、`shared_client`（`_new_client()` 造，120s/8s）。
 - `app/throttle.py` — 429 自学限流水位，预判式换路。
 - `app/store.py` — SQLite 用量 + `model_status.json`/`runtime_state.json` 落盘（`_atomic_write`）。
-- `app/providers.py` — 各平台 `/models` 列表、额度查询、OpenRouter 只读 endpoints。
+- `app/providers.py` — 各平台 `/models` 列表（**顺带收割 AA 榜分**）、额度查询、OpenRouter 只读 endpoints。
 - `app/config.py` — 渠道预设 + 敏感字段 DPAPI 加密（`vault.py`）。
 - `desktop.py` — pywebview 窗口 + pystray 托盘 + 单实例锁 + `_bind_listen`/`_serve`（端口竞态）。`frontend/index.html` — 全部前端（单文件，CRLF 行尾）。
 

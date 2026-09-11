@@ -451,7 +451,9 @@ function compScore(m){
   for (const c of pool){
     const lat = c.latency_ms;
     const spd = (lat != null && isFinite(lat)) ? 400 / (400 + lat) : 0;
-    const v = w[0] * cap + w[1] * (c.score ?? 0.7) + w[2] * spd;
+    // 稳定分用带样本量置信度的 eff_score（与后端 get_stat/eff_score 一致）
+    const stab = c.eff_score ?? 0.7;
+    const v = w[0] * cap + w[1] * stab + w[2] * spd;
     if (v > best) best = v;
   }
   return best;
@@ -543,8 +545,10 @@ function renderModels(){
     const stChip = st === "limited" ? '<span class="tag-chip" style="color:var(--warn); border-color:var(--warn)">受限</span>' : "";
     // 特点 chips
     const chips = [];
-    chips.push(MODEL_TIERS[m.tier] ? `<span class="tag-chip ok">${MODEL_TIERS[m.tier]}</span>` : `<span class="tag-chip">中档</span>`);
-    chips.push(isFinite(lat) ? `<span class="tag-chip">${fmtLatency(lat)}</span>` : `<span class="tag-chip">—</span>`);
+    const aaTip = (m.aa != null) ? ` title="Artificial Analysis 智能指数 ${m.aa}"` : "";
+    chips.push(MODEL_TIERS[m.tier] ? `<span class="tag-chip ok"${aaTip}>${MODEL_TIERS[m.tier]}</span>` : `<span class="tag-chip"${aaTip}>中档</span>`);
+    if (m.aa != null) chips.push(`<span class="tag-chip" title="Artificial Analysis 智能指数（经 OpenRouter 榜单自动更新）">AA ${Number(m.aa).toFixed(1)}</span>`);
+    chips.push(isFinite(lat) ? `<span class="tag-chip" title="响应延迟（流式请求为首字节时间 TTFT）">${fmtLatency(lat)}</span>` : `<span class="tag-chip">—</span>`);
     if (m.vision) chips.push('<span class="tag-chip ok">视觉</span>');
     if (m.context) chips.push(`<span class="tag-chip">${esc(m.context)}</span>`);
     const u = m.usage24 || {};

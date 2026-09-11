@@ -477,11 +477,17 @@ def _fail(cid, name, upstream_model, requested_model, t0, errors, msg):
 
 
 async def _stream_gen(resp, cid, name, model, t0, upstream_model=""):
-    """流式转发，同时从 SSE 里抽 usage 记账"""
+    """流式转发，同时从 SSE 里抽 usage 记账，并记录**首字节时间(TTFT)**。
+
+    TTFT 是「速度优先」路由最该用的信号：请求发出到上游吐出第一个字节的耗时，
+    才反映用户感受到的响应快慢。"""
     usage = {}
     buf = b""
+    ttft = None
     try:
         async for chunk in resp.aiter_bytes():
+            if ttft is None and chunk:
+                ttft = max(1, int((time.time() - t0) * 1000))
             yield chunk
             buf += chunk
             while b"\n" in buf:
@@ -496,6 +502,8 @@ async def _stream_gen(resp, cid, name, model, t0, upstream_model=""):
                     except Exception:
                         pass
     finally:
+        if ttft is not None and upstream_model:
+            gateway.mark_ttft(upstream_model, cid, ttft)
         await resp.aclose()
         store.log_usage(cid, name, model, usage.get("prompt_tokens", 0),
                         usage.get("completion_tokens", 0),

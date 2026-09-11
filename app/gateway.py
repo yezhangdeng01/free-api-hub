@@ -301,6 +301,11 @@ def save_runtime_state():
             "ratelimit": {f"{k[0]}|{k[1]}": v for k, v in ratelimit.items()},
             "channel_cool": {cid: round(v, 1) for cid, v in channel_cool.items() if v > now},
             "throttle": throttle.snapshot(),
+            # 渠道评分（稳定分/延迟/首字节/样本数）：只落「实测过」的条目，
+            # 否则模型×渠道全量落盘太大。带 n 才能让稳定分的置信度跨重启累计。
+            "stats": {f"{k[0]}|{k[1]}": {c: s.get(c) for c in _SCORE_COLS}
+                      for k, s in stats.items()
+                      if (s.get("n") or s.get("latency") or s.get("ttft"))},
         })
     except Exception:
         pass  # 持久化失败不影响内存状态
@@ -337,6 +342,23 @@ def restore_runtime_state():
     # 恢复 429 自学水位（throttle），并给仍在有效期内的 (渠道,模型) 一个保守短冷却，
     # 避免重启后受限模型立刻回绿、再次集中撞限（这是 Gemini/NIM 重启变绿的直接原因）
     throttle.restore(data.get("throttle") or {})
+    # 恢复渠道评分（稳定分/延迟/首字节/样本数）：这是「稳定优先」的历史依据，
+    # 不恢复的话每次重启稳定分都从 0.7 重来，样本量置信度也就永远攒不起来
+    n_stat = 0
+    for k, v in (data.get("stats") or {}).items():
+        mid, _, cid = k.partition("|")
+        if not (mid and cid and isinstance(v, dict)):
+            continue
+        try:
+            stats[(mid, cid)] = {
+                "score": float(v.get("score", 0.7)),
+                "latency": int(v["latency"]) if v.get("latency") else None,
+                "ttft": int(v["ttft"]) if v.get("ttft") else None,
+                "n": int(v.get("n") or 0),
+            }
+        except (TypeError, ValueError):
+            continue
+        n_stat += 1
     n_seeded = 0
     for cid, mid in throttle.learned_pairs():
         key = (mid, cid)
@@ -345,9 +367,9 @@ def restore_runtime_state():
             n_seeded += 1
     import logging
     logging.getLogger("api-hub").info(
-        "已恢复运行时状态：冷却 %d，待验证 %d，渠道级硬失败 %d，限流头 %d，429 预判 %d（seed 冷却 %d）",
+        "已恢复运行时状态：冷却 %d，待验证 %d，渠道级硬失败 %d，限流头 %d，429 预判 %d（seed 冷却 %d，评分样本 %d）",
         n_cool, len(unverified), len(channel_down), len(ratelimit),
-        len(throttle.learned_pairs()), n_seeded)
+        len(throttle.learned_pairs()), n_seeded, n_stat)
 
 
 def _request_save():
@@ -372,10 +394,12 @@ def get_model_status(model: str):
  return model_status.get(model)
 
 
-def _update_score(model: str, cid: str, ok: bool, latency_ms=None, kind: str = None):
+def _update_score(model: str, cid: str, ok: bool, latency_ms=None, kind: str = None,
+                  ttft_ms=None):
     """滑动评分：成功 0.8*旧+0.2；失败按类型降分（连接类更狠，让受限/挂起的渠道快速沉底）。
-    延迟做 7:3 EMA。"""
-    s = stats.setdefault((model, cid), {"score": 0.7, "latency": None})
+    延迟/首字节各做 7:3 EMA；样本数 n 供 eff_score 做置信度折算。"""
+    s = stats.setdefault((model, cid), {"score": 0.7, "latency": None, "n": 0})
+    s["n"] = int(s.get("n") or 0) + 1
     if ok:
         s["score"] = round(s["score"] * 0.8 + 0.2, 3)
     else:
@@ -384,6 +408,18 @@ def _update_score(model: str, cid: str, ok: bool, latency_ms=None, kind: str = N
         s["score"] = round(s["score"] * decay, 3)
     if ok and latency_ms:
         s["latency"] = latency_ms if s["latency"] is None else int(s["latency"] * 0.7 + latency_ms * 0.3)
+    if ttft_ms:
+        s["ttft"] = ttft_ms if s.get("ttft") is None else int(s["ttft"] * 0.7 + ttft_ms * 0.3)
+
+
+def mark_ttft(model: str, cid: str, ttft_ms: int):
+    """记录一次流式请求的首字节时间（TTFT）。速度分优先用它——它才反映「吐字快不快」，
+    而渠道健康检查的延迟只是「列模型接口快不快」。"""
+    if not ttft_ms:
+        return
+    s = stats.setdefault((model, cid), {"score": 0.7, "latency": None, "n": 0})
+    s["ttft"] = ttft_ms if s.get("ttft") is None else int(s["ttft"] * 0.7 + ttft_ms * 0.3)
+    _request_save()
 
 
 def mark_result(model: str, cid: str, ok: bool, latency_ms=None,
@@ -410,7 +446,25 @@ def mark_result(model: str, cid: str, ok: bool, latency_ms=None,
 
 
 def get_stat(model: str, cid: str) -> dict:
-    return stats.get((model, cid), {"score": 0.7, "latency": None})
+    return stats.get((model, cid), {"score": 0.7, "latency": None, "n": 0})
+
+
+# 稳定分置信度折算：n 个样本的 EMA 向先验 0.7 收缩，样本越少越不敢信。
+# 目的：让「侥幸测过 1 次成功」不会与「测过 50 次 100% 成功率」等价，
+# 也让「偶发 1 次连接失败」不至于把一个本来很稳的模型直接打到谷底。
+_SCORE_PRIOR = 0.7      # 未知模型的先验分（与 stats 初值一致）
+_SCORE_K = 3.0          # 收缩强度：n=3 时只用一半权重
+_LEGACY_N = 6           # 老持久化数据没有 n：当作已有 6 个样本的证据（别一升级就把历史分归零）
+_SCORE_COLS = ("score", "latency", "ttft", "n")
+
+
+def eff_score(s: dict) -> float:
+    """带置信度的稳定分：sample 越少越向 0.7 收缩（老数据没有 n → 按 6 个样本算）"""
+    raw = float(s.get("score", _SCORE_PRIOR))
+    n = s.get("n")
+    n = _LEGACY_N if n is None else max(0, int(n))
+    conf = n / (n + _SCORE_K)
+    return round(_SCORE_PRIOR + (raw - _SCORE_PRIOR) * conf, 4)
 
 
 # ---------------- 模型 ID 命名变更 → 旧状态迁移 ----------------
@@ -541,7 +595,10 @@ def _model_composite(m: dict, strategy: str) -> float:
     for c in pool:
         lat = c.get("latency_ms")
         speed = _SPEED_K / (_SPEED_K + lat) if lat else 0.0
-        cand = wcap * cap + wstab * (c.get("score") or 0.7) + wspd * speed
+        stab = c.get("eff_score")
+        if stab is None:
+            stab = c.get("score") or 0.7   # 没有置信度字段（手造 dict）就用原始评分
+        cand = wcap * cap + wstab * stab + wspd * speed
         if cand > best:
             best = cand
     return best
@@ -562,15 +619,18 @@ def _last_version(s: str):
 
 
 def _composite(c, cfg, strategy: str) -> float:
-    """综合评分 = w智能*能力档 + w稳定*实测成功率 + w速度*延迟分"""
+    """综合评分 = w智能*能力档 + w稳定*实测成功率(带置信度) + w速度*响应速度
+
+    速度优先用**流式首字节时间(TTFT)**，其次实测总延迟，最后退回渠道健康检查延迟——
+    健康检查量的是「列模型接口快不快」，跟吐字速度弱相关。"""
     s = get_stat(c["model"], c["channel"]["id"])
     cs_lat = (channels.get(c["channel"]["id"]).latency_ms) or 9999
-    lat = s["latency"] or cs_lat
+    lat = s.get("ttft") or s["latency"] or cs_lat
     w_cap, w_stab, w_spd = _STRATEGY_WEIGHTS.get(strategy, _STRATEGY_WEIGHTS["balanced"])
     tier = capability.tier_of(c["model"], cfg.get("model_tiers"))
     cap = _CAP_BY_TIER.get(tier, 0.6)
     speed = _SPEED_K / (_SPEED_K + lat) if lat else 0.0
-    return w_cap * cap + w_stab * s["score"] + w_spd * speed
+    return w_cap * cap + w_stab * eff_score(s) + w_spd * speed
 
 
 def candidates_for(model: str, cfg: dict) -> list:
@@ -650,10 +710,12 @@ def model_view(cfg: dict) -> list:
                 "in_cooldown": in_cool or ch_cool,
                 "down": ch_down,
                 "preempted": preempted,
-                # 延迟优先用「该模型在该渠道的实测延迟」，没实测过才退回渠道健康检查延迟
-                # ——与 _composite(候选) / FE compScore 同一口径，否则界面顺序会与真实选路不符
-                "latency_ms": s["latency"] or cs.latency_ms,
+                # 响应速度：首字节(TTFT) 优先 → 实测总延迟 → 渠道健康检查延迟
+                # ——与 _composite / _model_composite / FE compScore 同一口径
+                "latency_ms": s.get("ttft") or s["latency"] or cs.latency_ms,
                 "score": s["score"],
+                "eff_score": eff_score(s),   # 带样本量置信度的稳定分（排序用）
+                "samples": int(s.get("n") or 0),
             })
     models = []
     for m, chans in agg.items():
@@ -687,6 +749,7 @@ def model_view(cfg: dict) -> list:
             "any_channel_available": any_ok,
             "channel_count": len(chans),
             "tier": capability.tier_of(m, cfg.get("model_tiers")),
+            "aa": capability.bench_of(m),   # Artificial Analysis 智能指数（没上榜 → None）
             "channels": chans,
         })
     models.sort(key=lambda x: (x["status"] != "ok", x["id"]))

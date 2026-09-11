@@ -40,9 +40,15 @@ _FAMILY_MIN_VERSION = {
     "claude": 4.0, "grok": 4.0, "deepseek": 4.0,
     "kimi": 2.0, "glm": 5.0, "minimax": 3.0,
 }
-# 这些家族的 flash 就是同代主力（Gemini-3-flash 常是免费首选、glm-5.3-flash 与 glm-5.3
-# 同代同档），所以同代的 flash 不降档；其他家族的 flash 只降到中档（不是轻量）
-_FLASH_OK_FAMILIES = {"gemini", "glm"}
+# 这些家族的 flash 是同代主力（Gemini-3-flash 常是免费首选、glm-5.3-flash 与 glm-5.3
+# 同代同档），所以同代的 flash 不降档；其他家族的 flash 只降到中档（不是轻量）。
+# deepseek 于 2026-09 加入：实测 v4-flash-0731 的 AA 智能指数 34.5 > v4-pro 的 30.9/36.3，
+# 且它是用户日常主力，不能按「加速档」降到中档。
+_FLASH_OK_FAMILIES = {"gemini", "glm", "deepseek"}
+# 同代里「够不够新」：只认同一代内**最新那个次版本**（0.05 容差），更早的次版本不给智能档
+# ——同代旗舰之间能力差异也很大（实测 glm-5.1 的 AA 26.4 vs glm-5.3 的 44.9、
+#   gemini-3.5-flash 33.0 vs gemini-3.8-flash 41.2）。有榜单分的模型以榜分为准，不受此限。
+_FRONTIER_BAND = 0.05
 # 各家解析方式：返回 (家族, 版本号浮点)
 # 注意分隔符要跟厂商命名一致：`qwen3.8` 无连字符、`gemini-3.5` 有 —— 写宽了会把
 # 参数量当版本号（如 `DeepSeek-R1-Distill-Qwen-14B` → 以为是 qwen 第 14 代）。
@@ -61,6 +67,50 @@ _FAMILY_PARSERS = [
 # 参数规模门槛（十亿）
 _TINY_PARAMS = 9.0      # ≤9B → 轻量
 _HUGE_PARAMS = 200.0    # ≥200B → 至少中档，且可判智能
+# 无名家族的「旗舰像」标记：命中就给中档（否则一律轻量——不认识就保守压低）
+_FLAGSHIP = re.compile(
+    r"(?:^|[^a-z0-9])(?:ultra|super|max|pro|large|big|xlarge|xl|2\.4t)(?:$|[^a-z0-9])", re.I)
+
+
+# ---- 权威榜单分：Artificial Analysis 智能指数（经 OpenRouter 白拿，不必额外申请密钥）----
+# 渠道健康检查本来就在调 <base>/models，OpenRouter 的返回里带
+# `benchmarks.artificial_analysis.intelligence_index`（439 个模型里约 90 个有分）。
+# providers.fetch_models() 顺带把它喂进来：**有榜分就用榜分定档，没有才用下面的命名启发式**。
+# 阈值取观测分布的分位数（p72 / p40），这样 AA 换算法/换版本（v4.2 → v5）时会自动适应。
+_bench: dict = {}
+_bench_hi: float = 33.0    # 智能档阈值
+_bench_mid: float = 17.0   # 中档阈值
+_BENCH_MIN_N = 20          # 榜分样本不足时沿用上面的默认阈值
+
+
+def norm_id(model_id: str) -> str:
+    """跨渠道对齐用的归一化模型名：去厂商前缀与 :free/:batch 等变体后缀，转小写。
+
+    `ZhipuAI/GLM-5.3-Flash` / `z-ai/glm-5.3-flash:batch` / `models/gemini-3.8-flash`
+    都能落到同一个 key。"""
+    s = (model_id or "").lower().split("/")[-1]
+    for suf in (":free", ":batch", ":nitro", ":extended", ":online", ":thinking"):
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+    return s.strip()
+
+
+def update_bench_scores(scores: dict) -> dict:
+    """合并榜分（{归一化名: 智能指数}）并重算分档阈值，返回 {n, hi, mid} 便于日志"""
+    global _bench_hi, _bench_mid
+    clean = {k: float(v) for k, v in (scores or {}).items() if isinstance(v, (int, float))}
+    if clean:
+        _bench.update(clean)
+        vals = sorted(_bench.values())
+        if len(vals) >= _BENCH_MIN_N:
+            _bench_hi = round(vals[min(len(vals) - 1, int(len(vals) * 0.72))], 1)
+            _bench_mid = round(vals[min(len(vals) - 1, int(len(vals) * 0.40))], 1)
+    return {"n": len(_bench), "hi": _bench_hi, "mid": _bench_mid}
+
+
+def bench_of(model_id: str):
+    """该模型的 Artificial Analysis 智能指数（没上榜 → None）"""
+    return _bench.get(norm_id(model_id))
 
 
 def _family_version(model_id: str):
@@ -136,9 +186,14 @@ def tier_of(model_id: str, overrides: dict = None) -> int:
                 return int(t)
         except (re.error, ValueError, TypeError):
             continue
-    # 1) 轻量：非对话模型 / 小尺寸 SKU / ≤9B —— 只由「规模」决定，与代际无关
+    # 1) 非对话模型（图片/视频/音频/向量/翻译/安全）：不能拿来聊天就别占智能档
     if _UTIL.search(model_id):
         return 1
+    # 2) 权威榜单分：有 Artificial Analysis 智能指数就用它定档（比认名字可靠得多）
+    score = _bench.get(norm_id(model_id))
+    if score is not None:
+        return 3 if score >= _bench_hi else (2 if score >= _bench_mid else 1)
+    # 3) 轻量：小尺寸 SKU / 名字写明 ≤9B（规模决定，与代际无关）
     if _SMALL_SKU.search(model_id):
         return 1
     pb = _params_b(model_id)
@@ -146,15 +201,16 @@ def tier_of(model_id: str, overrides: dict = None) -> int:
         return 1
     huge = pb is not None and pb >= _HUGE_PARAMS
 
-    # 2) 已知家族：按代际（主版本号）+ 档位标记 逐级降档
+    # 4) 已知家族：代际（主版本号）+ 次版本前沿带 + 档位标记 逐级降档
     fam, ver = _family_version(model_id)
     if fam:
         cur = effective_min(fam)
         same_gen = int(ver) >= int(cur)      # 主版本号相同即同代（3.6 与 3.8 同属第 3 代）
+        fresh = ver >= cur - _FRONTIER_BAND  # 同代里也要够新，早期次版本不给智能档
         fast, lite = bool(_FAST.search(model_id)), bool(_LITE.search(model_id))
-        if same_gen:
+        if same_gen and fresh:
             # 同代：旗舰 3 → 加速档(flash/turbo) 2 → 缩水档(lite/air) 1
-            # 例外：gemini/glm 的 flash 就是同代主力（免费首选），不降档
+            # 例外：gemini/glm/deepseek 的 flash 就是同代主力（免费首选），不降档
             if lite:
                 tier = 1
             elif fast and fam not in _FLASH_OK_FAMILIES:
@@ -162,7 +218,7 @@ def tier_of(model_id: str, overrides: dict = None) -> int:
             else:
                 tier = 3
         else:
-            # 落后代：整体降一档（旗舰→中档，不塌到轻量），带档位标记再降一档
+            # 落后代 / 同代早期版本：整体降一档（旗舰→中档，不塌到轻量），带标记再降一档
             tier = 1 if (fast or lite) else 2
         tier = max(1, tier)
         # 名字里写明了中等规模（10~200B）就封顶中档：同代 ≠ 同尺寸
@@ -171,12 +227,10 @@ def tier_of(model_id: str, overrides: dict = None) -> int:
             tier = min(tier, 2)
         return tier
 
-    # 3) 无名家族：只信「规模」
-    if huge or any(re.search(p, model_id, re.I) for p in _STRONG):
-        return 3
-    # 没有代际可比时，flash/turbo 只当「同代快速档」→ 中档（不是小模型）；
-    # 只有 lite/air 这种名字自带「砍过」语义的才给轻量
-    return 1 if _LITE.search(model_id) else 2
+    # 5) 无名家族：默认轻量（不认识就保守压低），只有「旗舰像」才给中档
+    if huge or any(re.search(p, model_id, re.I) for p in _STRONG) or _FLAGSHIP.search(model_id):
+        return 2
+    return 1
 
 
 # ---------------- 视觉/上下文启发式（模型详情用，非官方数据，仅推断） ----------------

@@ -51,26 +51,28 @@ def test_vault_roundtrip():
 @pytest.mark.parametrize("mid,expect", [
     ("gpt-4o", 2), ("o3-mini", 1), ("claude-3-5-sonnet", 2),
     ("glm-4-flash", 1), ("gpt-4o-mini", 1), ("llama-3.1-8b-instruct", 1),
-    ("glm-4-air", 1), ("some-unknown-model", 2), ("qwen2.5-72b", 2),
+    ("glm-4-air", 1), ("some-unknown-model", 1), ("qwen2.5-72b", 2),
 ])
 def test_tier_of(mid, expect):
+    """不知名模型默认轻量（2026-09 起：不认识就保守压低，旗舰像的才给中档）"""
     assert capability.tier_of(mid) == expect
 
 
 def test_tier_overrides():
     assert capability.tier_of("custom-xyz", {"xyz": 3}) == 3
-    assert capability.tier_of("custom-xyz", {"bad:": 5}) == 2  # 非法覆盖忽略
+    assert capability.tier_of("custom-xyz", {"bad:": 5}) == 1  # 非法覆盖忽略 → 落到「不知名=轻量」
 
 
 def test_tier_scale_not_generation():
     """2026-09 修的那批「名不符实」：轻量只由规模决定，代际只降一档。"""
-    # 前沿家族的「同代加速档」不是轻量（曾把 deepseek-v4-flash 标成轻量）
-    assert capability.tier_of("deepseek-ai/deepseek-v4-flash-0731") == 2
-    assert capability.tier_of("deepseek-v4-flash") == 2
-    # 无名家族：光凭 super/字面不再拿智能；真·超大规模才算智能
+    # 前沿家族的「同代加速档」不再是轻量，deepseek 的 flash 更是同代主力 → 智能
+    assert capability.tier_of("deepseek-ai/deepseek-v4-flash-0731") == 3
+    assert capability.tier_of("deepseek-v4-flash") == 3
+    # 无名家族：光凭 super/字面不给智能，只给中档；真·超大规模也给中档（不认识就保守）
     assert capability.tier_of("nvidia/nemotron-3-super-120b-a12b:free") == 2
-    assert capability.tier_of("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B") == 3
-    assert capability.tier_of("nvidia/nemotron-3.5-lightning-30b-a3b") == 2
+    assert capability.tier_of("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B") == 2
+    assert capability.tier_of("nvidia/nemotron-3.5-lightning-30b-a3b") == 1  # 不知名且非旗舰像
+    assert capability.tier_of("prism-ml/some-odd-27B") == 1
     # 同代 flash：gemini/glm 的 flash 是同代主力 → 智能；flash-lite 仍轻量
     assert capability.tier_of("models/gemini-3.6-flash") == 3
     assert capability.tier_of("models/gemini-3.5-flash-lite") == 1
@@ -91,7 +93,8 @@ def test_family_version_not_polluted_by_params():
     cap._observed_frontier.clear()
     cap.update_frontier(["deepseek-ai/DeepSeek-R1-Distill-Qwen-14B", "Qwen/Qwen3.8-2.4T-A95B"])
     assert cap._observed_frontier["qwen"] == 3.8, cap._observed_frontier
-    assert capability.tier_of("Qwen/Qwen3-235B-A22B") == 3   # ≥200B 仍是智能
+    assert capability.tier_of("Qwen/Qwen3.8-2.4T-A95B") == 3          # 同代且够新 → 智能
+    assert capability.tier_of("Qwen/Qwen3-235B-A22B") == 2           # 同代但早期次版本 → 中档
     cap._observed_frontier.clear()
 
 
@@ -107,6 +110,60 @@ def test_model_composite_takes_best_single_channel():
     mixed = 0.10 * 1.0 + 0.25 * 1.0 + 0.65 * (400 / 500)        # 旧口径的「拼分」
     assert got < mixed
     assert gateway._model_composite({"tier": 2, "channels": []}, "balanced") == 0.0
+
+
+def test_tier_from_bench_score(monkeypatch):
+    """有权威榜单分（AA 智能指数）就用榜分定档，没有才回退命名启发式"""
+    from app import capability as cap
+    monkeypatch.setattr(cap, "_bench", {})
+    cap.update_bench_scores({"deepseek-v4-flash-0731": 34.5,
+                             "nemotron-3-super-120b-a12b": 13.6})
+    assert cap.tier_of("deepseek-ai/deepseek-v4-flash-0731") == 3        # 34.5 → 智能
+    assert cap.tier_of("nvidia/nemotron-3-super-120b-a12b:free") == 1    # 13.6 → 轻量
+    # 跨渠道名归一化后能对上（厂商前缀 / :batch / 大小写都不影响）
+    assert cap.bench_of("deepseek/deepseek-v4-flash-0731:batch") == 34.5
+    assert cap.bench_of("models/gemini-9.9-flash") is None
+
+
+def test_eff_score_confidence():
+    """稳定分按样本量向先验收缩：测 1 次 ≠ 测很多次（① 的回归）"""
+    assert gateway.eff_score({"score": 0.76, "n": 1}) < gateway.eff_score({"score": 0.99, "n": 20})
+    # 侥幸成功 1 次几乎不改变判断（贴近先验 0.7）
+    assert abs(gateway.eff_score({"score": 0.76, "n": 1}) - 0.7) < 0.02
+    # 偶发 1 次连接失败不再直接打到谷底
+    assert gateway.eff_score({"score": 0.35, "n": 1}) > 0.55
+    # 连续失败照样沉底
+    assert gateway.eff_score({"score": 0.02, "n": 10}) < 0.2
+    # 老持久化数据没有 n → 按 6 个样本算，升级不归零
+    assert gateway.eff_score({"score": 0.9}) > 0.8
+
+
+def test_stats_persist_and_restore(tmp_path, monkeypatch):
+    """渠道评分（稳定分/延迟/首字节/样本数）要跨重启保留——不然稳定分永远攒不起来"""
+    from app import store as _store
+    _reset()
+    monkeypatch.setattr(_store, "RUNTIME_STATE_PATH", str(tmp_path / "rt.json"))
+    gateway.mark_result("m1", "c1", True, 800)
+    gateway.mark_result("m1", "c1", True, 900)
+    gateway.mark_ttft("m1", "c1", 300)
+    gateway.save_runtime_state()
+    assert gateway.stats[("m1", "c1")]["n"] == 2
+    gateway.stats.clear()
+    gateway.restore_runtime_state()
+    s = gateway.stats[("m1", "c1")]
+    assert s["n"] == 2 and s["ttft"] == 300 and s["latency"] == 830  # 800→900 的 7:3 EMA
+
+
+def test_ttft_wins_over_total_latency_in_speed_score():
+    """速度分优先用首字节(TTFT)：总延迟一样时，首字节快的综合分应更高（② 的回归）"""
+    _reset()
+    ch = _chan("c1", ["m1", "m2"], latency=100)
+    gateway.stats[("m1", "c1")] = {"score": 0.7, "latency": 3000, "ttft": 200, "n": 5}
+    gateway.stats[("m2", "c1")] = {"score": 0.7, "latency": 3000, "ttft": 2500, "n": 5}
+    cfg = _cfg([ch], strategy="speed")
+    a = gateway._composite({"channel": ch, "model": "m1"}, cfg, "speed")
+    b = gateway._composite({"channel": ch, "model": "m2"}, cfg, "speed")
+    assert a > b, (a, b)
 
 
 # ---------------- gateway：评分、冷却、别名、路由策略 ----------------

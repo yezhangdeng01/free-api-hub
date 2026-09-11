@@ -1,12 +1,23 @@
 """各平台模型列表与额度查询"""
+import logging
+
 import httpx
+
+from app import capability
+
+logger = logging.getLogger("api-hub")
 
 # 智谱网页端额度接口（社区逆向，非官方文档，失败会自动降级）
 ZHIPU_BALANCE_URL = "https://www.bigmodel.cn/api/biz/account/query-customer-account-report"
 
 
 async def fetch_models(client: httpx.AsyncClient, base_url: str, api_key: str) -> list:
-    """拉取渠道的模型列表（OpenAI 兼容 /models）"""
+    """拉取渠道的模型列表（OpenAI 兼容 /models）
+
+    顺带收割权威榜单分：OpenRouter 的返回里带
+    `benchmarks.artificial_analysis.intelligence_index`（Artificial Analysis 智能指数），
+    这是白拿的——不用额外申请密钥、不多发一次请求，喂给 capability 用它定能力档位。
+    """
     r = await client.get(
         base_url.rstrip("/") + "/models",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -15,11 +26,24 @@ async def fetch_models(client: httpx.AsyncClient, base_url: str, api_key: str) -
     r.raise_for_status()
     data = r.json()
     items = data.get("data", []) if isinstance(data, dict) else data
-    ids = []
+    ids, bench = [], {}
     for it in items:
-        mid = it.get("id") if isinstance(it, dict) else str(it)
-        if mid:
-            ids.append(mid)
+        if not isinstance(it, dict):
+            if it:
+                ids.append(str(it))
+            continue
+        mid = it.get("id")
+        if not mid:
+            continue
+        ids.append(mid)
+        aa = ((it.get("benchmarks") or {}).get("artificial_analysis") or {})
+        v = aa.get("intelligence_index")
+        if isinstance(v, (int, float)):
+            bench[capability.norm_id(mid)] = v
+    if bench:
+        info = capability.update_bench_scores(bench)
+        logger.info("收割 AA 榜分 %d 个（累计 %d，智能阈值 %.1f / 中档阈值 %.1f）",
+                    len(bench), info["n"], info["hi"], info["mid"])
     return sorted(set(ids))
 
 
