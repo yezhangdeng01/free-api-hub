@@ -44,7 +44,7 @@
   .btn.pinned { color: var(--warn); border-color: var(--warn); font-weight: 700; }
   .btn.pinned:hover { color: var(--warn); }
   .btn.mini { padding: 2px 7px; font-size: 11.5px; border-radius: 5px; }
-  th .th-col { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+  thead th { vertical-align: middle; }   /* 表头行里按钮与文字垂直居中，避免「收藏」显得偏上 */
   .vdiv { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
   .chip-btn {
     background: var(--panel2); color: var(--muted);
@@ -140,8 +140,7 @@
       <table>
         <thead><tr><th style="width:44px">#</th><th>模型</th><th>特点</th>
           <th style="width:74px; text-align:center">收藏</th>
-          <th style="width:128px"><div class="th-col"><span>单次测试</span>
-            <button class="btn mini" id="pg-test-all" title="对所有未测试模型各发一次 1 token 探测">测试未测</button></div></th>
+          <th style="width:104px; text-align:center"><button class="btn mini" id="pg-test-all" title="对所有未测试模型各发一次 1 token 探测">测试未测</button></th>
         </tr></thead>
         <tbody id="model-rows"></tbody>
       </table>
@@ -429,34 +428,43 @@ document.querySelectorAll("#sort-chips .chip-btn").forEach(b =>
     api("/api/settings", {route_strategy: MODEL_STATE.sort}).catch(()=>{});
   });
 
-// 排序：收藏置顶 → 可用(ok) → 受限(limited) → 策略加权综合分 → 版本号 → 名称
-// 每种策略都同时考虑 智能(档位)/稳定(实测成功率)/速度(延迟)，只是权重不同（与后端 _STRATEGY_WEIGHTS 一致）
-const STRAT_W = {
-  quality:   [0.60, 0.30, 0.10],   // 智能优先
-  balanced:  [0.35, 0.40, 0.25],   // 均衡
-  stability: [0.20, 0.70, 0.10],   // 稳定优先
-  speed:     [0.10, 0.25, 0.65],   // 速度优先
+// 排序：收藏置顶 → 可用(ok) → 受限(limited) → 策略分 → 版本号 → 名称
+// 策略 = 主维度优先（按**容忍带宽**分档：「差得不多」就算同等）+ 档内再按另两维加权；
+// 均衡是三维直接加权。与后端 _STRATEGY_SPEC / _score_dims 完全同口径。
+// 为什么用带宽而不是严格主键：主维度是连续值（AA 34.5 vs 34.6 也算不同），
+// 严格排序等于只看主键，稳定/速度两维就废了。
+const STRAT_SPEC = {
+  quality:   {primary: 0, band: 0.10, tie: [0.60, 0.40]},   // 智能优先：能力接近时看稳定6/速度4
+  stability: {primary: 1, band: 0.08, tie: [0.60, 0.40]},   // 稳定优先：稳定接近时看智能6/速度4
+  speed:     {primary: 2, band: 0.10, tie: [0.55, 0.45]},   // 速度优先：速度接近时看智能5.5/稳定4.5
+  balanced:  {weights: [0.35, 0.40, 0.25]},                 // 均衡：三维加权
 };
-const CAP_NORM = {3: 1.0, 2: 0.6, 1: 0.25};
-// 模型分 = 「该模型最优渠道」的综合分。逐渠道算完取最大，不能用
+const OTHER_DIMS = [[1, 2], [0, 2], [0, 1]];                // 主维度 → 剩下两维
+const CAP_NORM = {3: 0.76, 2: 0.28, 1: 0.10};               // 无榜分时的档位锚点（同后端 _TIER_ANCHOR）
+// 模型分 = 「该模型最优渠道」的策略分。逐渠道算完取最大，不能用
 // 「稳定分取最好的渠道 + 延迟取最快的渠道」拼分——那会拼出一个不存在的组合。
-// 与后端 _model_composite / _composite(候选) 同口径，保证「列表顺序 = 实际选用顺序」。
 function compScore(m){
   const s = overview?.settings?.route_strategy || "balanced";
-  const w = STRAT_W[s] || STRAT_W.balanced;
-  const cap = CAP_NORM[m.tier] ?? 0.6;
+  const spec = STRAT_SPEC[s] || STRAT_SPEC.balanced;
+  const cap = m.cap_score ?? CAP_NORM[m.tier] ?? 0.28;      // 连续能力分（后端按 AA 榜分算好）
   const chans = m.channels || [];
-  const pool = chans.filter(c => c.available).length ? chans.filter(c => c.available) : chans;
-  let best = 0;
+  const avail = chans.filter(c => c.available);
+  const pool = avail.length ? avail : chans;
+  let best = -1;
   for (const c of pool){
     const lat = c.latency_ms;
-    const spd = (lat != null && isFinite(lat)) ? 400 / (400 + lat) : 0;
-    // 稳定分用带样本量置信度的 eff_score（与后端 get_stat/eff_score 一致）
-    const stab = c.eff_score ?? 0.7;
-    const v = w[0] * cap + w[1] * stab + w[2] * spd;
+    const dims = [cap, c.eff_score ?? 0.7,
+                  (lat != null && isFinite(lat)) ? 400 / (400 + lat) : 0];
+    let v;
+    if (spec.weights){
+      v = spec.weights[0] * dims[0] + spec.weights[1] * dims[1] + spec.weights[2] * dims[2];
+    } else {
+      const o = OTHER_DIMS[spec.primary];
+      v = Math.floor(dims[spec.primary] / spec.band) + spec.tie[0] * dims[o[0]] + spec.tie[1] * dims[o[1]];
+    }
     if (v > best) best = v;
   }
-  return best;
+  return best < 0 ? 0 : best;
 }
 function modelSort(a, b){
   const pa = isPinned(a.id), pb = isPinned(b.id);

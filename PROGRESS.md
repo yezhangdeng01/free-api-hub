@@ -15,7 +15,7 @@
 | v1.0.1 | 措辞 + gitignore | README 完善；排除本地 venv |
 | v1.0.2 | 可用性语义 + 故障切换 | `available=state==ok`（limited 不再冒充可用）；`is_permanent_failure` 统一 4xx/429 判定；`restore_model_status` 归正旧数据 + 回写磁盘；connect 0.5 衰减降权；connect 超时 15s→8s；持久化（throttle/channel_down/原子写/托盘优雅退出/单实例锁）；OpenRouter 命名迁移；扫描串行限速 |
 | v1.0.3 | 挂起切换 + 账户级限额 + 统计 + 用法页 | read 超时 300s→120s（挂起 2min 切换）；魔搭 daily 型 429 → 整渠道冷却到明天（`mark_channel_quota_exhausted` + `channel_cool` 持久化）；柱状图数值标签 + 最小高度；请求日志按钮反馈 + 统计页 3s 轮询；网关用法页去硬编码 |
-| **v1.0.4（未发）** | **重启 404 根因 + 托盘左键 + 档位/排序/表格列** | ① `_serve` 改为「先 `_bind_listen` 抢端口（SO_REUSEADDR 绕过 TIME_WAIT + 探测活跃监听者），再 `uvicorn.Server(config).run(sockets=[sock])`」——**删掉了 v1.0.3 那版在 `uvicorn.run` 外面重试的做法**（它每次都重跑 lifespan，`aclose()` 掉 `shared_client` → 全渠道 "client has been closed"）；② 单实例锁去掉 SO_REUSEADDR（Windows 上会让锁失效）+ 5s 重试；③ `wait_port` 20s→45s；④ 托盘「显示窗口」改为 default+invisible（恢复左键唤起，且不占右键菜单），删「隐藏窗口」（X 就是隐藏）；⑤ `app/main.py` lifespan 兜底重建被 `aclose()` 过的 `shared_client`；⑥ 档位/排序/表格列（收藏·单次测试）；⑦ **档位改为「AA 榜分优先 + 启发式兜底」**（榜分从 OpenRouter `/models` 白拿）+ 稳定分加样本量置信度 + 速度分改用首字节 TTFT + 渠道评分持久化；新增 `tests/test_desktop.py` 与档位/排序/评分回归测试 |
+| **v1.0.4（未发）** | **重启 404 根因 + 托盘左键 + 档位/排序/表格列** | ① `_serve` 改为「先 `_bind_listen` 抢端口（SO_REUSEADDR 绕过 TIME_WAIT + 探测活跃监听者），再 `uvicorn.Server(config).run(sockets=[sock])`」——**删掉了 v1.0.3 那版在 `uvicorn.run` 外面重试的做法**（它每次都重跑 lifespan，`aclose()` 掉 `shared_client` → 全渠道 "client has been closed"）；② 单实例锁去掉 SO_REUSEADDR（Windows 上会让锁失效）+ 5s 重试；③ `wait_port` 20s→45s；④ 托盘「显示窗口」改为 default+invisible（恢复左键唤起，且不占右键菜单），删「隐藏窗口」（X 就是隐藏）；⑤ `app/main.py` lifespan 兜底重建被 `aclose()` 过的 `shared_client`；⑥ 档位/排序/表格列（收藏·单次测试）；⑦ **档位改为「AA 榜分优先 + 启发式兜底」**（榜分从 OpenRouter `/models` 白拿）+ 稳定分加样本量置信度 + 速度分改用首字节 TTFT + 渠道评分持久化；⑧ **策略改为「主维度优先 + 容忍带宽」**（智能/稳定/速度各自优先，均衡三维加权）+ 能力维度升级为**连续 AA 分** + 表头去掉「单次测试」文字并对齐；新增 `tests/test_desktop.py` 与档位/排序/评分回归测试 |
 
 ## 档位与排序（2026-09-11 第二批，改前必读）
 
@@ -56,21 +56,36 @@ OpenRouter 返回里的 `benchmarks.artificial_analysis.intelligence_index`—�
 - 结论：**先用 AA 榜分（免费且零额外请求）**，其它来源按需再加。
 
 ### 排序（FE `compScore` / BE `_model_composite` / 路由 `_composite` 三处同口径）
-- 模型分 = **逐渠道算综合分，取最大的那条**（不能「稳定分取最好的渠道 + 延迟取最快的渠道」拼分）。
-- 综合分 = w智能·档位归一化 + w稳定·**eff_score** + w速度·400/(400+响应毫秒)；
-  权重 `_STRATEGY_WEIGHTS`（FE `STRAT_W` 镜像）：quality .60/.30/.10、balanced .35/.40/.25、
-  stability .20/.70/.10、speed .10/.25/.65；档位归一化 {3:1.0, 2:0.6, 1:0.25}。
-- **响应速度取「首字节时间 TTFT」优先**：流式请求在 `_stream_gen` 记 TTFT（`gateway.mark_ttft`），
-  没 TTFT 用实测总延迟，最后退回渠道健康检查延迟。健康检查量的是「列模型接口快不快」，与吐字速度弱相关。
-- **稳定分带样本量置信度** `eff_score()`：`0.7 + (score-0.7) * n/(n+3)`——测 1 次成功不再等价于测 50 次；
-  偶发 1 次连接失败也不再直接打到谷底。老持久化数据没有 `n` 按 6 个样本算，升级不归零。
-- **渠道评分会持久化**（`runtime_state.json` 的 `stats`，只存实测过的条目）：稳定分/延迟/TTFT/样本数跨重启累计，
-  否则「稳定优先」每次重启都从 0.7 重来。
-- 排序硬分组：收藏置顶 → 可用(ok) → 受限(limited) → 综合分 → 版本号 → 名称（后端 `/v1/models` 与前端一致）。
+三个维度都归一到 0~1：**cap 智能**（AA 榜分归一化，连续分）/ **stab 稳定**（带样本量置信度的
+`eff_score`）/ **spd 速度**（`400/(400+响应毫秒)`，TTFT 优先）。
+
+策略 = **主维度优先 + 容忍带宽分档**，档内再按另外两维加权（`_STRATEGY_SPEC`，FE 的 `STRAT_SPEC` 镜像）：
+
+| 策略 | 主维度 | 带宽（「差不多」的宽度） | 档内加权 |
+|---|---|---|---|
+| 智能优先 quality | cap | 0.10 ≈ AA 3.5 分 | 稳定 0.60 / 速度 0.40 |
+| 稳定优先 stability | stab | 0.08 | 智能 0.60 / 速度 0.40 |
+| 速度优先 speed | spd | 0.10 | 智能 0.55 / 稳定 0.45 |
+| 均衡 balanced | 无（三维直接加权） | — | 0.35 / 0.40 / 0.25 |
+
+- **为什么用带宽而不是严格主键**：主维度是连续分，严格「同等再比次要」几乎永不成立
+  （AA 34.5 vs 34.6 也算不同）→ 等于只看主键，另两维形同虚设。
+- **为什么不用「主维度给大权重」**：权重再大也压不住主维度的极端值（1 分能力差 vs 稳定性崩掉）。
+- 实现：`_score_dims()` 返回 `档号 + 档内加权`（档内加权 ∈[0,1)），所以标量排序天然等于
+  「先分档、同档再比次要」，前端 / 路由 / `/v1/models` 共用同一套口径，不用各写一份比较器。
+- 能力分 `capability.capability_score()`：**有 AA 榜分 → 按观测分布归一化（p10→0、p90→1）**；
+  无榜分 → 档位锚点 `_TIER_ANCHOR = {3:0.76, 2:0.28, 1:0.10}`（取该档在归一化尺度上的下沿，
+  不让没上榜的模型凭档位挤到榜上有名的前面）。
+- 稳定分 `eff_score()`：`0.7 + (score-0.7) * n/(n+3)`；渠道评分（分数/延迟/TTFT/样本数）持久化在
+  `runtime_state.json` 的 `stats`（只存实测过的条目），跨重启累计。
+- 速度：流式请求在 `_stream_gen` 记 TTFT（`gateway.mark_ttft`）→ 没 TTFT 用实测总延迟 →
+  最后退回渠道健康检查延迟。
+- 排序硬分组（在策略分之前）：收藏置顶 → 可用(ok) → 受限(limited) → 策略分 → 版本号 → 名称。
 
 ### 模型表格列
-`# / 模型 / 特点 / 收藏 / 单次测试`。「测试未测」（批量对未测模型各发一次 1 token 探测）按钮放在
-**「单次测试」列表头**里。特点列里档位标签后跟 `AA xx.x`（Artificial Analysis 智能指数，没上榜则不显示），
+`# / 模型 / 特点 / 收藏 / 测试未测`（表头不放「单次测试」文字，`thead th` 垂直居中，
+所以按钮与「收藏」同一行对齐）。「测试未测」= 批量给未测模型各发一次 1 token 探测。
+特点列里档位标签后跟 `AA xx.x`（Artificial Analysis 智能指数，没上榜则不显示），
 档位/延迟标签都带 title 说明。
 
 ## 待办（下次从这里接手）
@@ -81,12 +96,11 @@ OpenRouter 返回里的 `benchmarks.artificial_analysis.intelligence_index`—�
 - [ ] **OpenRouter 改名无法自动迁移的模型**（`aya-expanse-32b`→`command-a`、`MiniMax-M2`→`minimax-m2.7` 等本体/版本也变的）：迁移只做确定等价，这几个需用户手动重扫。
 - [ ] **`model_status` 幽灵数据**（旧名、已不在任何渠道）：暂保留（避免误删 HF 渠道还在用的旧名），保守清理留待以后。
 - [ ] **`classify_429` 对「余额不足」误判为 daily**：GLM 余额不足的 429 会被判成 daily → `mark_channel_quota_exhausted` 把整渠道冷却到明天（截图里的「限流熔断中（账号级限流）」就是它）。永久性欠费应走 `is_permanent_failure` → `down`，不该占用 channel_cool。观察到即可修。
-- [ ] **排序算法增强（③④ 待用户拍板；①② 已完成）**：
-      ~~① 稳定分加样本量置信度~~ ✅ 已做（`eff_score` + 样本数持久化）；
-      ~~② 速度分改用首字节时间~~ ✅ 已做（`mark_ttft` + TTFT 优先）；
-      ③ **权重是拍脑袋值**（balanced .35/.40/.25 等）：若主要当 Hermes 后端用，可考虑更偏速度
-         （如 balanced → .30/.30/.40）；需用户确认。
-      ④ **档位归一化 {3:1.0, 2:0.6, 1:0.25}**：轻量 0.25 惩罚很重，若想「中档和智能差距更小」可改 {1.0,0.7,0.35}。
+- [ ] **策略参数按手感微调（待用户实测后定）**：主维度带宽（能力 0.10 / 稳定 0.08 / 速度 0.10）、
+      档内加权（稳定优先 0.60/0.40 等）、均衡权重（0.35/0.40/0.25）、档位锚点
+      （`_TIER_ANCHOR` 3:0.76 / 2:0.28 / 1:0.10）。带宽调小 = 主维度更强势。
+      可选进阶：① 用 pairwise 容差比较替代「分档标量」以消除档位边界效应；
+      ② 收藏/可用 是否也要参与策略（现在收藏永远置顶、不参与打分）。
 - [ ] **扫描按钮命名**：按钮叫「扫描全部模型」，实为「只扫未测过的」。已加 toast + skip 原因提示缓解，按钮名本身可考虑改「扫描未测」。
 
 ## 端口 / 重启机制（**改之前务必读，别再改回「重试 uvicorn.run」**）

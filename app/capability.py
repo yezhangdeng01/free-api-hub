@@ -80,7 +80,24 @@ _FLAGSHIP = re.compile(
 _bench: dict = {}
 _bench_hi: float = 33.0    # 智能档阈值
 _bench_mid: float = 17.0   # 中档阈值
+_bench_p10: float = 7.8    # 观测分布 p10（把榜分归一化到 0~1 用）
+_bench_p90: float = 42.3   # 观测分布 p90
 _BENCH_MIN_N = 20          # 榜分样本不足时沿用上面的默认阈值
+# 无榜分时按档位给的「能力分锚点」：取该档位在归一化尺度上的**下沿**（保守，
+# 不让没上榜的模型凭档位挤到榜上有名的模型前面）
+_TIER_ANCHOR = {3: 0.76, 2: 0.28, 1: 0.10}
+
+
+def capability_score(model_id: str, tier: int = None) -> float:
+    """0~1 能力分（连续）。有 AA 榜分就按观测分布归一化（p10→0、p90→1）；
+    没有榜分才按档位锚点给保守值。
+
+    「智能优先」用这个连续分排序——只按 3 档太钝（同档里 AA 41.2 与 33.9 差 7 分）。"""
+    s = _bench.get(norm_id(model_id))
+    if s is not None and _bench_p90 > _bench_p10:
+        return max(0.0, min(1.0, (s - _bench_p10) / (_bench_p90 - _bench_p10)))
+    t = tier if tier is not None else tier_of(model_id)
+    return _TIER_ANCHOR.get(t, _TIER_ANCHOR[2])
 
 
 def norm_id(model_id: str) -> str:
@@ -97,7 +114,7 @@ def norm_id(model_id: str) -> str:
 
 def update_bench_scores(scores: dict) -> dict:
     """合并榜分（{归一化名: 智能指数}）并重算分档阈值，返回 {n, hi, mid} 便于日志"""
-    global _bench_hi, _bench_mid
+    global _bench_hi, _bench_mid, _bench_p10, _bench_p90
     clean = {k: float(v) for k, v in (scores or {}).items() if isinstance(v, (int, float))}
     if clean:
         _bench.update(clean)
@@ -105,6 +122,8 @@ def update_bench_scores(scores: dict) -> dict:
         if len(vals) >= _BENCH_MIN_N:
             _bench_hi = round(vals[min(len(vals) - 1, int(len(vals) * 0.72))], 1)
             _bench_mid = round(vals[min(len(vals) - 1, int(len(vals) * 0.40))], 1)
+            _bench_p10 = vals[min(len(vals) - 1, int(len(vals) * 0.10))]
+            _bench_p90 = vals[min(len(vals) - 1, int(len(vals) * 0.90))]
     return {"n": len(_bench), "hi": _bench_hi, "mid": _bench_mid}
 
 

@@ -568,17 +568,38 @@ def model_targets(model: str, cfg: dict) -> list:
     return ids
 
 
-# 能力档位 → 0~1 归一化分（用于加权综合分）
-_CAP_SCORE = {3: 1.0, 2: 0.6, 1: 0.25}
-# 策略权重 (智能, 稳定, 速度)：每种策略都考虑三项，只是侧重不同（借鉴 FreeLLMAPI 思路）
-_STRATEGY_WEIGHTS = {
-    "quality":    (0.60, 0.30, 0.10),   # 智能优先：能力为主，稳定其次，速度少量
-    "balanced":   (0.35, 0.40, 0.25),   # 均衡：稳定/速度并重，能力兜底
-    "stability":  (0.20, 0.70, 0.10),   # 稳定优先：成功率为主
-    "speed":      (0.10, 0.25, 0.65),   # 速度优先：延迟为主
+# 三个维度都归一化到 0~1：cap 智能（AA 榜分归一化）/ stab 稳定（带样本量置信度）/ spd 速度
+# 策略 = **主维度优先，按容忍带宽分档**（同档视为「差不多」）→ 档内再按另外两维加权。
+#   为什么不用「严格主键排序」：主维度是连续分，几乎永不相等（AA 34.5 vs 34.6 就是不同），
+#   那样等于只看主键、另两维形同虚设；
+#   为什么不用「大权重加权」：权重再大也压不住主维度的极端值（1 分能力差 vs 稳定性崩掉）。
+# band 就是「差不多」的宽度：能力带 0.10 ≈ AA 3.5 分（观测分布 7.8~42.3 归一化后）。
+_STRATEGY_SPEC = {
+    # 主维度 / 容忍带宽 / 档内加权（另两维，按 cap-stab-spd 去掉主维后的顺序）
+    "quality":   {"primary": "cap",  "band": 0.10, "tie": (0.60, 0.40)},  # 智能优先：能力接近时看稳定6/速度4
+    "stability": {"primary": "stab", "band": 0.08, "tie": (0.60, 0.40)},  # 稳定优先：稳定接近时看智能6/速度4
+    "speed":     {"primary": "spd",  "band": 0.10, "tie": (0.55, 0.45)},  # 速度优先：速度接近时看智能5.5/稳定4.5
+    "balanced":  {"weights": (0.35, 0.40, 0.25)},                         # 均衡：三维直接加权
 }
-_CAP_BY_TIER = _CAP_SCORE
+_DIM_IDX = {"cap": 0, "stab": 1, "spd": 2}
+_CAP_BY_TIER = capability._TIER_ANCHOR   # 手造 dict / 无榜分时的兜底锚点
 _SPEED_K = 400.0  # 400/(400+ms) 把延迟映射到 0~1（400ms 为 0.5）
+
+
+def _score_dims(dims: tuple, strategy: str) -> float:
+    """把三维分按策略折成一个可排序的标量。
+
+    带主维度的策略返回 `档号 + 档内加权`（档内加权 ∈ [0,1)），所以排序天然是
+    「先按主维度分档、同档再按另外两维」——标量接口不变，前端 / 路由 / /v1/models
+    共用同一套口径。"""
+    spec = _STRATEGY_SPEC.get(strategy) or _STRATEGY_SPEC["balanced"]
+    if "weights" in spec:
+        w = spec["weights"]
+        return w[0] * dims[0] + w[1] * dims[1] + w[2] * dims[2]
+    i = _DIM_IDX[spec["primary"]]
+    others = [x for x in (0, 1, 2) if x != i]
+    tie = spec["tie"][0] * dims[others[0]] + spec["tie"][1] * dims[others[1]]
+    return int(dims[i] / spec["band"]) + tie
 
 
 def _model_composite(m: dict, strategy: str) -> float:
@@ -587,21 +608,22 @@ def _model_composite(m: dict, strategy: str) -> float:
     与 candidates_for 的候选排序（_composite 单渠道版）同口径——这样「/v1/models 里
     排前面的」就是「auto 实际会先用到的」。旧版把「稳定分取最好的渠道、延迟取最快的
     渠道」分开取值，会拼出一个任何一次请求都拿不到的组合。"""
-    wcap, wstab, wspd = _STRATEGY_WEIGHTS.get(strategy, _STRATEGY_WEIGHTS["balanced"])
-    cap = _CAP_BY_TIER.get(m.get("tier") or 2, 0.6)
+    cap = m.get("cap_score")
+    if cap is None:
+        cap = _CAP_BY_TIER.get(m.get("tier") or 2, _CAP_BY_TIER[2])
     chans = m.get("channels") or []
     pool = [c for c in chans if c.get("available")] or chans
-    best = 0.0
+    best = -1.0
     for c in pool:
         lat = c.get("latency_ms")
         speed = _SPEED_K / (_SPEED_K + lat) if lat else 0.0
         stab = c.get("eff_score")
         if stab is None:
             stab = c.get("score") or 0.7   # 没有置信度字段（手造 dict）就用原始评分
-        cand = wcap * cap + wstab * stab + wspd * speed
+        cand = _score_dims((cap, stab, speed), strategy)
         if cand > best:
             best = cand
-    return best
+    return max(best, 0.0)
 
 
 import re as _re_ver  # 与 FE _lastVersion 对齐：剥 -\d+[bB]$ 取末位数字
@@ -619,18 +641,17 @@ def _last_version(s: str):
 
 
 def _composite(c, cfg, strategy: str) -> float:
-    """综合评分 = w智能*能力档 + w稳定*实测成功率(带置信度) + w速度*响应速度
+    """候选（模型×渠道）综合分：按当前策略把三维分折算成标量。
 
-    速度优先用**流式首字节时间(TTFT)**，其次实测总延迟，最后退回渠道健康检查延迟——
-    健康检查量的是「列模型接口快不快」，跟吐字速度弱相关。"""
+    智能 = 连续能力分（AA 榜分归一化，无榜分用档位锚点）；稳定 = 带样本量置信度的
+    eff_score；速度 = 首字节时间(TTFT) 优先 → 实测总延迟 → 渠道健康检查延迟。"""
     s = get_stat(c["model"], c["channel"]["id"])
     cs_lat = (channels.get(c["channel"]["id"]).latency_ms) or 9999
     lat = s.get("ttft") or s["latency"] or cs_lat
-    w_cap, w_stab, w_spd = _STRATEGY_WEIGHTS.get(strategy, _STRATEGY_WEIGHTS["balanced"])
     tier = capability.tier_of(c["model"], cfg.get("model_tiers"))
-    cap = _CAP_BY_TIER.get(tier, 0.6)
+    cap = capability.capability_score(c["model"], tier)
     speed = _SPEED_K / (_SPEED_K + lat) if lat else 0.0
-    return w_cap * cap + w_stab * eff_score(s) + w_spd * speed
+    return _score_dims((cap, eff_score(s), speed), strategy)
 
 
 def candidates_for(model: str, cfg: dict) -> list:
@@ -739,6 +760,7 @@ def model_view(cfg: dict) -> list:
         else:
             status = "down"
             available = False
+        _tier = capability.tier_of(m, cfg.get("model_tiers"))
         models.append({
             "id": m,
             "available": available,
@@ -748,8 +770,9 @@ def model_view(cfg: dict) -> list:
             "test_ts": (ms.get("ts", 0) if ms else 0),
             "any_channel_available": any_ok,
             "channel_count": len(chans),
-            "tier": capability.tier_of(m, cfg.get("model_tiers")),
-            "aa": capability.bench_of(m),   # Artificial Analysis 智能指数（没上榜 → None）
+            "tier": _tier,
+            "aa": capability.bench_of(m),              # Artificial Analysis 智能指数（没上榜 → None）
+            "cap_score": capability.capability_score(m, _tier),   # 连续能力分（排序用）
             "channels": chans,
         })
     models.sort(key=lambda x: (x["status"] != "ok", x["id"]))

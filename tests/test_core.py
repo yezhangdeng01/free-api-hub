@@ -104,12 +104,62 @@ def test_model_composite_takes_best_single_channel():
         {"available": True, "score": 1.0, "latency_ms": 5000},   # 很稳但很慢
         {"available": True, "score": 0.1, "latency_ms": 100},    # 很快但很不稳
     ]}
+    cap = gateway._CAP_BY_TIER[3]              # 手造 dict 没给 cap_score → 按档位锚点兜底
     got = gateway._model_composite(m, "speed")
-    fast = 0.10 * 1.0 + 0.25 * 0.1 + 0.65 * (400 / 500)         # 快渠道那条
+    fast = 8 + 0.55 * cap + 0.45 * 0.1         # 快渠道：速度档 8 + 档内加权(智能5.5/稳定4.5)
     assert abs(got - fast) < 1e-9, got
-    mixed = 0.10 * 1.0 + 0.25 * 1.0 + 0.65 * (400 / 500)        # 旧口径的「拼分」
+    mixed = 8 + 0.55 * cap + 0.45 * 1.0        # 旧口径的「拼分」：快延迟 + 高稳定（不存在）
     assert got < mixed
     assert gateway._model_composite({"tier": 2, "channels": []}, "balanced") == 0.0
+
+
+def test_capability_score_is_continuous(monkeypatch):
+    """能力分是连续的（按 AA 榜分归一化），不再只有 3 档——「智能优先」才排得细"""
+    from app import capability as cap
+    monkeypatch.setattr(cap, "_bench", {"a": 42.3, "b": 7.8, "mid": 25.0})
+    assert cap.capability_score("a") == 1.0
+    assert cap.capability_score("b") == 0.0
+    assert 0.4 < cap.capability_score("mid") < 0.6
+    assert cap.capability_score("never-listed-model") == 0.10   # 无榜分 → 档位锚点（轻量）
+
+
+def test_strategy_primary_with_tolerance_band(monkeypatch):
+    """四种策略的口径：**主维度按容忍带宽优先，同档才看另两维**（用户 2026-09 定的）。
+
+    能力带宽 0.10 ≈ AA 3.5 分，所以 AA 40 与 AA 39 视为「差不多」→ 稳定分说话；
+    而 AA 45 高一档 → 稳定分再差也排在前面。"""
+    from app import capability as cap
+    _reset()
+    monkeypatch.setattr(cap, "_bench", {"m-hi": 40.0, "m-lo": 39.0, "m-top": 45.0})
+    ch = _chan("c1", [], latency=100)
+    cfg = _cfg([ch])
+
+    def setm(mid, stab, ttft):
+        gateway.stats[(mid, "c1")] = {"score": stab, "latency": None, "ttft": ttft, "n": 9}
+
+    c_hi = {"channel": ch, "model": "m-hi"}
+    c_lo = {"channel": ch, "model": "m-lo"}
+    c_top = {"channel": ch, "model": "m-top"}
+
+    # 智能优先：同档内稳定分决定；跨档时能力压过稳定分
+    setm("m-hi", 0.40, 5000)     # 能力略高但不稳
+    setm("m-lo", 0.95, 5000)     # 能力略低但很稳（同一能力档）
+    setm("m-top", 0.30, 9000)    # 能力高一档，最不稳最慢
+    q_lo = gateway._composite(c_lo, cfg, "quality")
+    q_hi = gateway._composite(c_hi, cfg, "quality")
+    q_top = gateway._composite(c_top, cfg, "quality")
+    assert q_lo > q_hi, (q_lo, q_hi)
+    assert q_top > max(q_lo, q_hi), (q_top, q_lo, q_hi)
+
+    # 稳定优先 / 速度优先：各自的主维度说话
+    setm("m-hi", 0.95, 5000)     # 很稳但慢
+    setm("m-lo", 0.20, 200)      # 不稳但很快
+    assert gateway._composite(c_hi, cfg, "stability") > gateway._composite(c_lo, cfg, "stability")
+    assert gateway._composite(c_lo, cfg, "speed") > gateway._composite(c_hi, cfg, "speed")
+
+    # 均衡：三维直接加权，没有任何一个是「一票否决」的主维度
+    b = gateway._composite(c_hi, cfg, "balanced")
+    assert 0 < b < 1, b
 
 
 def test_tier_from_bench_score(monkeypatch):
