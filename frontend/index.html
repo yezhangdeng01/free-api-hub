@@ -138,7 +138,6 @@
           <button class="btn" id="pg-next">›</button>
         </span>
       </div>
-      <div class="muted small" id="group-hint" style="display:none; padding:0 0 8px"></div>
       <table>
         <thead><tr><th style="width:44px">#</th><th>模型</th><th>特点</th>
           <th style="width:74px; text-align:center">收藏</th>
@@ -187,8 +186,8 @@
     <div class="card">
       <h2>网关设置</h2>
       <div class="form-grid" style="grid-template-columns: 1.2fr 1fr 1.2fr auto">
-        <div><label>路由策略</label>
-          <select id="set-strategy"></select></div>
+        <div><label>健康检查间隔（分钟）</label>
+          <input type="number" min="1" max="1440" id="set-check-iv" placeholder="30" style="width:100%"></div>
         <div><label>模型主动探测</label>
           <select id="set-probe"><option value="1">开启（推荐）</option><option value="0">关闭</option></select></div>
         <div><label>429 限流预判（自学习水位）</label>
@@ -196,9 +195,13 @@
         <div style="padding-bottom:0"><button class="btn primary" id="set-save">保存设置</button></div>
       </div>
       <p class="muted small" style="margin-top:8px; line-height:1.8">
-        四种策略都综合「智能档位 + 实测成功率 + 实测延迟」三项，只是权重不同（如：智能优先 = 0.6智能/0.3稳定/0.1速度；稳定优先 = 0.7稳定为主，但也参考智能与速度）。
-        429 限流预判：每撞一次 429 就记住「撞之前这一分钟/一天实际打过的量」，之后接近这个水位就提前换路，而不是等被打回再冷却。
-        能力档位是启发式估算（按模型名），可在 config.json 的 <span class="mono">model_tiers</span> 里用正则手动覆盖。
+        健康检查：定期拉一遍各渠道「免费模型列表」并测连通性（只读元数据，不消耗额度）。间隔越小越及时，也越费网络。<br>
+        模型主动探测：给「从没调用过」的免费模型各发一次 1 token 请求，确认它真能调（不是摆设）。<br>
+        429 限流预判：每撞一次 429 就记住「撞之前这一分钟/一天实际打过的量」，之后接近这个水位就提前换路，
+        而不是等被打回再冷却。<br>
+        能力档位是启发式估算（按模型名 + AA 榜分），可在 config.json 的
+        <span class="mono">model_tiers</span> 里用正则手动覆盖；<span class="mono">route_strategy</span>
+        现在只作为「显式写真实模型名时渠道排序」的兜底（<span class="mono">auto:*</span> 由模型名决定，见「网关用法」页）。
       </p>
     </div>
     <div class="card">
@@ -275,11 +278,24 @@
             <p class="muted small" style="line-height:1.9">
               · 请求按「可用渠道 → 延迟从低到高」的顺序尝试，失败自动换下一个渠道重试；<br>
               · 失败的「模型 × 渠道」组合进入冷却（时长按错误类型：连接失败短、限流/当天额度用完等冷却到明）；<br>
-              · 健康检查自动定期运行（可在 config.json 调整），也可手动点「刷新全部」；<br>
-              · 响应头 <span class="mono">X-Api-Hub-Channel</span> 会告诉你本次实际由哪个渠道服务；<br>
-              · 模型名填 <span class="mono">auto</span>（= <span class="mono">auto:balanced</span>，均衡） / <span class="mono">auto:quality</span> / <span class="mono">auto:speed</span> / <span class="mono">auto:stability</span> / <span class="mono">auto:vision</span>
-                时，网关会自动选最优真实模型并跨模型无感切换（按「模型」页里的排序顺序逐个尝试，
-                能用的排前面；<span class="mono">auto:vision</span> 只挑能看图的模型，适合当 Hermes 的辅助视觉模型）。</p>
+              · 健康检查自动定期运行（间隔在「设置」页调整，默认 30 分钟）；<br>
+              · 响应头 <span class="mono">X-Api-Hub-Channel</span> 显示本次实际由哪个渠道服务（在「测试台」发一条消息，输出末尾就会写出渠道与延迟；命令行 <span class="mono">curl -i</span> 也能看到）；<br>
+              · 模型名填 <span class="mono">auto:balanced</span> / <span class="mono">auto:quality</span> /
+                <span class="mono">auto:stability</span> / <span class="mono">auto:speed</span> /
+                <span class="mono">auto:vision</span> 时，网关会自动选最优真实模型并跨模型无感切换
+                （按「模型」页对应视图的排序逐个尝试，能用的排前面；<span class="mono">auto:vision</span>
+                只挑能看图的模型，适合当 Hermes 的辅助视觉模型）。</p>
+      <table style="margin-top:10px; width:auto">
+        <thead><tr><th>模型名（填哪里都行）</th><th>「模型」页对应视图</th><th>排序口径</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">auto:balanced</td><td>均衡</td><td>智能/稳定/速度三项加权</td></tr>
+          <tr><td class="mono">auto:quality</td><td>智能优先</td><td>先看能力（AA 分），同档看稳定/速度</td></tr>
+          <tr><td class="mono">auto:stability</td><td>稳定优先</td><td>先看成功率，同档看能力/速度</td></tr>
+          <tr><td class="mono">auto:speed</td><td>速度优先</td><td>先看延迟，同档看能力/稳定</td></tr>
+          <tr><td class="mono">auto:vision</td><td>视觉</td><td>只挑能看图的模型，再按能力优先排序</td></tr>
+          <tr><td class="mono">auto</td><td>—</td><td>auto:balanced 的简写，等价</td></tr>
+        </tbody>
+      </table>
       <h3 style="margin-top:14px">常用客户端配置（点击复制）</h3>
       <div id="guide-snippets"></div>
     </div>
@@ -295,15 +311,8 @@ const MODEL_TIERS = {1:"轻量", 2:"中档", 3:"智能"};
 // 列表「视图」= 只决定排序展示，**不切换路由策略**（路由策略在 Agent 端按模型名选）。
 // 视图名 ↔ Agent 端模型名一一对应，且排序口径与对应策略完全同源。
 const VIEW_KEY = "apihub.view";
-const VIEW_ALIAS = {balanced:"auto", quality:"auto:quality", stability:"auto:stability",
+const VIEW_ALIAS = {balanced:"auto:balanced", quality:"auto:quality", stability:"auto:stability",
                     speed:"auto:speed", vision:"auto:vision"};
-const VIEW_DESC = {
-  balanced: "三项加权，不偏科",
-  quality: "先看能力（AA 分），同档看稳定/速度",
-  stability: "先看成功率，同档看能力/速度",
-  speed: "先看延迟，同档看能力/稳定",
-  vision: "只列能看图的模型，连不上自动换下一个",
-};
 function savedView(){
   try { const v = localStorage.getItem(VIEW_KEY); if (VIEW_ALIAS[v]) return v; } catch(e){}
   return null;
@@ -382,14 +391,12 @@ function renderGuide(){
     '    messages=[{"role": "user", "content": "你好"}])\n' +
     'print(resp.choices[0].message.content)';
   $("#guide-curl").textContent =
-    'curl ' + base + '/chat/completions \\\n' +
+    'curl -i ' + base + '/chat/completions \\\n' +
     '  -H "Content-Type: application/json" \\\n' +
     '  -H "Authorization: Bearer ' + tok + '" \\\n' +
     '  -d \'{"model":"auto:quality","messages":[{"role":"user","content":"你好"}]}\'';
   // 常用客户端配置片段（借鉴 FreeLLMAPI 的 setup-* 思路）
   const snippets = [
-    ["OpenAI 兼容工具（Cherry Studio / ChatBox / NextChat 等）",
-     'API 地址:  ' + base + '\nAPI Key:  ' + tok + '\n模型名:    auto:quality（或 models 列表里任意模型）'],
     ["环境变量（OpenAI SDK 系工具通用）",
      'export OPENAI_BASE_URL="' + base + '"\nexport OPENAI_API_KEY="' + tok + '"'],
     ["Claude Code 等支持自定义网关的工具",
@@ -565,18 +572,6 @@ function renderModels(){
   // 先算可见计数（未按 ok/受限 开关收窄，供 chip 文案与空态提示）
   const okN = all.filter(m => m.status === "ok" && inGroup(m) && kwMatch(m, tokens)).length;
   const limN = all.filter(m => m.status === "limited" && inGroup(m) && kwMatch(m, tokens)).length;
-  const gh = $("#group-hint");
-  // 提示行常显：把「视图 ↔ Agent 端模型名」的对应关系摆明（视图只管排序，不管路由）
-  gh.style.display = "block";
-  {
-    const v = MODEL_STATE.sort;
-    gh.innerHTML = "视图只决定<b>列表顺序</b>，不切换路由策略；路由策略在 Agent 端填模型名选 → "
-      + `<span class="mono click-copy" title="点击复制" onclick="copyText('${VIEW_ALIAS[v]}')">${VIEW_ALIAS[v]}</span>`
-      + `（${VIEW_DESC[v]}）`
-      + (v === "vision"
-          ? "。Hermes 的「辅助视觉模型」就填它，连不上会自动换下一个能看图的模型。"
-          : "。同一视图名对应同一套排序口径，所以列表顺序 = 该策略的实际切换顺序。");
-  }
   const filtered = all
     .filter(inGroup)
     .filter(m => kwMatch(m, tokens))
@@ -586,7 +581,12 @@ function renderModels(){
   const maxPage = Math.max(0, Math.ceil(total / PAGE.size) - 1);
   if (PAGE.n > maxPage) PAGE.n = maxPage;
   const rows = filtered.slice(PAGE.n * PAGE.size, (PAGE.n + 1) * PAGE.size);
-  $("#model-count").textContent = `可用 ${okN} · 受限 ${limN}`;
+  // 计数：放在「可用 / 受限」开关上——任何视图（含视觉）下都能一眼看到当前视图的可用/受限分布
+  $("#show-ok-btn").textContent = `● 可用 ${okN}`;
+  $("#show-limited-btn").textContent = `● 受限 ${limN}`;
+  $("#show-ok-btn").title = `显示/隐藏可用的免费模型（当前视图 ${okN} 个）`;
+  $("#show-limited-btn").title = `显示/隐藏暂时受限的免费模型（限流/冷却中，当前视图 ${limN} 个）`;
+  $("#model-count").textContent = `共 ${okN + limN} 个`;
   $("#model-empty").style.display = total ? "none" : "block";
   $("#model-empty").textContent = !okN && !limN
     ? "还没有模型。请到「渠道」页添加渠道，保存后会自动测试连接；再点「扫描全部模型」确认哪些真能免费调用。"
@@ -682,15 +682,11 @@ $("#pg-test-all").onclick = async () => {
 };
 
 // ---- 设置 ----
-function initSettings(){
-  const sel = $("#set-strategy");
-  sel.innerHTML = Object.entries(STRATEGIES).map(([k,v])=>`<option value="${k}">${v}</option>`).join("");
-}
+function initSettings(){}
 function renderSettings(){
   const s = overview?.settings || {};
-  const cur = s.route_strategy || "balanced";
-  if (!$("#set-strategy").value || !STRATEGIES[$("#set-strategy").value]) $("#set-strategy").value = STRATEGIES[cur] ? cur : "balanced";
-  $("#set-strategy").value = cur;
+  const cur = s.route_strategy || "balanced";   // 已不可在界面改，仅作视图默认值来源
+  $("#set-check-iv").value = s.check_interval_minutes ?? 30;
   $("#set-probe").value = s.probe_used_models === false ? "0" : "1";
   $("#set-preempt").value = s.adaptive_preemption === false ? "0" : "1";
   // 视图 chip：**只在首次加载时初始化**（用户上次选的视图 → 否则用当前路由策略）。
@@ -702,10 +698,12 @@ function renderSettings(){
   }
   syncChips();
 }
-// 排序 chip 处理已在上方统一绑定
+// 排序 chip 处理已在上方统一绑定（点是纯视图，不写路由策略）
 $("#set-save").onclick = async () => {
+  const iv = Number($("#set-check-iv").value);
+  if (!(iv >= 1 && iv <= 1440)) { toast("健康检查间隔请填 1~1440 分钟"); return; }
   try {
-    await api("/api/settings", {route_strategy: $("#set-strategy").value,
+    await api("/api/settings", {check_interval_minutes: Math.round(iv),
                                 probe_used_models: $("#set-probe").value === "1",
                                 adaptive_preemption: $("#set-preempt").value === "1"});
     toast("设置已保存并生效"); await loadOverview();

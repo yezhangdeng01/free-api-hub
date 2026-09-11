@@ -63,6 +63,23 @@ def test_v1_models_usable_first(client, monkeypatch):
     assert ids == ["auto", "b-ok-weak", "a-limited-strong"], ids
 
 
+def test_settings_health_check_interval(client, monkeypatch):
+    """设置页新增「健康检查间隔」：接受 1~1440，越界/非法值忽略（不写真实 config.json）"""
+    from app import config as cfgmod
+    fake = {"channels": [], "aliases": {}, "route_strategy": "balanced", "pinned": [],
+            "auth_enabled": False, "api_token": "", "port": 8787, "check_interval_minutes": 30}
+    saved = {}
+    monkeypatch.setattr(cfgmod, "load_config", lambda: dict(fake))
+    monkeypatch.setattr(cfgmod, "save_config", lambda c: (saved.clear(), saved.update(c)))
+
+    r = client.post("/api/settings", json={"check_interval_minutes": 15}, headers=H)
+    assert r.status_code == 200 and saved["check_interval_minutes"] == 15
+    for bad in (0, -5, 5000, None, "abc"):
+        saved.clear()
+        client.post("/api/settings", json={"check_interval_minutes": bad}, headers=H)
+        assert saved.get("check_interval_minutes", 30) == 30, bad
+
+
 def test_models_test_no_channel(client):
     # 没有配置任何渠道 → 404
     r = client.post("/api/models/test", json={"model": "glm-4-flash"}, headers=H)

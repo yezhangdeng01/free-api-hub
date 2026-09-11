@@ -756,6 +756,7 @@ async def overview():
                         "auth_enabled": cfg.get("auth_enabled", True),
                         "token": cfg.get("api_token", "")},
             "settings": {"route_strategy": cfg.get("route_strategy", "balanced"),
+                         "check_interval_minutes": cfg.get("check_interval_minutes", 30),
                          "probe_used_models": cfg.get("probe_used_models", True),
                          "adaptive_preemption": cfg.get("adaptive_preemption", True)},
             "channels": chans,
@@ -947,14 +948,18 @@ async def settings(req: Request):
     cfg = cfgmod.load_config()
     if b.get("route_strategy") in ("balanced", "quality", "stability", "speed"):
         cfg["route_strategy"] = b["route_strategy"]
+    if isinstance(b.get("check_interval_minutes"), (int, float)):
+        iv = int(b["check_interval_minutes"])
+        if 1 <= iv <= 1440:            # 健康检查间隔（分钟），越界忽略
+            cfg["check_interval_minutes"] = iv
     if isinstance(b.get("probe_used_models"), bool):
         cfg["probe_used_models"] = b["probe_used_models"]
     if isinstance(b.get("adaptive_preemption"), bool):
         cfg["adaptive_preemption"] = b["adaptive_preemption"]
     cfgmod.save_config(cfg)
     logger.info("更新设置: %s", {k: b[k] for k in b
-                                  if k in ("route_strategy", "probe_used_models",
-                                           "adaptive_preemption")})
+                                  if k in ("route_strategy", "check_interval_minutes",
+                                           "probe_used_models", "adaptive_preemption")})
     return {"ok": True}
 
 
