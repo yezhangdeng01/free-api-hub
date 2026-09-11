@@ -101,8 +101,8 @@ def test_family_version_not_polluted_by_params():
 def test_model_composite_takes_best_single_channel():
     """模型分必须取自**同一条渠道**：不能「稳定分来自 A + 延迟来自 B」拼出不存在的组合。"""
     m = {"tier": 3, "channels": [
-        {"available": True, "score": 1.0, "latency_ms": 5000},   # 很稳但很慢
-        {"available": True, "score": 0.1, "latency_ms": 100},    # 很快但很不稳
+        {"available": True, "stab": 1.0, "latency_ms": 5000},   # 很稳但很慢
+        {"available": True, "stab": 0.1, "latency_ms": 100},    # 很快但很不稳
     ]}
     cap = gateway._CAP_BY_TIER[3]              # 手造 dict 没给 cap_score → 按档位锚点兜底
     got = gateway._model_composite(m, "speed")
@@ -134,17 +134,19 @@ def test_strategy_primary_with_tolerance_band(monkeypatch):
     ch = _chan("c1", [], latency=100)
     cfg = _cfg([ch])
 
-    def setm(mid, stab, ttft):
-        gateway.stats[(mid, "c1")] = {"score": stab, "latency": None, "ttft": ttft, "n": 9}
+    def setm(mid, wins, ttft):
+        """wins = 最近 10 次真实调用里的成功次数 → 稳定分 = 0.7 + (wins/10 - 0.7) × 10/12"""
+        gateway.stats[(mid, "c1")] = {"win": [1] * wins + [0] * (10 - wins),
+                                      "latency": None, "ttft": ttft}
 
     c_hi = {"channel": ch, "model": "m-hi"}
     c_lo = {"channel": ch, "model": "m-lo"}
     c_top = {"channel": ch, "model": "m-top"}
 
     # 智能优先：同档内稳定分决定；跨档时能力压过稳定分
-    setm("m-hi", 0.40, 5000)     # 能力略高但不稳
-    setm("m-lo", 0.95, 5000)     # 能力略低但很稳（同一能力档）
-    setm("m-top", 0.30, 9000)    # 能力高一档，最不稳最慢
+    setm("m-hi", 4, 5000)        # 能力略高但不稳（4/10）
+    setm("m-lo", 10, 5000)       # 能力略低但很稳（10/10，同一能力档）
+    setm("m-top", 3, 9000)       # 能力高一档，最不稳最慢
     q_lo = gateway._composite(c_lo, cfg, "quality")
     q_hi = gateway._composite(c_hi, cfg, "quality")
     q_top = gateway._composite(c_top, cfg, "quality")
@@ -152,8 +154,8 @@ def test_strategy_primary_with_tolerance_band(monkeypatch):
     assert q_top > max(q_lo, q_hi), (q_top, q_lo, q_hi)
 
     # 稳定优先 / 速度优先：各自的主维度说话
-    setm("m-hi", 0.95, 5000)     # 很稳但慢
-    setm("m-lo", 0.20, 200)      # 不稳但很快
+    setm("m-hi", 10, 5000)       # 很稳但慢
+    setm("m-lo", 2, 200)         # 不稳但很快
     assert gateway._composite(c_hi, cfg, "stability") > gateway._composite(c_lo, cfg, "stability")
     assert gateway._composite(c_lo, cfg, "speed") > gateway._composite(c_hi, cfg, "speed")
 
@@ -218,17 +220,87 @@ def test_tier_from_bench_score(monkeypatch):
     assert cap.bench_of("models/gemini-9.9-flash") is None
 
 
-def test_eff_score_confidence():
-    """稳定分按样本量向先验收缩：测 1 次 ≠ 测很多次（① 的回归）"""
-    assert gateway.eff_score({"score": 0.76, "n": 1}) < gateway.eff_score({"score": 0.99, "n": 20})
-    # 侥幸成功 1 次几乎不改变判断（贴近先验 0.7）
-    assert abs(gateway.eff_score({"score": 0.76, "n": 1}) - 0.7) < 0.02
-    # 偶发 1 次连接失败不再直接打到谷底
-    assert gateway.eff_score({"score": 0.35, "n": 1}) > 0.55
-    # 连续失败照样沉底
-    assert gateway.eff_score({"score": 0.02, "n": 10}) < 0.2
-    # 老持久化数据没有 n → 按 6 个样本算，升级不归零
-    assert gateway.eff_score({"score": 0.9}) > 0.8
+def test_stab_window_score():
+    """稳定分 = 近 N 次**真实调用**成功率（向先验 0.7 收缩）；没数据 → None（不参与加权）"""
+    from app.gateway import stab_of, stab_raw
+    assert stab_of({"win": []}) is None and stab_of({}) is None
+    assert stab_raw({"win": []}) is None
+    assert abs(stab_of({"win": [1, 1, 1]}) - 0.88) < 1e-6      # 0.7 + 0.3×(3/5)
+    assert abs(stab_of({"win": [0, 0, 0]}) - 0.28) < 1e-6      # 0.7 - 0.7×(3/5)
+    assert stab_of({"win": [1] * 10}) > stab_of({"win": [1] * 2}) > 0.7   # 样本越多越接近原始率
+    assert stab_of({"win": [1, 0] * 5}) < 0.71 and stab_raw({"win": [1, 0] * 5}) == 0.5
+
+
+def test_stab_only_real_calls_and_technical_failures(monkeypatch):
+    """稳定分只吃真实调用；且只认技术性失败——429/余额/4xx/本地网络一律不进窗口"""
+    from app import store
+    monkeypatch.setattr(store, "persist_runtime_state", lambda *a, **k: None)
+    gateway.stats.clear()
+    gateway.mark_result("m1", "c1", True, 100)                                  # 默认 probe → 不记
+    assert gateway.get_stat("m1", "c1")["win"] == []
+    gateway.mark_result("m1", "c1", True, 100, source="real")
+    gateway.mark_result("m1", "c1", False, kind="rate_limit", source="real")    # 429 限流 → 不进
+    gateway.mark_result("m1", "c1", False, kind="balance", source="real")       # 余额不足 → 不进
+    gateway.mark_result("m1", "c1", False, kind="client", source="real")        # 4xx 权限 → 不进
+    gateway.mark_result("m1", "c1", False, kind="local_net", source="real")     # 本地 DNS → 不进
+    assert gateway.get_stat("m1", "c1")["win"] == [1]
+    for k in ("stream_break", "connect", "timeout", "server", "bad_json"):      # 技术性失败 → 进
+        gateway.mark_result("m1", "c1", False, kind=k, source="real")
+    assert gateway.get_stat("m1", "c1")["win"] == [1, 0, 0, 0, 0, 0]
+    gateway.mark_result("m1", "c1", False, source="real")                       # 未知失败 → 也计
+    assert gateway.get_stat("m1", "c1")["win"] == [1, 0, 0, 0, 0, 0, 0]
+    for _ in range(12):                                                          # 窗口只留最近 10 次
+        gateway.mark_result("m1", "c1", True, source="real")
+    assert len(gateway.get_stat("m1", "c1")["win"]) == 10
+    gateway.stats.clear()
+
+
+def test_score_dims_without_stab_data():
+    """均衡（加权）：没有真实样本 → 稳定维剔除、权重归一给 cap/spd（与前端 compScore 同口径）"""
+    from app.gateway import _score_dims
+    w = (0.35, 0.40, 0.25)
+    assert abs(_score_dims((1.0, None, 0.0), "balanced")
+               - (w[0] * 1.0 + w[2] * 0.0) / (w[0] + w[2])) < 1e-9
+    # 有数据时走原加权公式
+    assert abs(_score_dims((1.0, 0.5, 0.0), "balanced")
+               - (w[0] + w[1] * 0.5)) < 1e-9
+    # 主维度=稳定的策略遇到 None：按先验 0.7 当中性，不抛错、仍能排序
+    assert _score_dims((0.9, None, 0.9), "stability") == _score_dims((0.9, 0.7, 0.9), "stability")
+
+
+def test_classify_429_three_tiers():
+    """429 四档：余额不足（要充值）/ 免费额度用尽（等明天）/ 每分钟限流 / 未知
+
+    关键用例来自实盘：**魔搭的每日免费额度用完，正文就是 insufficient balance**，
+    与 OpenRouter 真欠费的正文完全一样，只能靠渠道类型区分。"""
+    from app.gateway import classify_429
+    bal = '{"error":{"message":"insufficient balance"}}'
+    label, secs, _ = classify_429(bal, "modelscope")          # 魔搭免费日额度
+    assert label == "free_daily" and secs > 600
+    label, secs, _ = classify_429(bal, "openrouter")          # 真·欠费 → 不冷却，按 down
+    assert label == "paid_balance" and secs == 0
+    label, _, _ = classify_429('{"error":{"message":"You exceeded your current quota, '
+                               'please check your plan and billing details"}}', "gemini")
+    assert label == "free_daily"                              # 免费渠道的 quota/billing 措辞
+    label, secs, _ = classify_429('{"status":429,"title":"Too Many Requests"}', "nim")
+    assert label == "minute" and secs == 90
+    label, secs, _ = classify_429('{"error":{"message":"daily quota"}}', "modelscope", retry_after=60)
+    assert label == "minute"                                  # 上游说 60s 能好 → 不按明天冷却
+    label, secs, _ = classify_429("something odd", "custom")
+    assert label == "unknown" and secs == 300
+
+
+def test_vision_verified_and_heuristic():
+    """视觉判定：实测表 > 平台数据 > 名字启发式；产出型/转写类必须排除"""
+    from app.capability import meta_of
+    assert meta_of("agnes-3.0-flash")["vision"] is True            # 真图实测（OpenRouter 无此模型）
+    assert meta_of("agnes-2.5-pro")["vision"] is True
+    assert meta_of("agnes-image-2.5-flash")["vision"] is False     # 产出型，不收图
+    assert meta_of("agnes-video-2.5")["vision"] is False
+    assert meta_of("models/gemini-3.5-transcribe")["vision"] is False   # 实测 400
+    assert meta_of("models/gemini-3.5-live-translate-preview")["vision"] is False  # Live 流式翻译，不收图
+    assert meta_of("models/gemini-3.7-flash")["vision"] is True
+    assert meta_of("inclusionai/ling-3.0-flash-vl:free")["vision"] is True
 
 
 def test_stats_persist_and_restore(tmp_path, monkeypatch):
@@ -236,15 +308,15 @@ def test_stats_persist_and_restore(tmp_path, monkeypatch):
     from app import store as _store
     _reset()
     monkeypatch.setattr(_store, "RUNTIME_STATE_PATH", str(tmp_path / "rt.json"))
-    gateway.mark_result("m1", "c1", True, 800)
-    gateway.mark_result("m1", "c1", True, 900)
+    gateway.mark_result("m1", "c1", True, 800, source="real")
+    gateway.mark_result("m1", "c1", True, 900, source="real")
     gateway.mark_ttft("m1", "c1", 300)
     gateway.save_runtime_state()
-    assert gateway.stats[("m1", "c1")]["n"] == 2
+    assert gateway.stats[("m1", "c1")]["win"] == [1, 1]
     gateway.stats.clear()
     gateway.restore_runtime_state()
     s = gateway.stats[("m1", "c1")]
-    assert s["n"] == 2 and s["ttft"] == 300 and s["latency"] == 830  # 800→900 的 7:3 EMA
+    assert s["win"] == [1, 1] and s["ttft"] == 300 and s["latency"] == 830  # 800→900 的 7:3 EMA
 
 
 def test_ttft_wins_over_total_latency_in_speed_score():
@@ -265,9 +337,10 @@ def test_model_view_latency_prefers_model_stat():
     （与 _composite 同口径，否则界面顺序与真实选路对不上）。"""
     _reset()
     ch = _chan("c1", ["m1"], latency=1800)
-    gateway.stats[("m1", "c1")] = {"score": 0.9, "latency": 250}
+    gateway.stats[("m1", "c1")] = {"win": [1] * 10, "latency": 250}
     entry = gateway.model_view(_cfg([ch]))[0]["channels"][0]
-    assert entry["latency_ms"] == 250 and entry["score"] == 0.9
+    assert entry["latency_ms"] == 250 and entry["score"] == 1.0 and entry["samples"] == 10
+    assert entry["stab"] >= 0.94        # 10/10 成功 → 0.7 + 0.3×(10/12) = 0.95
     gateway.stats.clear()
     assert gateway.model_view(_cfg([ch]))[0]["channels"][0]["latency_ms"] == 1800
 
@@ -307,14 +380,53 @@ def test_channel_quota_exhausted_cools_whole_channel(tmp_path, monkeypatch):
 
 
 def test_mark_result_scoring():
+    """真实调用的结果进稳定分窗口；探测（默认 source）只碰可用性、不进窗口"""
     _reset()
-    gateway.mark_result("m", "c1", True, 100)
-    gateway.mark_result("m", "c1", True, 100)
-    gateway.mark_result("m", "c1", False)
+    gateway.mark_result("m", "c1", True, 100, source="real")
+    gateway.mark_result("m", "c1", True, 100, source="real")
+    gateway.mark_result("m", "c1", False, source="real")
     s = gateway.get_stat("m", "c1")
-    assert 0 < s["score"] < 1
-    assert s["score"] < 0.7  # 失败拉低评分
+    assert s["win"] == [1, 1, 0] and gateway.stab_raw(s) == 0.667
+    assert gateway.stab_of(s) < 0.7      # 失败拉低稳定分
     assert s["latency"] == 100
+    gateway.mark_result("m", "c1", False, kind="connect")     # 默认 = probe
+    assert gateway.get_stat("m", "c1")["win"] == [1, 1, 0]
+
+
+def test_geo_block_not_model_fault():
+    """地域封锁 = 本机出口网络问题：不算永久失败（不标 down）、不进稳定分"""
+    from app.gateway import is_geo_block, is_permanent_failure, kind_from_error, _STAB_SKIP_KINDS
+    geo = ('{"error":{"code":400,"message":"User location is not supported for the API use.",'
+           '"status":"FAILED_PRECONDITION"}}')
+    assert is_geo_block(geo)
+    assert not is_permanent_failure(400, geo)            # 400 但地域封锁 → 不记 down
+    assert kind_from_error(geo) == "geo" and "geo" in _STAB_SKIP_KINDS
+    assert not is_geo_block('{"error":{"message":"model is not available"}}')
+    assert is_permanent_failure(400, '{"error":{"message":"model not found"}}')
+
+
+def test_backfill_stab_from_usage_rows(monkeypatch, tmp_path):
+    """历史真实调用回填窗口：429/余额/4xx/本地网络/地域 跳过；已有实时样本的不覆盖"""
+    from app import store as _store
+    _reset()
+    monkeypatch.setattr(_store, "RUNTIME_STATE_PATH", str(tmp_path / "rt.json"))
+    gateway.stats.clear()
+    rows = [                                                            # (模型,渠道,成功,error,ts) 新→旧
+        ("m1", "c1", 1, "", 300.0),                                     # 成功 → 1
+        ("m1", "c1", 0, "connect: Server disconnected", 200.0),          # 技术性失败 → 0
+        ("m1", "c1", 0, "HTTP 429 当日额度用完", 100.0),                  # 429 → 跳过
+        ("m1", "c1", 0, "connect: [Errno 11001] getaddrinfo failed", 50.0),  # 本地 DNS → 跳过
+        ("m2", "c1", 0, 'HTTP 400: {"error":"User location is not supported"}', 40.0),  # 地域 → 跳过
+        ("m3", "c1", 1, "", 30.0),
+    ]
+    assert gateway.backfill_stab(rows) == 2
+    assert gateway.stats[("m1", "c1")]["win"] == [0, 1]      # 存成旧的在前（旧=失败,新=成功）
+    assert gateway.stats[("m3", "c1")]["win"] == [1]
+    assert ("m2", "c1") not in gateway.stats                 # 整组都是跳过的失败 → 不建条目
+    gateway.stats[("m3", "c1")]["win"] = [0, 0]              # 已有实时样本 → 不覆盖
+    gateway.backfill_stab(rows)
+    assert gateway.stats[("m3", "c1")]["win"] == [0, 0]
+    gateway.stats.clear()
 
 
 def test_alias_expansion_in_candidates():

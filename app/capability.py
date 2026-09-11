@@ -155,6 +155,18 @@ def bench_of(model_id: str):
 _vision_ok: set = set()   # 归一化名：确认支持图像输入
 _vision_no: set = set()   # 归一化名：确认**不**支持（用于纠正启发式的误标，如 TTS）
 
+# 真图实测结论（最高优先级，压过平台数据和名字启发式）——平台数据是「按模型名」的，
+# 同名模型在不同渠道/不同部署上未必一致，所以本机实测才是准的。
+# 怎么复测：`scripts/verify_vision_models.py`（直连上游发 48x48 纯红 PNG，要求模型答出 "red"；
+# 200 但答不出 red 视为「静默忽略图片」，记 UNCERTAIN 不采信；被地域封锁的记 GEO，别据此改标记）。
+# 2026-09-12 实测：Agnes 三个 chat 模型均 200 且答 "Red"（OpenRouter 目录里
+# 根本没有 agnes 系列，所以平台数据永远查不到它们，只能靠这张表）。
+_VISION_VERIFIED = {
+    "agnes-3.0-flash": True,
+    "agnes-2.5-flash": True,
+    "agnes-2.5-pro": True,
+}
+
 
 def update_vision_models(ok, no) -> dict:
     """合并「支持/不支持图像输入」的模型名（归一化），返回计数便于日志"""
@@ -164,8 +176,10 @@ def update_vision_models(ok, no) -> dict:
 
 
 def vision_known(model_id: str):
-    """True/False=平台数据明确；None=没数据（回退名字启发式）"""
+    """True/False=明确（实测或平台数据）；None=没数据（回退名字启发式）"""
     nid = norm_id(model_id)
+    if nid in _VISION_VERIFIED:
+        return _VISION_VERIFIED[nid]
     if nid in _vision_ok:
         return True
     if nid in _vision_no:
@@ -296,11 +310,14 @@ _VISION = [
     r"vision", r"-?vlx?(\b|-|$)", r"\.vl(\b|-|$)", r"omni", r"multimodal",
     r"gpt-4o(?!.*mini)", r"glm-4v", r"glm-5v", r"gemini-.*", r"qwen.*-?vl",
     r"llama.*vision", r"claude-3", r"grok-2?-?vision", r"moonshot.*-vl",
+    r"agnes-(?!image|video)",   # Agnes 系 chat 模型（真图实测支持视觉；image/video 是产出型，排除）
 ]
-# 名字里明确**不是**图像输入的（纯生成/语音类）：防止启发式把它们标成「视觉」
+# 名字里明确**不是**图像输入的（纯生成/语音/转写类）：防止启发式把它们标成「视觉」
+# 「-transcrib*」是 2026-09-12 实测补的：`models/gemini-3.5-transcribe` 被 `gemini-.*` 通配误标，
+# 上游明确回 400 "Image input modality is not enabled for this model"。
 _VISION_NEG = re.compile(
-    r"(?:^|[-_ .])(?:tts|lyria|music|audio|speech|whisper|dall|flux|sdxl|diffusion)"
-    r"(?:$|[-_ .])|image(?:-preview)?$", re.I)
+    r"(?:^|[-_ .])(?:tts|lyria|music|audio|speech|whisper|transcrib\w*|dall|flux|sdxl|diffusion)"
+    r"(?:$|[-_ .])|image(?:-preview)?$|live-translate", re.I)
 _CONTEXT_HINTS = [
     (r"2m|2,?000,?000|2097152", "2M"),
     (r"1m|1,?000,?000|1048576", "1M"),

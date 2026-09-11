@@ -55,9 +55,9 @@ def test_v1_models_usable_first(client, monkeypatch):
     monkeypatch.setattr(gateway, "alias_view", lambda cfg: [])
     monkeypatch.setattr(gateway, "model_view", lambda cfg: [
         {"id": "a-limited-strong", "status": "limited", "tier": 3, "cap_score": 1.0,
-         "channels": [{"available": True, "eff_score": 1.0, "latency_ms": 100}]},
+         "channels": [{"available": True, "stab": 1.0, "latency_ms": 100}]},
         {"id": "b-ok-weak", "status": "ok", "tier": 1, "cap_score": 0.1,
-         "channels": [{"available": True, "eff_score": 0.4, "latency_ms": 3000}]},
+         "channels": [{"available": True, "stab": 0.4, "latency_ms": 3000}]},
     ])
     ids = [m["id"] for m in client.get("/v1/models", headers=H).json()["data"]]
     assert ids == ["auto:balanced", "b-ok-weak", "a-limited-strong"], ids

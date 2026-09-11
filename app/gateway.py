@@ -1,5 +1,6 @@
 """运行时状态：渠道健康、模型注册表、评分排序、错误分类冷却"""
 import collections
+import re
 import time
 
 from . import capability, providers, throttle
@@ -97,26 +98,71 @@ def mark_channel_up(mid: str, cid: str):
     save_runtime_state()
 
 
-# ---- 429 响应体分类：区分"每分钟限流"（等一会就好）和"每日额度/余额用完"（等也没用）----
-_DAILY_429 = ("daily", "per day", "day limit", "monthly", "quota", "balance", "credit",
-              "recharge", "top up", "purchase",
-              "额度", "今日", "每日", "当日", "已用完", "用尽", "余额", "充值", "资源包")
-_MINUTE_429 = ("per minute", "per-min", "rpm", "per hour", "too frequent",
-               "每分钟", "频繁", "速率", "minute limit")
+# ---- 429 响应体分类：区分「每分钟限流」「免费额度用尽」「付费余额不足」----
+# ⚠️ 光看正文分不出后两者：**魔搭的每日免费额度用完，正文就是 `insufficient balance`**
+# （2026-09-12 实测：魔搭 429 → {"error":{"message":"insufficient balance"}}，翌日自动恢复；
+#  OpenRouter 同样正文则是真没 credits，要充值）。所以必须结合渠道类型：
+#  - 免费额度型渠道（modelscope/gemini/nim/agnes/huggingface）：额度类措辞一律当「等窗口刷新」；
+#  - 其它（有余额接口的付费渠道）：余额/额度不足 → 需充值 → down，等不来自愈。
+# 最权威的判据是平台余额接口（providers.check_quota），调用方查得到就覆盖这里的推断。
+_FREE_QUOTA_TYPES = {"modelscope", "gemini", "nim", "agnes", "huggingface"}
+_PAID_TEXT = ("insufficient balance", "insufficient_quota", "insufficient funds",
+              "credit balance", "no credit", "recharge", "top up", "add credit",
+              "purchase", "billing", "余额", "充值", "欠费", "资源包", "购买")
+_FREE_TEXT = ("free tier", "freetier", "free-models-per-day", "免费额度",
+              "daily", "per day", "day limit", "monthly",
+              "今日", "每日", "当日", "已用完", "用尽", "quota exceeded", "exceeded your current quota")
+_MINUTE_429 = ("per minute", "per-min", "rpm", "per hour", "too many requests",
+               "too frequent", "rate limit", "每分钟", "频繁", "速率", "minute limit")
 
 
-def classify_429(body: str) -> tuple:
-    """解析 429 响应体 → (类型, 建议冷却秒数, 可读说明)。
-    daily → 冷却到明天凌晨；minute → 90 秒；认不出 → 默认 300 秒。"""
+def _secs_to_tomorrow() -> int:
+    """冷却到下一个 00:05（额度按天刷新，留 5 分钟缓冲）"""
+    t = time.localtime()
+    secs = (24 - t.tm_hour - 1) * 3600 + (60 - t.tm_min - 1) * 60 + (65 - t.tm_sec)
+    return int(min(max(secs, 600), 86400))
+
+
+def classify_429(body: str, ch_type: str = None, retry_after=None) -> tuple:
+    """解析 429 响应体 → (类型, 建议冷却秒数, 可读说明)。四档：
+
+    paid_balance → 冷却 0（调用方按 down 处理：等不来自愈，要充值/换 key）
+    free_daily   → 冷却到明天凌晨（免费额度按天刷新，次日自动回来）
+    minute       → 90 秒（上游给了 Retry-After 就用它）
+    unknown      → 300 秒（保守；交给 429 自学水位接着调）
+
+    上游若明确给了较短 Retry-After（≤10 分钟），说明它自己认为很快能好 →
+    一律按分钟级处理，不按「明天」冷却。"""
     text = (body or "").lower()
-    if any(k in text for k in _DAILY_429):
-        # 冷却到下一个 00:05（额度一般按天刷新，留 5 分钟缓冲）
-        t = time.localtime()
-        secs = (24 - t.tm_hour - 1) * 3600 + (60 - t.tm_min - 1) * 60 + (65 - t.tm_sec)
-        return ("daily", min(max(secs, 600), 86400), "今日额度已用完，冷却至明天")
-    if any(k in text for k in _MINUTE_429):
-        return ("minute", 90, "每分钟限流，90 秒后重试")
-    return ("unknown", 300, "暂时限流")
+    free_ch = (ch_type or "") in _FREE_QUOTA_TYPES
+    paid = any(k in text for k in _PAID_TEXT)
+    daily = any(k in text for k in _FREE_TEXT)
+    if free_ch:
+        if paid or daily:
+            label, note = "free_daily", "免费额度用完，冷却至明天（次日自动恢复）"
+        elif any(k in text for k in _MINUTE_429):
+            label, note = "minute", "每分钟限流"
+        else:
+            label, note = "unknown", "暂时限流"
+    else:
+        if paid:
+            label, note = "paid_balance", "账户余额/额度不足，需充值或换 key（硬不可用）"
+        elif daily:
+            label, note = "free_daily", "额度用尽，冷却至明天"
+        elif any(k in text for k in _MINUTE_429):
+            label, note = "minute", "每分钟限流"
+        else:
+            label, note = "unknown", "暂时限流"
+    # 上游给的 Retry-After 若很短，说明不是「额度到明天」那种限制
+    if label in ("free_daily", "unknown") and retry_after and 0 < retry_after <= 600:
+        label, note = "minute", note + f"（上游 Retry-After {retry_after}s）"
+    if label == "paid_balance":
+        return (label, 0, note)
+    if label == "free_daily":
+        return (label, _secs_to_tomorrow(), note)
+    if label == "minute":
+        return (label, max(90, int(retry_after or 0)), note)
+    return (label, 300, note)
 
 
 # 永久不可用判定：这些错误「冷却到明天」也不会自愈，应记 down 而非 limited
@@ -127,12 +173,78 @@ _PERMANENT_KEYWORDS = (
 )
 
 
+# ---- 地域封锁：本机出口网络的问题，不是模型的错 ----
+_GEO_HINTS = ("user location is not supported", "location is not supported",
+              "not available in your country", "not available in your region",
+              "unsupported_country", "region not supported", "failed_precondition",
+              "地域", "地区不支持", "所在地区", "不支持您所在的")
+
+
+def is_geo_block(text: str) -> bool:
+    """上游以「你所在地区不支持」拒了请求（Google 系常见——走代理时尤其频繁）。
+
+    2026-09-12 实测：同一批请求里有的 200 答对、有的 400 FAILED_PRECONDITION
+    `User location is not supported for the API use`。这**既不是模型不稳，也不是模型下线**，
+    是本机出口网络的问题；所以不写稳定分、不标 down、不冷却（与本地 DNS 同等对待）。"""
+    t = (text or "").lower()
+    return any(k in t for k in _GEO_HINTS)
+
+
+def kind_from_error(err: str) -> str:
+    """从历史 error 文本反推失败类型（口径与实时路径的 kind 一致，供回填用）。
+
+    实时路径有真实 kind，不需要猜；只有回填 usage.db 老数据时才走这里。"""
+    t = (err or "").lower()
+    if is_geo_block(t):
+        return "geo"
+    if "getaddrinfo" in t or "name resolution" in t or "proxy" in t:
+        return "local_net"
+    if "429" in t or "rate limit" in t or "限流" in t or "频繁" in t:
+        return "rate_limit"
+    if "insufficient" in t or "balance" in t or "余额" in t or "额度" in t or "欠费" in t:
+        return "balance"
+    if re.search(r"http\s*[45]\d\d", t) and "http 5" not in t:
+        return "client"
+    return "connect"
+
+
+def backfill_stab(rows) -> int:
+    """用历史**真实调用**回填稳定分窗口（rows 来自 store.recent_outcomes，按新→旧）。
+
+    为什么需要：稳定分只认真实调用，而历史真实调用全在 usage.db 里；旧口径（探测与真实
+    混算的 score/n）已按新口径丢弃，不回填的话所有模型从空窗口起步，「稳定优先」要等很久
+    才有效。只填**还没有窗口**的 (模型,渠道)，实时攒下的样本绝不被覆盖。
+    失败按 kind_from_error 分类：429/余额/4xx/本地网络/地域 一律跳过。返回回填条数。"""
+    per = {}
+    for model, cid, success, err, _ts in rows:
+        lst = per.setdefault((model, cid), [])
+        if len(lst) >= STAB_WIN:
+            continue
+        if success:
+            lst.append(1)
+        elif kind_from_error(err) not in _STAB_SKIP_KINDS:
+            lst.append(0)
+    n = 0
+    for (model, cid), lst in per.items():
+        if not lst or (stats.get((model, cid)) or {}).get("win"):
+            continue
+        s = stats.setdefault((model, cid), {"win": [], "latency": None, "ttft": None})
+        s["win"] = list(reversed(lst))       # 与新→旧相反，存成旧的在前（与实时追加一致）
+        n += 1
+    if n:
+        save_runtime_state()
+    return n
+
+
 def is_permanent_failure(status: int, text: str = "") -> bool:
     """HTTP 状态/响应体是否为「永久不可用」（down），而非「暂时受限」（limited）。
 
     - 400/402/403/404/405：付费/权限/参数/已下线 → 等也不会恢复，记 down。
     - 429 且正文含「余额/充值/购买」等：额度用尽需人工充值 → 记 down。
+    - 地域封锁（400 FAILED_PRECONDITION）：本机网络问题，不是下游结论 → 不算永久失败。
     - 其余 429（每分钟限流）/5xx/连接失败 → 暂时受限，记 limited。"""
+    if is_geo_block(text):
+        return False
     if status in (400, 402, 403, 404, 405):
         return True
     if status == 429:
@@ -301,11 +413,11 @@ def save_runtime_state():
             "ratelimit": {f"{k[0]}|{k[1]}": v for k, v in ratelimit.items()},
             "channel_cool": {cid: round(v, 1) for cid, v in channel_cool.items() if v > now},
             "throttle": throttle.snapshot(),
-            # 渠道评分（稳定分/延迟/首字节/样本数）：只落「实测过」的条目，
-            # 否则模型×渠道全量落盘太大。带 n 才能让稳定分的置信度跨重启累计。
-            "stats": {f"{k[0]}|{k[1]}": {c: s.get(c) for c in _SCORE_COLS}
+            # 渠道评分（稳定分窗口/延迟/首字节）：只落「有真实调用样本或有延迟」的条目，
+            # 否则模型×渠道全量落盘太大。win 存最近 N 次真实调用的 1/0，跨重启继续累计。
+            "stats": {f"{k[0]}|{k[1]}": {c: s.get(c) for c in _STAB_COLS}
                       for k, s in stats.items()
-                      if (s.get("n") or s.get("latency") or s.get("ttft"))},
+                      if (s.get("win") or s.get("latency") or s.get("ttft"))},
         })
     except Exception:
         pass  # 持久化失败不影响内存状态
@@ -342,19 +454,20 @@ def restore_runtime_state():
     # 恢复 429 自学水位（throttle），并给仍在有效期内的 (渠道,模型) 一个保守短冷却，
     # 避免重启后受限模型立刻回绿、再次集中撞限（这是 Gemini/NIM 重启变绿的直接原因）
     throttle.restore(data.get("throttle") or {})
-    # 恢复渠道评分（稳定分/延迟/首字节/样本数）：这是「稳定优先」的历史依据，
-    # 不恢复的话每次重启稳定分都从 0.7 重来，样本量置信度也就永远攒不起来
+    # 恢复渠道评分（稳定分窗口/延迟/首字节）：这是「稳定优先」的历史依据，不恢复的话
+    # 每次重启稳定分都从头开始。**旧版数据（只有 score/n，没有 win）直接丢弃**——旧 score 是
+    # 探测与真实调用混算的，口径不同；真实历史用 scripts/backfill_stab.py 从 usage.db 回填。
     n_stat = 0
     for k, v in (data.get("stats") or {}).items():
         mid, _, cid = k.partition("|")
         if not (mid and cid and isinstance(v, dict)):
             continue
         try:
+            win = [1 if int(x) else 0 for x in (v.get("win") or [])][-STAB_WIN:]
             stats[(mid, cid)] = {
-                "score": float(v.get("score", 0.7)),
+                "win": win,
                 "latency": int(v["latency"]) if v.get("latency") else None,
                 "ttft": int(v["ttft"]) if v.get("ttft") else None,
-                "n": int(v.get("n") or 0),
             }
         except (TypeError, ValueError):
             continue
@@ -395,39 +508,47 @@ def get_model_status(model: str):
 
 
 def _update_score(model: str, cid: str, ok: bool, latency_ms=None, kind: str = None,
-                  ttft_ms=None):
-    """滑动评分：成功 0.8*旧+0.2；失败按类型降分（连接类更狠，让受限/挂起的渠道快速沉底）。
-    延迟/首字节各做 7:3 EMA；样本数 n 供 eff_score 做置信度折算。"""
-    s = stats.setdefault((model, cid), {"score": 0.7, "latency": None, "n": 0})
-    s["n"] = int(s.get("n") or 0) + 1
-    if ok:
-        s["score"] = round(s["score"] * 0.8 + 0.2, 3)
-    else:
-        # 连接失败/超时：0.5 衰减，快速沉底，避免受限渠道霸占候选第一长时间白等
-        decay = 0.5 if kind in ("connect",) else 0.8
-        s["score"] = round(s["score"] * decay, 3)
+                  ttft_ms=None, source: str = "probe"):
+    """记录一次调用的结果。
+
+    只有 `source="real"`（真实 /v1 请求）才写稳定分窗口——主动探测/测试按钮的 1-token
+    ping 与真实可用性无关。窗口只收「技术性失败」：上游超时/断连/断流/5xx/响应坏了；
+    429·额度、4xx 权限下线、本地 DNS 一律不进（不是模型不稳，或根本不是上游的错）。
+    延迟/首字节同样只认真实请求；没真实数据的模型由 _composite 回退渠道健康检查延迟。"""
+    s = stats.setdefault((model, cid), {"win": [], "latency": None, "ttft": None})
+    if source != "real":
+        return
+    # 失败**默认计入**（保守：未知失败就是不稳），只有下面这些明确「不是模型不稳」的才跳过
+    if ok or kind not in _STAB_SKIP_KINDS:
+        win = list(s.get("win") or [])
+        win.append(1 if ok else 0)
+        s["win"] = win[-STAB_WIN:]
     if ok and latency_ms:
-        s["latency"] = latency_ms if s["latency"] is None else int(s["latency"] * 0.7 + latency_ms * 0.3)
-    if ttft_ms:
+        s["latency"] = latency_ms if s.get("latency") is None else int(s["latency"] * 0.7 + latency_ms * 0.3)
+    if ok and ttft_ms:
         s["ttft"] = ttft_ms if s.get("ttft") is None else int(s["ttft"] * 0.7 + ttft_ms * 0.3)
 
 
 def mark_ttft(model: str, cid: str, ttft_ms: int):
-    """记录一次流式请求的首字节时间（TTFT）。速度分优先用它——它才反映「吐字快不快」，
+    """记录一次**真实流式请求**的首字节时间（TTFT）。速度分优先用它——它才反映「吐字快不快」，
     而渠道健康检查的延迟只是「列模型接口快不快」。"""
     if not ttft_ms:
         return
-    s = stats.setdefault((model, cid), {"score": 0.7, "latency": None, "n": 0})
+    s = stats.setdefault((model, cid), {"win": [], "latency": None, "ttft": None})
     s["ttft"] = ttft_ms if s.get("ttft") is None else int(s["ttft"] * 0.7 + ttft_ms * 0.3)
     _request_save()
 
 
 def mark_result(model: str, cid: str, ok: bool, latency_ms=None,
-                kind: str = None, retry_after: int = None, cooldown_seconds: int = None):
-    """记录一次真实请求结果：成功解除冷却并加分，失败按类型冷却并扣分。
-    cooldown_seconds 由 429 响应体分类给出（每日额度/每分钟限流），优先级最高；
-    其次是上游 Retry-After 头；都没有才用按 kind 的默认冷却。"""
-    _update_score(model, cid, ok, latency_ms, kind=kind)
+                kind: str = None, retry_after: int = None, cooldown_seconds: int = None,
+                source: str = "probe"):
+    """记录一次调用结果：成功解除冷却，失败按类型冷却。
+
+    `source` 决定要不要动稳定分：只有 `"real"`（真实 /v1 请求）会写稳定分窗口与延迟，
+    `"probe"`（主动探测 / 模型测试 / 健康检查）只更新可用性状态（冷却、熔断、状态标记）。
+    默认 `"probe"` 是安全默认：以后新增调用点忘了传，也不会污染稳定分。
+    cooldown_seconds 由 429 响应体分类给出，优先级最高；其次是上游 Retry-After 头。"""
+    _update_score(model, cid, ok, latency_ms, kind=kind, source=source)
     key = (model, cid)
     if ok:
         cooldown.pop(key, None)
@@ -440,31 +561,50 @@ def mark_result(model: str, cid: str, ok: bool, latency_ms=None,
             seconds = max(seconds, min(retry_after, 3600))
         if cooldown_seconds:
             seconds = cooldown_seconds
-        cooldown[key] = time.time() + seconds
+        if seconds:
+            cooldown[key] = time.time() + seconds
         unverified.add(key)  # 冷却到期后仍显示受限，直到实测/探测成功才转绿
     _request_save()
 
 
 def get_stat(model: str, cid: str) -> dict:
-    return stats.get((model, cid), {"score": 0.7, "latency": None, "n": 0})
+    return stats.get((model, cid), {"win": [], "latency": None, "ttft": None})
 
 
-# 稳定分置信度折算：n 个样本的 EMA 向先验 0.7 收缩，样本越少越不敢信。
-# 目的：让「侥幸测过 1 次成功」不会与「测过 50 次 100% 成功率」等价，
-# 也让「偶发 1 次连接失败」不至于把一个本来很稳的模型直接打到谷底。
-_SCORE_PRIOR = 0.7      # 未知模型的先验分（与 stats 初值一致）
-_SCORE_K = 3.0          # 收缩强度：n=3 时只用一半权重
-_LEGACY_N = 6           # 老持久化数据没有 n：当作已有 6 个样本的证据（别一升级就把历史分归零）
-_SCORE_COLS = ("score", "latency", "ttft", "n")
+_SCORE_PRIOR = 0.7      # 未知模型的先验分（中性：不奖不罚）
+STAB_WIN = 10           # 稳定分只看最近 N 次**真实调用**
+_STAB_K = 2.0           # 小样本收缩强度：n=2 时只用一半权重（旧版是 3）
+_STAB_COLS = ("win", "latency", "ttft")
+# 不算「模型不稳」的失败类型（时间/充值/权限能解决，或根本不是上游的错）：
+#   rate_limit/balance/quota = 429 系列（冷却或充值就好，稳定分不该被扣）
+#   client/auth = 4xx（模型在该渠道下线/无权限 → 走「硬不可用」，不是质量信号）
+#   local_net  = 本地 DNS/代理问题（你自己的网络抖了）
+#   geo        = 上游地域封锁（也是出口网络问题，见 is_geo_block）
+_STAB_SKIP_KINDS = {"rate_limit", "balance", "quota", "client", "auth", "local_net", "geo"}
 
 
-def eff_score(s: dict) -> float:
-    """带置信度的稳定分：sample 越少越向 0.7 收缩（老数据没有 n → 按 6 个样本算）"""
-    raw = float(s.get("score", _SCORE_PRIOR))
-    n = s.get("n")
-    n = _LEGACY_N if n is None else max(0, int(n))
-    conf = n / (n + _SCORE_K)
+def stab_of(s: dict):
+    """稳定分 = 最近 N 次**真实调用**的成功率（向先验 0.7 收缩）；**没有真实样本 → None**。
+
+    - 只认真实请求的结果：主动探测/测试按钮的 1-token ping 与真实可用性无关（免费额度、
+      长上下文、流式都可能翻车），它们只更新可用性状态，不写这张窗口。
+    - 只认「技术性失败」（上游超时/断连/断流/5xx/响应坏了）：429/额度、4xx 权限下线、
+      本地 DNS 一律不进窗口——前者等窗口刷新或充值就恢复，后者根本不是上游的错。
+    - 返回 None 表示「没数据」：加权策略里该维度不参与、权重归一给其它维度
+      （不让一个假的 0.7 先验干扰排序），一旦有真实数据立刻以完整权重生效。
+    """
+    win = s.get("win") or []
+    if not win:
+        return None
+    raw = sum(win) / len(win)
+    conf = len(win) / (len(win) + _STAB_K)
     return round(_SCORE_PRIOR + (raw - _SCORE_PRIOR) * conf, 4)
+
+
+def stab_raw(s: dict):
+    """窗口原始成功率（给人看的「成功率 X%」，不做收缩）；没数据 → None"""
+    win = s.get("win") or []
+    return round(sum(win) / len(win), 3) if win else None
 
 
 # ---------------- 模型 ID 命名变更 → 旧状态迁移 ----------------
@@ -592,15 +732,25 @@ def _score_dims(dims: tuple, strategy: str) -> float:
 
     带主维度的策略返回 `档号 + 档内加权`（档内加权 ∈ [0,1)），所以排序天然是
     「先按主维度分档、同档再按另外两维」——标量接口不变，前端 / 路由 / /v1/models
-    共用同一套口径。"""
+    共用同一套口径。
+
+    `dims[1]`（稳定）**可能是 None** = 该 (模型,渠道) 还没有真实调用样本：
+    - 加权策略（均衡）：把稳定维剔除、其余维度权重归一 —— 不让一个假的 0.7 先验干扰排序，
+      等有真实数据再以完整权重生效；
+    - 主维度=稳定的策略（稳定优先）：按先验 0.7 当「中性」处理，否则数据少时它几乎没有候选。
+    """
     spec = _STRATEGY_SPEC.get(strategy) or _STRATEGY_SPEC["balanced"]
     if "weights" in spec:
         w = spec["weights"]
+        if dims[1] is None:
+            return (w[0] * dims[0] + w[2] * dims[2]) / (w[0] + w[2])
         return w[0] * dims[0] + w[1] * dims[1] + w[2] * dims[2]
     i = _DIM_IDX[spec["primary"]]
     others = [x for x in (0, 1, 2) if x != i]
-    tie = spec["tie"][0] * dims[others[0]] + spec["tie"][1] * dims[others[1]]
-    return int(dims[i] / spec["band"]) + tie
+    tie = sum(spec["tie"][n] * (dims[o] if dims[o] is not None else _SCORE_PRIOR)
+              for n, o in enumerate(others))
+    primary = dims[i] if dims[i] is not None else _SCORE_PRIOR
+    return int(primary / spec["band"]) + tie
 
 
 def _model_composite(m: dict, strategy: str) -> float:
@@ -618,9 +768,7 @@ def _model_composite(m: dict, strategy: str) -> float:
     for c in pool:
         lat = c.get("latency_ms")
         speed = _SPEED_K / (_SPEED_K + lat) if lat else 0.0
-        stab = c.get("eff_score")
-        if stab is None:
-            stab = c.get("score") or 0.7   # 没有置信度字段（手造 dict）就用原始评分
+        stab = c.get("stab")            # None = 该渠道没有真实调用样本（不参与加权）
         cand = _score_dims((cap, stab, speed), strategy)
         if cand > best:
             best = cand
@@ -644,15 +792,16 @@ def _last_version(s: str):
 def _composite(c, cfg, strategy: str) -> float:
     """候选（模型×渠道）综合分：按当前策略把三维分折算成标量。
 
-    智能 = 连续能力分（AA 榜分归一化，无榜分用档位锚点）；稳定 = 带样本量置信度的
-    eff_score；速度 = 首字节时间(TTFT) 优先 → 实测总延迟 → 渠道健康检查延迟。"""
+    智能 = 连续能力分（AA 榜分归一化，无榜分用档位锚点）；稳定 = 近 N 次**真实调用**成功率
+    （没有真实样本 → None，加权时该维剔除）；速度 = 首字节(TTFT) 优先 → 实测总延迟 →
+    渠道健康检查延迟。"""
     s = get_stat(c["model"], c["channel"]["id"])
     cs_lat = (channels.get(c["channel"]["id"]).latency_ms) or 9999
     lat = s.get("ttft") or s["latency"] or cs_lat
     tier = capability.tier_of(c["model"], cfg.get("model_tiers"))
     cap = capability.capability_score(c["model"], tier, cfg.get("model_tiers"))
     speed = _SPEED_K / (_SPEED_K + lat) if lat else 0.0
-    return _score_dims((cap, eff_score(s), speed), strategy)
+    return _score_dims((cap, stab_of(s), speed), strategy)
 
 
 def candidates_for(model: str, cfg: dict) -> list:
@@ -735,9 +884,9 @@ def model_view(cfg: dict) -> list:
                 # 响应速度：首字节(TTFT) 优先 → 实测总延迟 → 渠道健康检查延迟
                 # ——与 _composite / _model_composite / FE compScore 同一口径
                 "latency_ms": s.get("ttft") or s["latency"] or cs.latency_ms,
-                "score": s["score"],
-                "eff_score": eff_score(s),   # 带样本量置信度的稳定分（排序用）
-                "samples": int(s.get("n") or 0),
+                "score": stab_raw(s),        # 近 N 次真实调用成功率（展示用；没数据 → None）
+                "stab": stab_of(s),          # 带小样本收缩的稳定分（排序用；没数据 → None）
+                "samples": len(s.get("win") or []),
             })
     models = []
     for m, chans in agg.items():

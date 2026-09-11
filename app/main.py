@@ -120,12 +120,26 @@ async def probe_used_models():
                 else:
                     kind = _kind_of(r.status_code)
                     if r.status_code == 429:
-                        _, secs, _ = gateway.classify_429(r.text[:300])
+                        label, secs, _ = gateway.classify_429(r.text[:300], ch.get("type"),
+                                                              _parse_retry_after(r.headers))
+                        if label == "paid_balance":
+                            # 探测发现账户欠费：按渠道级硬不可用处理（探测只碰可用性，不写稳定分）
+                            cs = gateway.get_cs(ch["id"])
+                            cs.valid = False
+                            cs.error = "账户余额/额度不足（探测 429）"
+                            secs = 0
                         gateway.mark_result(m, ch["id"], False, kind=kind,
                                             cooldown_seconds=secs)
                     else:
                         gateway.mark_result(m, ch["id"], False, kind=kind,
                                             retry_after=_parse_retry_after(r.headers))
+                    if gateway.is_geo_block(r.text[:300]):
+                        # 地域封锁：本机出口网络问题，不是模型不可用 → 不标 down、不记硬失败
+                        gateway.mark_model_status(m, True, "地域限制（本机出口网络）",
+                                                  ch.get("name"), state="limited")
+                        logger.warning("渠道[%s] 模型[%s] 被上游地域限制（非模型问题）",
+                                       ch.get("name"), m)
+                        continue
                     if r.status_code in (400, 402, 403):
                         # 付费/权限/下线 → 该渠道上此模型硬不可用（按渠道级记录），
                         # 模型级也记为 down（与扫描口径一致），避免探测把硬失败覆盖成可用
@@ -228,6 +242,14 @@ async def lifespan(app: FastAPI):
     store.init()
     gateway.restore_model_status()  # 恢复已测模型状态，重启不丢
     gateway.restore_runtime_state()  # 恢复冷却/待验证/渠道级硬失败（扫描结果重启不丢）
+    # 稳定分回填：稳定分只认真实调用，而历史真实调用都在 usage.db 里。重启后窗口是空的，
+    # 不回填的话「稳定优先」要等很久才有样本（旧口径的 score/n 已按新口径丢弃）。
+    try:
+        n = gateway.backfill_stab(store.recent_outcomes(days=120, per_pair=gateway.STAB_WIN))
+        if n:
+            logger.info("稳定分回填：%d 个(模型,渠道)用历史真实调用补齐窗口", n)
+    except Exception as e:
+        logger.warning("稳定分回填失败（不影响启动）: %s", e)
     task = asyncio.create_task(_bg_loop())
     yield
     task.cancel()
@@ -335,7 +357,7 @@ async def chat_completions(request: Request):
                 req = shared_client.build_request("POST", url, json=body, headers=headers)
                 resp = await shared_client.send(req, stream=True)
             except Exception as e:
-                _fail(cid, name, upstream_model, model, t0, errors, f"connect: {e}")
+                _fail(cid, name, upstream_model, model, t0, errors, f"connect: {e}", exc=e)
                 continue
             if resp.status_code != 200:
                 raw = (await resp.aread()).decode("utf-8", "ignore")[:300]
@@ -343,9 +365,11 @@ async def chat_completions(request: Request):
                 gateway.note_ratelimit_headers(cid, upstream_model, resp.headers)
                 await resp.aclose()
                 _classify(cid, name, upstream_model, model, t0, errors,
-                          resp.status_code, raw, ra)
+                          resp.status_code, raw, ra, ch_type=ch.get("type"))
                 continue
-            gateway.mark_result(upstream_model, cid, True, int((time.time() - t0) * 1000))
+            # 收到 200 = 「上游接受了这次请求」→ 只更新可用性（解冷却/转绿），**不写稳定分**：
+            # 真正的成败要等 _stream_gen 跑完（中途断流算失败）。
+            gateway.mark_result(upstream_model, cid, True, source="probe")
             gateway.note_ratelimit_headers(cid, upstream_model, resp.headers)
             ms = gateway.get_model_status(upstream_model)
             if ms is not None and ms.get("state") == "down":
@@ -358,25 +382,26 @@ async def chat_completions(request: Request):
             try:
                 r = await shared_client.post(url, json=body, headers=headers)
             except Exception as e:
-                _fail(cid, name, upstream_model, model, t0, errors, f"connect: {e}")
+                _fail(cid, name, upstream_model, model, t0, errors, f"connect: {e}", exc=e)
                 continue
             latency = int((time.time() - t0) * 1000)
             if r.status_code != 200:
                 gateway.note_ratelimit_headers(cid, upstream_model, r.headers)
                 _classify(cid, name, upstream_model, model, t0, errors,
-                          r.status_code, r.text[:300], _parse_retry_after(r.headers))
+                          r.status_code, r.text[:300], _parse_retry_after(r.headers),
+                          ch_type=ch.get("type"))
                 continue
             gateway.note_ratelimit_headers(cid, upstream_model, r.headers)
             try:
                 data = r.json()
             except Exception:
-                gateway.mark_result(upstream_model, cid, False, latency)
+                gateway.mark_result(upstream_model, cid, False, latency, kind="bad_json", source="real")
                 store.log_usage(cid, name, model, 0, 0, latency, False, "响应不是 JSON",
                                 upstream_model=upstream_model)
                 logger.warning("渠道[%s] 模型[%s] 响应不是 JSON", name, upstream_model)
                 errors.append(f"{name}: 响应不是 JSON")
                 continue
-            gateway.mark_result(upstream_model, cid, True, latency)
+            gateway.mark_result(upstream_model, cid, True, latency, source="real")
             ms = gateway.get_model_status(upstream_model)
             if ms is not None and ms.get("state") == "down":
                 gateway.mark_model_status(upstream_model, True, "", name)  # 真实成功 → 解除遗留 down
@@ -389,6 +414,20 @@ async def chat_completions(request: Request):
             return JSONResponse(data, headers={"X-Api-Hub-Channel": _hdr(name), "X-Api-Hub-Model": _hdr(upstream_model)})
 
     raise HTTPException(502, "所有渠道均失败。详情: " + " | ".join(errors[:5]))
+
+
+def _conn_kind(exc) -> str:
+    """连接类失败的细分。
+
+    `local_net` = 本地 DNS/代理问题（getaddrinfo 失败等）——**不是上游的错**，所以既不该
+    进稳定分，也不该当成模型不可用；`timeout` = 连上了但不响应；其余归 `connect`。"""
+    t = str(exc).lower()
+    if any(k in t for k in ("getaddrinfo", "name or service not known", "nodename nor servname",
+                            "name resolution", "proxy")):
+        return "local_net"
+    if "timeout" in t or "timed out" in t:
+        return "timeout"
+    return "connect"
 
 
 def _parse_retry_after(headers) -> int:
@@ -421,8 +460,10 @@ def _quota_exhausted(cid: str) -> bool:
     return False
 
 
-def _classify(cid, name, upstream_model, requested_model, t0, errors, status, raw, retry_after=None):
-    """按 HTTP 状态分类处理：鉴权失败直接停用渠道，限流按响应体分类冷却（每日额度 vs 每分钟限流）"""
+def _classify(cid, name, upstream_model, requested_model, t0, errors, status, raw,
+              retry_after=None, ch_type=None):
+    """按 HTTP 状态分类处理：鉴权失败直接停用渠道；429 分三档（余额不足→down /
+    免费额度用尽→冷却到明天 / 每分钟限流→冷却几十秒）；其它 4xx → 该渠道上硬不可用。"""
     latency = int((time.time() - t0) * 1000)
     note = f" (上游模型 {upstream_model})" if upstream_model != requested_model else ""
     kind = _kind_of(status)
@@ -435,20 +476,35 @@ def _classify(cid, name, upstream_model, requested_model, t0, errors, status, ra
         # 按 (模型, 渠道) 记录，不再把同名模型在其他渠道的状态一起标红
         gateway.mark_channel_down(upstream_model, cid, f"Key 无效: HTTP {status}")
     elif kind == "rate_limit":
-        label, secs, text429 = gateway.classify_429(raw)
-        cooldown_seconds = secs
-        # 「每天额度用完」型 429：账户级限额，整个渠道所有模型一起受限，冷却到明天。
-        # 与「余额不足」不同——余额接口可能仍有余额，只是当天免费调用次数用完了。
-        if label == "daily":
-            logger.warning("渠道[%s] 模型[%s] 当日额度用完 (daily 429)，整个渠道冷却到明天，"
-                           "该渠道下所有模型一并受限", name, upstream_model)
+        # 429 分三档：余额不足（要充值）/ 免费额度用尽（等明天）/ 每分钟限流（等一会）。
+        # 判别必须结合渠道类型——魔搭的「每日免费额度用完」正文就是 insufficient balance，
+        # 光看字面会误判成欠费；平台余额接口查得到时以它为准（_quota_exhausted）。
+        label, secs, text429 = gateway.classify_429(raw, ch_type, retry_after)
+        if label == "paid_balance" or _quota_exhausted(cid):
+            # 账户余额/额度不足：等不来自愈，要充值或换 key → 按渠道级「硬不可用」处理
+            # （与 Key 无效同一条路径：先挂掉 cs.valid，下次健康检查再试）
+            cs = gateway.get_cs(cid)
+            cs.valid = False
+            cs.error = f"账户余额/额度不足（HTTP 429）：{raw[:120]}"
+            gateway.mark_channel_down(upstream_model, cid, "账户余额不足，需充值")
+            gateway.mark_model_status(requested_model, False, "账户余额不足，需充值（等不会恢复）",
+                                      name, state="down")
+            gateway.mark_result(upstream_model, cid, False, kind="balance")
+            store.log_usage(cid, name, requested_model, 0, 0, latency, False,
+                            f"HTTP 429 余额/额度不足(需充值): {raw[:200]}", upstream_model=upstream_model)
+            logger.warning("渠道[%s] 模型[%s] 账户余额/额度不足，按硬不可用处理（需充值或换 key）", name, upstream_model)
+            errors.append(f"{name}: 账户余额不足，需充值{note}")
+            return
+        if label == "free_daily":
+            logger.warning("渠道[%s] 模型[%s] 免费额度用完 (free_daily 429)，"
+                           "整个渠道冷却到明天，该渠道下所有模型一并受限", name, upstream_model)
             gateway.mark_channel_quota_exhausted(cid, text429)
             gateway.mark_model_status(requested_model, False, text429, name, state="limited")
             gateway.mark_result(upstream_model, cid, False, kind="rate_limit",
                                 cooldown_seconds=secs)
             store.log_usage(cid, name, requested_model, 0, 0, latency, False,
-                            f"HTTP 429 当日额度用完: {raw[:200]}", upstream_model=upstream_model)
-            errors.append(f"{name}: 当日额度用完 (HTTP 429){note}")
+                            f"HTTP 429 免费额度用完: {raw[:200]}", upstream_model=upstream_model)
+            errors.append(f"{name}: 免费额度用完 (HTTP 429){note}")
             return
         logger.warning("渠道[%s] 模型[%s] 限流 (429, %s)，冷却 %ds，Retry-After=%s",
                        name, upstream_model, label, secs, retry_after)
@@ -460,33 +516,54 @@ def _classify(cid, name, upstream_model, requested_model, t0, errors, status, ra
         logger.warning("渠道[%s] 模型[%s] 上游服务错误 (%s)", name, upstream_model, status)
         gateway.mark_model_status(requested_model, True, f"上游暂时故障 (HTTP {status})", name, state="limited")
     else:  # 4xx 客户端类（含 400/402/403/404）—— 通常是付费/权限/参数/已下线
-        gateway.mark_channel_down(upstream_model, cid, f"HTTP {status}: {raw[:160]}")
-        logger.warning("渠道[%s] 模型[%s] 请求被拒 (%s): %s", name, upstream_model, status, raw[:150])
+        if gateway.is_geo_block(raw):
+            # 地域封锁：本机出口网络的问题，不是模型不可用 → 不标 down、不记硬失败
+            logger.warning("渠道[%s] 模型[%s] 被上游地域限制（非模型问题）: %s",
+                           name, upstream_model, raw[:120])
+            gateway.mark_model_status(requested_model, True, "地域限制（本机出口网络）",
+                                      name, state="limited")
+            kind = "geo"
+        else:
+            gateway.mark_channel_down(upstream_model, cid, f"HTTP {status}: {raw[:160]}")
+            logger.warning("渠道[%s] 模型[%s] 请求被拒 (%s): %s", name, upstream_model, status, raw[:150])
     gateway.mark_result(upstream_model, cid, False, None, kind=kind,
-                        retry_after=retry_after, cooldown_seconds=cooldown_seconds)
+                        retry_after=retry_after, cooldown_seconds=cooldown_seconds,
+                        source="real")
     store.log_usage(cid, name, requested_model, 0, 0, latency, False,
                     f"HTTP {status}{note}: {raw[:200]}", upstream_model=upstream_model)
     errors.append(f"{name}: HTTP {status}"
                   + (f" (Retry-After {retry_after}s)" if retry_after else "") + note)
 
 
-def _fail(cid, name, upstream_model, requested_model, t0, errors, msg):
-    gateway.mark_result(upstream_model, cid, False, None, kind="connect")
-    gateway.mark_model_status(requested_model, True, "连接失败（可能暂时不可达）", name, state="limited")
+def _fail(cid, name, upstream_model, requested_model, t0, errors, msg, exc=None):
+    """请求阶段就失败（连不上/本地网络）。
+
+    本地 DNS/代理问题（`local_net`）**不算模型的账**：不改模型状态、不进稳定分、不冷却——
+    否则你自己网络一抖，所有渠道的模型都被打成「受限」。其余失败（超时/断连）才记。"""
+    kind = _conn_kind(exc) if exc is not None else "connect"
+    if kind != "local_net":
+        gateway.mark_result(upstream_model, cid, False, None, kind=kind, source="real")
+        gateway.mark_model_status(requested_model, True, "连接失败（可能暂时不可达）", name, state="limited")
+    else:
+        logger.warning("渠道[%s] 本地网络/DNS 问题，不改模型状态: %s", name, msg[:160])
     store.log_usage(cid, name, requested_model, 0, 0, int((time.time() - t0) * 1000), False, msg,
                     upstream_model=upstream_model)
-    logger.warning("渠道[%s] 模型[%s] 连接失败: %s", name, upstream_model, msg[:200])
+    logger.warning("渠道[%s] 模型[%s] 连接失败 (%s): %s", name, upstream_model, kind, msg[:200])
     errors.append(f"{name}: {msg[:120]}")
 
 
 async def _stream_gen(resp, cid, name, model, t0, upstream_model=""):
-    """流式转发，同时从 SSE 里抽 usage 记账，并记录**首字节时间(TTFT)**。
+    """流式转发，同时从 SSE 里抽 usage 记账，并记录**首字节时间(TTFT)**与**是否完整收尾**。
 
-    TTFT 是「速度优先」路由最该用的信号：请求发出到上游吐出第一个字节的耗时，
-    才反映用户感受到的响应快慢。"""
+    成功只有在整条流正常读完时才算：中途断流/超时记 `kind="stream_break"` 的失败
+    （旧版一收到 200 就记成功，断流被当成功，稳定分完全看不到这种最真实的失败）。
+    客户端主动断开（GeneratorExit/CancelledError）不是模型的错 → 不记失败、只落用量。"""
     usage = {}
     buf = b""
     ttft = None
+    completed = False
+    aborted = False
+    err = None
     try:
         async for chunk in resp.aiter_bytes():
             if ttft is None and chunk:
@@ -504,13 +581,26 @@ async def _stream_gen(resp, cid, name, model, t0, upstream_model=""):
                             usage = u
                     except Exception:
                         pass
+        completed = True
+    except (GeneratorExit, asyncio.CancelledError):
+        aborted = True       # 客户端断开：不算上游失败
+        raise
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        logger.warning("渠道[%s] 模型[%s] 流式中断: %s", name, upstream_model, err[:180])
+        raise
     finally:
         if ttft is not None and upstream_model:
             gateway.mark_ttft(upstream_model, cid, ttft)
         await resp.aclose()
+        if upstream_model and not aborted:
+            gateway.mark_result(upstream_model, cid, completed,
+                                int((time.time() - t0) * 1000) if completed else None,
+                                kind=None if completed else "stream_break", source="real")
         store.log_usage(cid, name, model, usage.get("prompt_tokens", 0),
                         usage.get("completion_tokens", 0),
-                        int((time.time() - t0) * 1000), True,
+                        int((time.time() - t0) * 1000), completed,
+                        error=("客户端断开" if aborted else (err[:200] if err else None)),
                         upstream_model=upstream_model)
 
 
@@ -602,26 +692,26 @@ async def model_test(req: Request):
             last_err = f"HTTP {r.status_code}: {r.text[:200]}"
             gateway.note_ratelimit_headers(ch["id"], upstream_model, r.headers)
             if r.status_code == 429:
-                label429, secs429, _ = gateway.classify_429(r.text[:300])
-                # 「每天额度用完」型 429：账户级限额，整个渠道所有模型一起受限，冷却到明天
-                if label429 == "daily":
-                    gateway.mark_channel_quota_exhausted(ch["id"], "当日额度用完")
-                    gateway.mark_model_status(model, False, "当日额度用完，账户级限额",
-                                              ch.get("name"), state="limited")
-                    gateway.mark_result(upstream_model, ch["id"], False, kind="rate_limit",
-                                        cooldown_seconds=secs429)
-                    return {"available": False, "skipped": True, "channel": ch.get("name"),
-                            "error": "当日额度用完 (HTTP 429)，整个渠道冷却到明天"}
-                # 余额不足型 429（正文含"余额/充值/购买"等，或平台确认余额≤0）→ 硬不可用，等也不会恢复
-                if gateway.is_permanent_failure(429, r.text[:300]) or (
-                        label429 == "daily" and _quota_exhausted(ch["id"])):
+                label429, secs429, text429 = gateway.classify_429(
+                    r.text[:300], ch.get("type"), _parse_retry_after(r.headers))
+                # 余额/额度不足（付费渠道）→ 硬不可用，等也不会恢复
+                if label429 == "paid_balance" or (_quota_exhausted(ch["id"]) and label429 != "minute"):
                     gateway.mark_channel_down(upstream_model, ch["id"],
                                               "账户余额不足，需充值 (HTTP 429)")
                     gateway.mark_model_status(model, False, "账户余额不足，需充值",
                                               ch.get("name"), state="down")
-                    gateway.mark_result(upstream_model, ch["id"], False, kind="rate_limit")
+                    gateway.mark_result(upstream_model, ch["id"], False, kind="balance")
                     return {"available": False, "skipped": True, "channel": ch.get("name"),
                             "error": "余额不足 (HTTP 429)，按不可用处理"}
+                # 免费额度用完：账户级限额，整个渠道所有模型一起受限，冷却到明天
+                if label429 == "free_daily":
+                    gateway.mark_channel_quota_exhausted(ch["id"], text429)
+                    gateway.mark_model_status(model, False, text429,
+                                              ch.get("name"), state="limited")
+                    gateway.mark_result(upstream_model, ch["id"], False, kind="rate_limit",
+                                        cooldown_seconds=secs429)
+                    return {"available": False, "skipped": True, "channel": ch.get("name"),
+                            "error": "免费额度用完 (HTTP 429)，整个渠道冷却到明天"}
                 gateway.note_channel_429(ch["id"], upstream_model,
                                          _parse_retry_after(r.headers))
                 gateway.mark_result(upstream_model, ch["id"], False,
@@ -636,6 +726,7 @@ async def model_test(req: Request):
                 await asyncio.sleep(1.5)
                 continue
             # 400/402/403/404/405（付费/权限/参数/已下线）+ 余额不足 429 → 永久不可用，记 down
+            # 例外：地域封锁是本机网络问题（is_permanent_failure 内部已排除），按 limited 处理
             hard = gateway.is_permanent_failure(r.status_code, r.text[:200])
             if hard:
                 gateway.mark_channel_down(upstream_model, ch["id"], last_err)
@@ -687,22 +778,23 @@ async def embeddings(request: Request):
         try:
             r = await shared_client.post(url, json=body, headers=headers)
         except Exception as e:
-            _fail(cid, name, upstream_model, model, t0, errors, f"connect: {e}")
+            _fail(cid, name, upstream_model, model, t0, errors, f"connect: {e}", exc=e)
             continue
         latency = int((time.time() - t0) * 1000)
         if r.status_code != 200:
             _classify(cid, name, upstream_model, model, t0, errors,
-                      r.status_code, r.text[:300], _parse_retry_after(r.headers))
+                      r.status_code, r.text[:300], _parse_retry_after(r.headers),
+                      ch_type=ch.get("type"))
             continue
         try:
             data = r.json()
         except Exception:
-            gateway.mark_result(upstream_model, cid, False, latency)
+            gateway.mark_result(upstream_model, cid, False, latency, kind="bad_json", source="real")
             store.log_usage(cid, name, model, 0, 0, latency, False, "响应不是 JSON",
                             upstream_model=upstream_model)
             errors.append(f"{name}: 响应不是 JSON")
             continue
-        gateway.mark_result(upstream_model, cid, True, latency)
+        gateway.mark_result(upstream_model, cid, True, latency, source="real")
         u = data.get("usage") or {}
         store.log_usage(cid, name, model, u.get("prompt_tokens", 0), 0, latency, True,
                         upstream_model=upstream_model)

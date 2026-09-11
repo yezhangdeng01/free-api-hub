@@ -112,6 +112,23 @@ def log_usage(channel_id, channel_name, model, prompt_tokens, completion_tokens,
              1 if success else 0, error or None, upstream_model or ""))
 
 
+def recent_outcomes(days: int = 120, per_pair: int = 10) -> list:
+    """每个 (上游模型, 渠道) 最近 per_pair 次的成败（新→旧），供回填稳定分窗口用。
+
+    模型名优先取 `upstream_model`（真实上游名，与稳定分的 key 一致），没有才退回 `model`。
+    用窗口函数在 SQL 里取「每组最近 N 条」，Python 侧按顺序取即可。"""
+    since = time.time() - days * 86400
+    with _conn() as con:
+        return con.execute(
+            "SELECT m, channel_id, success, COALESCE(error, ''), ts FROM ("
+            "  SELECT COALESCE(NULLIF(upstream_model, ''), model) AS m, channel_id, success,"
+            "         error, ts, ROW_NUMBER() OVER ("
+            "           PARTITION BY COALESCE(NULLIF(upstream_model, ''), model), channel_id"
+            "           ORDER BY ts DESC) AS rn"
+            "  FROM usage WHERE ts >= ?)"
+            " WHERE rn <= ? ORDER BY m, channel_id, ts DESC", (since, per_pair)).fetchall()
+
+
 def distinct_models(days: int = 7) -> list:
     """近期成功调用过的模型（用于主动探测，把探测成本压在真实使用过的模型上）"""
     since = time.time() - days * 86400

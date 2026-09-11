@@ -476,6 +476,7 @@ const STRAT_SPEC = {
 };
 const OTHER_DIMS = [[1, 2], [0, 2], [0, 1]];                // 主维度 → 剩下两维
 const CAP_NORM = {3: 0.76, 2: 0.28, 1: 0.10};               // 无榜分时的档位锚点（同后端 _TIER_ANCHOR）
+const STAB_PRIOR = 0.7;                                     // 稳定维先验（同后端 _SCORE_PRIOR）
 // 模型分 = 「该模型最优渠道」的策略分。逐渠道算完取最大，不能用
 // 「稳定分取最好的渠道 + 延迟取最快的渠道」拼分——那会拼出一个不存在的组合。
 function compScore(m){
@@ -490,14 +491,20 @@ function compScore(m){
   let best = -1;
   for (const c of pool){
     const lat = c.latency_ms;
-    const dims = [cap, c.eff_score ?? 0.7,
+    // 稳定维：null = 该渠道还没有真实调用样本（后端 stab_of 返回 None）。
+    // 加权策略（均衡）里把它剔除、权重归一给另外两维——与后端 _score_dims 完全同口径：
+    // 不让一个假的 0.7 先验干扰排序，有真实数据了再以完整权重生效。
+    const dims = [cap, (c.stab ?? null),
                   (lat != null && isFinite(lat)) ? 400 / (400 + lat) : 0];
     let v;
     if (spec.weights){
-      v = spec.weights[0] * dims[0] + spec.weights[1] * dims[1] + spec.weights[2] * dims[2];
+      const w = spec.weights;
+      v = (dims[1] == null) ? (w[0] * dims[0] + w[2] * dims[2]) / (w[0] + w[2])
+                            : w[0] * dims[0] + w[1] * dims[1] + w[2] * dims[2];
     } else {
       const o = OTHER_DIMS[spec.primary];
-      v = Math.floor(dims[spec.primary] / spec.band) + spec.tie[0] * dims[o[0]] + spec.tie[1] * dims[o[1]];
+      const at = k => (dims[k] == null ? STAB_PRIOR : dims[k]);   // 没数据 → 中性先验（同后端）
+      v = Math.floor(at(spec.primary) / spec.band) + spec.tie[0] * at(o[0]) + spec.tie[1] * at(o[1]);
     }
     if (v > best) best = v;
   }
@@ -609,8 +616,9 @@ function renderModels(){
     const u = m.usage24 || {};
     if (u.requests) chips.push(`<span class="tag-chip">24h ${u.requests} 次</span>`);
     // 来源渠道 chips（≤4 个与特点同一行，≥5 才换行；渠道名已短写）
+    // 百分比 = 近 N 次**真实调用**的成功率（后端 stab_raw；没真实样本就不显示）
     const srcChips = (m.channels || []).slice(0, 4).map(c =>
-      `<span class="tag-chip ${c.available?'ok':''}" title="${esc(c.channel_name)} · 可用率 ${Math.round((c.score??0.7)*100)}% · ${fmtLatency(c.latency_ms)}">${esc(chName(c.channel_name))}${(c.score!=null)?` ·${Math.round((c.score*100))}%`:''}</span>`).join("");
+      `<span class="tag-chip ${c.available?'ok':''}" title="${esc(c.channel_name)} · ${c.score!=null?`近 ${c.samples} 次真实调用成功率 ${Math.round(c.score*100)}%`:'暂无真实调用样本'} · ${fmtLatency(c.latency_ms)}">${esc(chName(c.channel_name))}${(c.score!=null)?` ·${Math.round((c.score*100))}%`:''}</span>`).join("");
     const more = (m.channels||[]).length > 4 ? `<span class="tag-chip">+${(m.channels||[]).length-4}</span>` : "";
     const chChips = (m.channels || []).length ? srcChips + more : "";
     const pinBtn = `<button class="btn${isPinned(m.id)?' pinned':''}" style="padding:4px 8px" title="收藏置顶（★=已收藏）" onclick="togglePin('${esc(m.id)}')">${isPinned(m.id)?'★':'☆'}</button>`;
