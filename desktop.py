@@ -225,7 +225,6 @@ def _tray_loop(port: int):
             os._exit(0)
 
         menu = pystray.Menu(
-            pystray.MenuItem("显示窗口", on_show, default=True),
             pystray.MenuItem("打开配置文件夹", on_settings),
             pystray.MenuItem("重启服务", on_restart),
             pystray.MenuItem("隐藏窗口", on_hide),
@@ -280,14 +279,34 @@ def _launch_log(msg: str):
 
 
 def _serve(port: int):
-    try:
-        # log_config=None：跳过 uvicorn 内部日志 dictConfig。
-        # pythonw（无控制台，sys.stderr 为 None）下它会在配置 formatter 时抛
-        # ValueError: Unable to configure formatter 'default'，直接禁用最稳。
-        uvicorn.run(app, host="127.0.0.1", port=port,
-                    log_level="warning", log_config=None)
-    except BaseException as e:  # 绑定失败等：pythonw 无控制台，必须落盘
-        _launch_log(f"uvicorn 异常退出: {type(e).__name__}: {e}")
+    # log_config=None：跳过 uvicorn 内部日志 dictConfig。
+    # pythonw（无控制台，sys.stderr 为 None）下它会在配置 formatter 时抛
+    # ValueError: Unable to configure formatter 'default'，直接禁用最稳。
+    #
+    # 端口占用重试：Windows 下 asyncio.create_server 默认 reuse_address=False，
+    # 重启时旧进程被杀但 webview 前端还保持 8787 活跃连接，进程退出后这些
+    # TCP 连接进入 TIME_WAIT（系统层面 15~60s 才真正释放），新进程立即
+    # bind 撞 [Errno 10048]，uvicorn sys.exit(3)，服务挂 → 前端 404。
+    # 这里重试（延迟递增）给 TIME_WAIT 释放窗口，最长约 30s。
+    import time as _time
+    for attempt in range(8):
+        try:
+            uvicorn.run(app, host="127.0.0.1", port=port,
+                        log_level="warning", log_config=None)
+            return  # 正常退出（被外部关闭）
+        except SystemExit as e:
+            # uvicorn 启动失败 sys.exit(STARTUP_FAILURE=3)。
+            # 端口 TIME_WAIT 重试：第一次直接试，之后延迟递增
+            if attempt < 7:
+                delay = 2.0 * (attempt + 1)
+                _launch_log(f"端口 {port} 占用（TIME_WAIT），{delay:.0f}s 后重试（第 {attempt + 2}/8 次）")
+                _time.sleep(delay)
+                continue
+            _launch_log(f"uvicorn 端口 {port} 重试 8 次仍失败，退出: {e}")
+            return
+        except BaseException as e:
+            _launch_log(f"uvicorn 异常退出: {type(e).__name__}: {e}")
+            return
 
 
 def main():
