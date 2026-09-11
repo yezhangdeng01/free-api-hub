@@ -14,9 +14,10 @@ ZHIPU_BALANCE_URL = "https://www.bigmodel.cn/api/biz/account/query-customer-acco
 async def fetch_models(client: httpx.AsyncClient, base_url: str, api_key: str) -> list:
     """拉取渠道的模型列表（OpenAI 兼容 /models）
 
-    顺带收割权威榜单分：OpenRouter 的返回里带
-    `benchmarks.artificial_analysis.intelligence_index`（Artificial Analysis 智能指数），
-    这是白拿的——不用额外申请密钥、不多发一次请求，喂给 capability 用它定能力档位。
+    顺带收割两样白拿的权威数据（OpenRouter 的返回里带，不用额外密钥、不多发请求）：
+
+    1. `benchmarks.artificial_analysis.intelligence_index` — Artificial Analysis 智能指数；
+    2. `architecture.input_modalities` — **是否支持图像输入**（比名字猜准得多）。
     """
     r = await client.get(
         base_url.rstrip("/") + "/models",
@@ -27,6 +28,7 @@ async def fetch_models(client: httpx.AsyncClient, base_url: str, api_key: str) -
     data = r.json()
     items = data.get("data", []) if isinstance(data, dict) else data
     ids, bench = [], {}
+    vision_ok, vision_no = set(), set()
     for it in items:
         if not isinstance(it, dict):
             if it:
@@ -40,10 +42,20 @@ async def fetch_models(client: httpx.AsyncClient, base_url: str, api_key: str) -
         v = aa.get("intelligence_index")
         if isinstance(v, (int, float)):
             bench[capability.norm_id(mid)] = v
+        arch = it.get("architecture") or {}
+        mods = arch.get("input_modalities") or arch.get("modality")
+        if mods:
+            mods = [mods] if isinstance(mods, str) else mods
+            low = " ".join(str(x).lower() for x in mods)
+            (vision_ok if "image" in low else vision_no).add(capability.norm_id(mid))
     if bench:
         info = capability.update_bench_scores(bench)
         logger.info("收割 AA 榜分 %d 个（累计 %d，智能阈值 %.1f / 中档阈值 %.1f）",
                     len(bench), info["n"], info["hi"], info["mid"])
+    if vision_ok or vision_no:
+        vin = capability.update_vision_models(vision_ok, vision_no)
+        logger.info("收割视觉能力 %d 支持 / %d 不支持（累计 %d / %d）",
+                    len(vision_ok), len(vision_no), vin["ok"], vin["no"])
     return sorted(set(ids))
 
 

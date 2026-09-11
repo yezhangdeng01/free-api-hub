@@ -61,7 +61,7 @@
   .light-dot.limited { background: var(--warn); box-shadow: 0 0 5px var(--warn); }
   .light-dot.down { background: var(--bad); }
   .tag-chip {
-    display: inline-block; padding: 1px 8px; border-radius: 9px;
+    display: inline-block; padding: 1px 6px; border-radius: 9px;
     font-size: 11px; background: var(--panel2); border: 1px solid var(--border);
     color: var(--muted); white-space: nowrap;
   }
@@ -125,16 +125,12 @@
           <button class="chip-btn warn-dot" id="show-limited-btn" title="暂时限流/冷却中的免费模型（黄点）">● 受限</button>
         </span>
         <span class="vdiv"></span>
-        <span style="display:flex; gap:6px" id="group-chips">
-          <button class="chip-btn" data-group="all" title="全部模型">全部</button>
-          <button class="chip-btn" data-group="vision" title="只看能看图的模型（顺序即 auto:vision 的实际切换顺序）">视觉</button>
-        </span>
-        <span class="vdiv"></span>
         <span style="display:flex; gap:6px" id="sort-chips">
           <button class="chip-btn" data-sort="balanced">均衡</button>
           <button class="chip-btn" data-sort="quality">智能优先</button>
           <button class="chip-btn" data-sort="stability">稳定优先</button>
           <button class="chip-btn" data-sort="speed">速度优先</button>
+          <button class="chip-btn" data-sort="vision" title="只看能看图的模型；顺序即 auto:vision 的实际切换顺序">视觉</button>
         </span>
         <span style="margin-left:auto; display:flex; gap:8px; align-items:center">
           <button class="btn" id="pg-prev">‹</button>
@@ -387,7 +383,7 @@ function renderGuide(){
 // ---- 模型（分页；排序与状态逻辑见下方 MODEL_STATE 区块） ----
 const PAGE = {size: 100, n: 0};
 // ---- 模型：状态/收藏/搜索语法/排序 ----
-const MODEL_STATE = {sort: "balanced", showOk: true, showLimited: true, group: "all"};
+const MODEL_STATE = {sort: "balanced", showOk: true, showLimited: true};
 // 收藏持久化在后端 config.json（overview.pinned），不依赖浏览器 localStorage
 function pinList(){ return overview?.pinned || []; }
 function isPinned(id){ return pinList().includes(id); }
@@ -419,26 +415,39 @@ async function migratePins(){
 function syncChips(){
   document.querySelectorAll("#sort-chips .chip-btn").forEach(b =>
     b.classList.toggle("active", b.dataset.sort === MODEL_STATE.sort));
-  document.querySelectorAll("#group-chips .chip-btn").forEach(b =>
-    b.classList.toggle("active", b.dataset.group === MODEL_STATE.group));
   $("#show-ok-btn").classList.toggle("active", MODEL_STATE.showOk);
   $("#show-limited-btn").classList.toggle("active", MODEL_STATE.showLimited);
 }
-// 分组：全部 / 视觉（视觉组 = auto:vision 的预览：只列能看图的模型，按视觉策略排序）
-document.querySelectorAll("#group-chips .chip-btn").forEach(b =>
-  b.onclick = () => { MODEL_STATE.group = b.dataset.group; syncChips(); renderModels(); });
 $("#show-ok-btn").onclick = () => { MODEL_STATE.showOk = !MODEL_STATE.showOk; syncChips(); renderModels(); };
 $("#show-limited-btn").onclick = () => { MODEL_STATE.showLimited = !MODEL_STATE.showLimited; syncChips(); renderModels(); };
+// 「视觉」也在这一排：它不是路由策略，只是「只看能看图的模型」视图（顺序 = auto:vision），
+// 所以不写回 route_strategy，避免把后端默认策略改成 vision。
 document.querySelectorAll("#sort-chips .chip-btn").forEach(b =>
   b.onclick = () => {
     MODEL_STATE.sort = b.dataset.sort;
-    if (overview){
-      if (!overview.settings) overview.settings = {};
-      overview.settings.route_strategy = MODEL_STATE.sort;
+    if (STRATEGIES[MODEL_STATE.sort]){
+      if (overview){
+        if (!overview.settings) overview.settings = {};
+        overview.settings.route_strategy = MODEL_STATE.sort;
+      }
+      api("/api/settings", {route_strategy: MODEL_STATE.sort}).catch(()=>{});
     }
     syncChips(); renderModels();
-    api("/api/settings", {route_strategy: MODEL_STATE.sort}).catch(()=>{});
   });
+
+// 渠道名短写：表格里名字短一点才不会挤成两行（完整名在 hover 里有）
+const CH_SHORT = {
+  "魔搭 ModelScope": "魔搭", "ModelScope": "魔搭", "HuggingFace Router": "HF",
+  "HuggingFace": "HF", "NVIDIA NIM": "NIM", "Google Gemini": "Gemini",
+  "智谱 GLM": "GLM", "Zhipu GLM": "GLM", "Agnes AI": "Agnes",
+};
+function chName(n){
+  if (!n) return "";
+  if (CH_SHORT[n]) return CH_SHORT[n];
+  if (/^[A-Za-z0-9._-]+ (?:AI|Router|API)$/.test(n)) return n.replace(/ (?:AI|Router|API)$/, "");
+  const m = n.match(/^([^A-Za-z]+)\s+[A-Za-z].*$/);          // "魔搭 ModelScope" → "魔搭"
+  return m ? m[1].trim() : n;
+}
 
 // 排序：收藏置顶 → 可用(ok) → 受限(limited) → 策略分 → 版本号 → 名称
 // 策略 = 主维度优先（按**容忍带宽**分档：「差得不多」就算同等）+ 档内再按另两维加权；
@@ -457,8 +466,8 @@ const CAP_NORM = {3: 0.76, 2: 0.28, 1: 0.10};               // 无榜分时的�
 // 模型分 = 「该模型最优渠道」的策略分。逐渠道算完取最大，不能用
 // 「稳定分取最好的渠道 + 延迟取最快的渠道」拼分——那会拼出一个不存在的组合。
 function compScore(m){
-  // 视觉分组下按视觉策略排序（= auto:vision 的实际顺序），其余按当前路由策略
-  const s = MODEL_STATE.group === "vision" ? "vision"
+  // 「视觉」视图按视觉策略排序（= auto:vision 的实际顺序），其余按当前路由策略
+  const s = MODEL_STATE.sort === "vision" ? "vision"
             : (overview?.settings?.route_strategy || "balanced");
   const spec = STRAT_SPEC[s] || STRAT_SPEC.balanced;
   const cap = m.cap_score ?? CAP_NORM[m.tier] ?? 0.28;      // 连续能力分（后端按 AA 榜分算好）
@@ -540,12 +549,12 @@ function renderModels(){
     tier: 2, channel_count: a.targets.length, channels: [], targets: a.targets }));
   const all = [...aliases, ...(overview?.models || [])].filter(m => m.status !== "down");
   // 视觉分组：只列能看图的模型（别名不算）
-  const inGroup = m => MODEL_STATE.group !== "vision" || !!m.vision;
+  const inGroup = m => MODEL_STATE.sort !== "vision" || !!m.vision;
   // 先算可见计数（未按 ok/受限 开关收窄，供 chip 文案与空态提示）
   const okN = all.filter(m => m.status === "ok" && inGroup(m) && kwMatch(m, tokens)).length;
   const limN = all.filter(m => m.status === "limited" && inGroup(m) && kwMatch(m, tokens)).length;
   const gh = $("#group-hint");
-  if (MODEL_STATE.group === "vision"){
+  if (MODEL_STATE.sort === "vision"){
     gh.style.display = "block";
     gh.innerHTML = "视觉分组：只列能看图的模型，顺序就是 <b>实际切换顺序</b>（能力优先，同档看稳定/速度）。"
       + 'Hermes 的「辅助视觉模型」填 <span class="mono click-copy" title="点击复制" '
@@ -578,23 +587,25 @@ function renderModels(){
       ? (m.test_ts ? `上次实测可调 ${fmtTime(m.test_ts)}` : "渠道健康、未做单模型实测")
       : (m.test_reason || "限流/冷却中，稍后可恢复");
     const stChip = st === "limited" ? '<span class="tag-chip" style="color:var(--warn); border-color:var(--warn)">受限</span>' : "";
-    // 特点 chips
+    // 特点 chips（档位与 AA 分合成一个 chip：一行里少占 ~50px，术语在 hover 里解释）
     const chips = [];
-    const aaTip = (m.aa != null) ? ` title="Artificial Analysis 智能指数 ${m.aa}"` : "";
-    chips.push(MODEL_TIERS[m.tier] ? `<span class="tag-chip ok"${aaTip}>${MODEL_TIERS[m.tier]}</span>` : `<span class="tag-chip"${aaTip}>中档</span>`);
-    if (m.aa != null) chips.push(`<span class="tag-chip" title="Artificial Analysis 智能指数（经 OpenRouter 榜单自动更新）">AA ${Number(m.aa).toFixed(1)}</span>`);
+    const tierTxt = MODEL_TIERS[m.tier] || "中档";
+    const aaTip = (m.aa != null)
+      ? ` title="档位 ${tierTxt} · Artificial Analysis 智能指数 ${Number(m.aa).toFixed(1)}（经 OpenRouter 榜单自动更新）"`
+      : ` title="档位 ${tierTxt}（无 AA 榜分，按家族/规模推断）"`;
+    chips.push(`<span class="tag-chip ok"${aaTip}>${tierTxt}${m.aa != null ? " " + Number(m.aa).toFixed(1) : ""}</span>`);
     chips.push(isFinite(lat) ? `<span class="tag-chip" title="响应延迟（流式请求为首字节时间 TTFT）">${fmtLatency(lat)}</span>` : `<span class="tag-chip">—</span>`);
-    if (m.vision) chips.push('<span class="tag-chip ok">视觉</span>');
+    if (m.vision) chips.push('<span class="tag-chip ok" title="支持图像输入（能看图）">👁</span>');
     if (m.context) chips.push(`<span class="tag-chip">${esc(m.context)}</span>`);
     const u = m.usage24 || {};
     if (u.requests) chips.push(`<span class="tag-chip">24h ${u.requests} 次</span>`);
-    // 来源渠道 chips（≤3 个与特点同一行，≥4 才换行）
+    // 来源渠道 chips（≤4 个与特点同一行，≥5 才换行；渠道名已短写）
     const srcChips = (m.channels || []).slice(0, 4).map(c =>
-      `<span class="tag-chip ${c.available?'ok':''}" title="可用率 ${Math.round((c.score??0.7)*100)}% · ${fmtLatency(c.latency_ms)}">${esc(c.channel_name)}${(c.score!=null)?` ·${Math.round((c.score*100))}%`:''}</span>`).join("");
+      `<span class="tag-chip ${c.available?'ok':''}" title="${esc(c.channel_name)} · 可用率 ${Math.round((c.score??0.7)*100)}% · ${fmtLatency(c.latency_ms)}">${esc(chName(c.channel_name))}${(c.score!=null)?` ·${Math.round((c.score*100))}%`:''}</span>`).join("");
     const more = (m.channels||[]).length > 4 ? `<span class="tag-chip">+${(m.channels||[]).length-4}</span>` : "";
     const chChips = (m.channels || []).length ? srcChips + more : "";
     const pinBtn = `<button class="btn${isPinned(m.id)?' pinned':''}" style="padding:4px 8px" title="收藏置顶（★=已收藏）" onclick="togglePin('${esc(m.id)}')">${isPinned(m.id)?'★':'☆'}</button>`;
-    const oneline = (m.channels||[]).length <= 3;
+    const oneline = (m.channels||[]).length <= 4;
     return `<tr>
       <td class="muted small" style="width:44px">${PAGE.n*PAGE.size+i+1}</td>
       <td>

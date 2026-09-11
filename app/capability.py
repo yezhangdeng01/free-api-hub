@@ -148,6 +148,31 @@ def bench_of(model_id: str):
     return _bench.get(norm_id(model_id))
 
 
+# ---- 视觉能力：同样从渠道 /models 白拿（OpenRouter 的 architecture.input_modalities）----
+# 名字启发式（下面的 _VISION）会漏掉大量真·多模态模型（Qwen3.5/3.6/3.8 全系、gemma-3/4、
+# GLM-5.3-Flash、MiniMax-M3、claude-fable-5、nova、kimi-k2.5…实测漏了 250+ 个），
+# 也会把 TTS/音频这类误标成视觉。所以：**有榜单/平台数据就用数据，没有才回退名字启发式**。
+_vision_ok: set = set()   # 归一化名：确认支持图像输入
+_vision_no: set = set()   # 归一化名：确认**不**支持（用于纠正启发式的误标，如 TTS）
+
+
+def update_vision_models(ok, no) -> dict:
+    """合并「支持/不支持图像输入」的模型名（归一化），返回计数便于日志"""
+    _vision_ok.update(ok or ())
+    _vision_no.update(no or ())
+    return {"ok": len(_vision_ok), "no": len(_vision_no)}
+
+
+def vision_known(model_id: str):
+    """True/False=平台数据明确；None=没数据（回退名字启发式）"""
+    nid = norm_id(model_id)
+    if nid in _vision_ok:
+        return True
+    if nid in _vision_no:
+        return False
+    return None
+
+
 def _family_version(model_id: str):
     """识别 (家族, 版本号)；Claude 的 3-5 / 4-6 折成 3.5 / 4.6"""
     for fam, rx in _FAMILY_PARSERS:
@@ -266,11 +291,16 @@ def tier_of(model_id: str, overrides: dict = None) -> int:
 
 
 # ---------------- 视觉/上下文启发式（模型详情用，非官方数据，仅推断） ----------------
+# 注意：**只在 `vision_known()` 没数据时才用它**（平台数据优先，见上）
 _VISION = [
     r"vision", r"-?vlx?(\b|-|$)", r"\.vl(\b|-|$)", r"omni", r"multimodal",
     r"gpt-4o(?!.*mini)", r"glm-4v", r"glm-5v", r"gemini-.*", r"qwen.*-?vl",
     r"llama.*vision", r"claude-3", r"grok-2?-?vision", r"moonshot.*-vl",
 ]
+# 名字里明确**不是**图像输入的（纯生成/语音类）：防止启发式把它们标成「视觉」
+_VISION_NEG = re.compile(
+    r"(?:^|[-_ .])(?:tts|lyria|music|audio|speech|whisper|dall|flux|sdxl|diffusion)"
+    r"(?:$|[-_ .])|image(?:-preview)?$", re.I)
 _CONTEXT_HINTS = [
     (r"2m|2,?000,?000|2097152", "2M"),
     (r"1m|1,?000,?000|1048576", "1M"),
@@ -283,12 +313,17 @@ _CONTEXT_HINTS = [
 
 
 def meta_of(model_id: str) -> dict:
-    """按模型名推断 [是否视觉 / 上下文档位]。推断仅供参考，勿当官方参数使用"""
-    vision = bool(model_id) and any(re.search(p, model_id, re.I) for p in _VISION)
+    """[是否视觉 / 上下文档位]。视觉优先用平台数据（vision_known），没数据才用名字启发式。
+
+    上下文仍然只能靠名字推断（渠道 /models 各平台返回的字段不统一），仅供参考。"""
+    known = vision_known(model_id) if model_id else None
+    if known is None:
+        known = bool(model_id) and not _VISION_NEG.search(model_id) \
+            and any(re.search(p, model_id, re.I) for p in _VISION)
     ctx = None
     if model_id:
         for pat, label in _CONTEXT_HINTS:
             if re.search(pat, model_id, re.I):
                 ctx = label
                 break
-    return {"vision": vision, "context": ctx}
+    return {"vision": known, "context": ctx}

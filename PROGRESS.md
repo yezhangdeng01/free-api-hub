@@ -94,12 +94,26 @@ OpenRouter 返回里的 `benchmarks.artificial_analysis.intelligence_index`—�
 - ⚠️ **收藏是硬置顶**：收藏的模型一律排在未收藏之前（组内才按策略分）。后果：`auto:quality` 下
   你收藏但能力弱的模型会先被试（例：收藏了 agnes-3.0-flash 就会先于未收藏的 gemini-3.8-flash）。
   想改成「不参与置顶」或「只在均衡策略下置顶」随时说。
-- **视觉分组**：`auto:vision` 只保留 `capability.meta_of(m)["vision"]` 为真的模型，再按视觉策略排。
-  用途：Hermes 的「辅助视觉模型」直接填 `auto:vision`，连不上自动换下一个能看图的。
-  ⚠️ 没有「视觉能力」专用榜单——这里用 AA 智能指数当**强弱代理**（强模型的视觉一般也强），
-  加上「能看图」硬门槛。若要精确控制顺序，用 `model_tiers` 显式覆盖（覆盖会改档位标签**并**
-  改排序分：覆盖档位 → 该档顶值，见 `_OVERRIDE_ANCHOR`）。
-- 界面「视觉」分组 chip = `auto:vision` 的预览（同一套排序），提示行里点一下可复制 `auto:vision`。
+- **视觉分组**：`auto:vision` 只保留「能看图」的模型，再按视觉策略排。用途：Hermes 的「辅助视觉模型」
+  直接填 `auto:vision`，连不上自动换下一个能看图的。
+  - **视觉标记来源**：OpenRouter `/models` 的 `architecture.input_modalities` 里有没有 `image`
+    （白拿，与 AA 榜分同一次请求）→ `capability.update_vision_models(支持集, 不支持集)`；
+    **平台数据优先**，没有数据才回退名字启发式（`_VISION` + `_VISION_NEG`）。
+    实测你渠道 750 个模型：视觉标记 **111 → 359**（补上 Qwen3.5/3.6/3.8 全系、claude-opus-4.5/haiku-4.5/
+    fable-5、nova 全系、GLM-5.3-Flash、MiniMax-M3、kimi-k2.5…；纠正 6 个 gemini TTS/音频的误标）。
+  - ⚠️ 没有「视觉能力」专用榜单——用 AA 智能指数当**强弱代理**（强模型的视觉一般也强）+「能看图」硬门槛。
+    要精确控制顺序，用 `model_tiers` 显式覆盖（覆盖 → 该档顶值，既改标签也改排序分）。
+
+### 表格排版（都是为了让「特点」列一行放得下）
+- 排序标签一行 5 个：`均衡 / 智能优先 / 稳定优先 / 速度优先 / 视觉`。「视觉」是**视图**不是路由策略，
+  点了不写回 `route_strategy`（提示行给出可复制的 `auto:vision`）。
+- **渠道名短写**（`chName()`）：魔搭 ModelScope→魔搭、HuggingFace Router→HF、NVIDIA NIM→NIM、
+  Google Gemini→Gemini、智谱 GLM→GLM、Agnes AI→Agnes；规则兜底：`xxx AI/Router/API` 去尾、
+  「中文 + 英文」保留中文。**完整名保留在 chip 的 hover 里**。
+- **档位与 AA 分合成一个 chip**（`智能 34.5`，之前是 `智能` + `AA 34.5` 两个）——一行少占 ~50px，术语放 hover。
+- 视觉标记用 `👁`（2 字符宽 vs `视觉` 省 ~30px）；`.tag-chip` 内边距 8px→6px。
+- 渠道 chips ≤4 个与特点同行，≥5 才换行，超出显示 `+N`。
+- 实测（1320px 宽窗口）：100 行**全部单行**，连「所有模型都标视觉」的最坏情况也不换行。
 
 ### 模型表格列
 `# / 模型 / 特点 / 收藏 / 测试未测`（表头不放「单次测试」文字，`thead th` 垂直居中，

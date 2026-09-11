@@ -162,6 +162,23 @@ def test_strategy_primary_with_tolerance_band(monkeypatch):
     assert 0 < b < 1, b
 
 
+def test_vision_from_platform_data(monkeypatch):
+    """视觉能力：平台数据（OpenRouter architecture.input_modalities）优先于名字启发式"""
+    from app import capability as cap
+    monkeypatch.setattr(cap, "_vision_ok", set())
+    monkeypatch.setattr(cap, "_vision_no", set())
+    cap.update_vision_models({"qwen/qwen3.5-9b"} | {cap.norm_id(x) for x in ("Qwen/Qwen3.5-9B",)},
+                             {cap.norm_id(x) for x in ("gemini-2.5-flash-preview-tts",)})
+    # 名字里没有 vl/vision，但平台说能看图 → 标视觉（Qwen3.5-9B 这类，实测漏标 250+ 个）
+    assert cap.meta_of("Qwen/Qwen3.5-9B")["vision"] is True
+    # 名字像视觉（gemini-*）但平台明确说不能 → 纠正为不标
+    assert cap.meta_of("gemini-2.5-flash-preview-tts")["vision"] is False
+    # 没数据才回退名字启发式；且 TTS/音频/绘图类不再误标
+    assert cap.meta_of("some-vl-model")["vision"] is True
+    assert cap.meta_of("plain-text-model")["vision"] is False
+    assert cap.meta_of("gemini-3-pro-image")["vision"] is False
+
+
 def test_auto_vision_filters_and_orders(monkeypatch):
     """auto:vision：候选**只含能看图**的模型，顺序 = 视觉策略（能力优先，同档看稳定/速度）"""
     from app import capability as cap
