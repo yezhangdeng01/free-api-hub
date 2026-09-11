@@ -814,6 +814,7 @@ def list_model_ids(cfg: dict) -> list:
 # 并在请求失败时自动跨模型切换（用户感觉是「无感 failover」）。
 RESERVED_AUTO = {
     "auto": "balanced",          # 默认 = 均衡（简短别名）
+    "auto:balanced": "balanced",  # 与视图名统一：每个视图都有 auto:<名> 写法（auto ≡ auto:balanced）
     "auto:quality": "quality",
     "auto:stability": "stability",
     "auto:speed": "speed",

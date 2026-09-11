@@ -277,7 +277,7 @@
               · 失败的「模型 × 渠道」组合进入冷却（时长按错误类型：连接失败短、限流/当天额度用完等冷却到明）；<br>
               · 健康检查自动定期运行（可在 config.json 调整），也可手动点「刷新全部」；<br>
               · 响应头 <span class="mono">X-Api-Hub-Channel</span> 会告诉你本次实际由哪个渠道服务；<br>
-              · 模型名填 <span class="mono">auto</span> / <span class="mono">auto:quality</span> / <span class="mono">auto:speed</span> / <span class="mono">auto:stability</span> / <span class="mono">auto:vision</span>
+              · 模型名填 <span class="mono">auto</span>（= <span class="mono">auto:balanced</span>，均衡） / <span class="mono">auto:quality</span> / <span class="mono">auto:speed</span> / <span class="mono">auto:stability</span> / <span class="mono">auto:vision</span>
                 时，网关会自动选最优真实模型并跨模型无感切换（按「模型」页里的排序顺序逐个尝试，
                 能用的排前面；<span class="mono">auto:vision</span> 只挑能看图的模型，适合当 Hermes 的辅助视觉模型）。</p>
       <h3 style="margin-top:14px">常用客户端配置（点击复制）</h3>
@@ -292,6 +292,28 @@ const $ = s => document.querySelector(s);
 const PRESETS = {zhipu:"智谱 GLM", openrouter:"OpenRouter", gemini:"Google Gemini", openai:"OpenAI", nim:"NVIDIA NIM", siliconflow:"硅基流动", groq:"Groq", cerebras:"Cerebras", mistral:"Mistral", cohere:"Cohere", modelscope:"魔搭 ModelScope", opencode:"OpenCode Zen", huggingface:"HuggingFace", together:"Together AI", zai:"智谱国际 Z.ai", agnes:"Agnes AI", custom:"自定义 (OpenAI 兼容)"};
 const STRATEGIES = {balanced:"均衡（稳定优先，兼顾速度）", quality:"智能优先（先强模型）", stability:"稳定优先（成功率最高）", speed:"速度优先（延迟最低）"};
 const MODEL_TIERS = {1:"轻量", 2:"中档", 3:"智能"};
+// 列表「视图」= 只决定排序展示，**不切换路由策略**（路由策略在 Agent 端按模型名选）。
+// 视图名 ↔ Agent 端模型名一一对应，且排序口径与对应策略完全同源。
+const VIEW_KEY = "apihub.view";
+const VIEW_ALIAS = {balanced:"auto", quality:"auto:quality", stability:"auto:stability",
+                    speed:"auto:speed", vision:"auto:vision"};
+const VIEW_DESC = {
+  balanced: "三项加权，不偏科",
+  quality: "先看能力（AA 分），同档看稳定/速度",
+  stability: "先看成功率，同档看能力/速度",
+  speed: "先看延迟，同档看能力/稳定",
+  vision: "只列能看图的模型，连不上自动换下一个",
+};
+function savedView(){
+  try { const v = localStorage.getItem(VIEW_KEY); if (VIEW_ALIAS[v]) return v; } catch(e){}
+  return null;
+}
+function setView(v){
+  MODEL_STATE.sort = VIEW_ALIAS[v] ? v : "balanced";
+  MODEL_STATE.viewInited = true;
+  try { localStorage.setItem(VIEW_KEY, MODEL_STATE.sort); } catch(e){}
+  syncChips(); renderModels();
+}
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 let overview = null, editingId = null;
 
@@ -420,20 +442,10 @@ function syncChips(){
 }
 $("#show-ok-btn").onclick = () => { MODEL_STATE.showOk = !MODEL_STATE.showOk; syncChips(); renderModels(); };
 $("#show-limited-btn").onclick = () => { MODEL_STATE.showLimited = !MODEL_STATE.showLimited; syncChips(); renderModels(); };
-// 「视觉」也在这一排：它不是路由策略，只是「只看能看图的模型」视图（顺序 = auto:vision），
-// 所以不写回 route_strategy，避免把后端默认策略改成 vision。
+// 「视觉」也在这一排：整排 chip 都是**视图**（只决定列表排序），不写回 route_strategy——
+// 路由策略在 Agent 端填模型名选（auto / auto:quality / …），这里点了只是「换一种看法」。
 document.querySelectorAll("#sort-chips .chip-btn").forEach(b =>
-  b.onclick = () => {
-    MODEL_STATE.sort = b.dataset.sort;
-    if (STRATEGIES[MODEL_STATE.sort]){
-      if (overview){
-        if (!overview.settings) overview.settings = {};
-        overview.settings.route_strategy = MODEL_STATE.sort;
-      }
-      api("/api/settings", {route_strategy: MODEL_STATE.sort}).catch(()=>{});
-    }
-    syncChips(); renderModels();
-  });
+  b.onclick = () => setView(b.dataset.sort));
 
 // 渠道名短写：表格里名字短一点才不会挤成两行（完整名在 hover 里有）
 const CH_SHORT = {
@@ -554,13 +566,16 @@ function renderModels(){
   const okN = all.filter(m => m.status === "ok" && inGroup(m) && kwMatch(m, tokens)).length;
   const limN = all.filter(m => m.status === "limited" && inGroup(m) && kwMatch(m, tokens)).length;
   const gh = $("#group-hint");
-  if (MODEL_STATE.sort === "vision"){
-    gh.style.display = "block";
-    gh.innerHTML = "视觉分组：只列能看图的模型，顺序就是 <b>实际切换顺序</b>（能力优先，同档看稳定/速度）。"
-      + 'Hermes 的「辅助视觉模型」填 <span class="mono click-copy" title="点击复制" '
-      + "onclick=\"copyText('auto:vision')\">auto:vision</span>，连不上会自动换下一个能看图的模型。";
-  } else {
-    gh.style.display = "none";
+  // 提示行常显：把「视图 ↔ Agent 端模型名」的对应关系摆明（视图只管排序，不管路由）
+  gh.style.display = "block";
+  {
+    const v = MODEL_STATE.sort;
+    gh.innerHTML = "视图只决定<b>列表顺序</b>，不切换路由策略；路由策略在 Agent 端填模型名选 → "
+      + `<span class="mono click-copy" title="点击复制" onclick="copyText('${VIEW_ALIAS[v]}')">${VIEW_ALIAS[v]}</span>`
+      + `（${VIEW_DESC[v]}）`
+      + (v === "vision"
+          ? "。Hermes 的「辅助视觉模型」就填它，连不上会自动换下一个能看图的模型。"
+          : "。同一视图名对应同一套排序口径，所以列表顺序 = 该策略的实际切换顺序。");
   }
   const filtered = all
     .filter(inGroup)
@@ -678,8 +693,13 @@ function renderSettings(){
   $("#set-strategy").value = cur;
   $("#set-probe").value = s.probe_used_models === false ? "0" : "1";
   $("#set-preempt").value = s.adaptive_preemption === false ? "0" : "1";
-  // 同步模型页排序 chip 状态
-  MODEL_STATE.sort = STRATEGIES[cur] ? cur : "balanced";
+  // 视图 chip：**只在首次加载时初始化**（用户上次选的视图 → 否则用当前路由策略）。
+  // 之后不再跟着 route_strategy 走——否则任何 loadOverview（比如单次测试完刷新）
+  // 都会把视图打回均衡（曾出现：视觉视图里点测试 → 跳回均衡）。
+  if (!MODEL_STATE.viewInited){
+    MODEL_STATE.sort = savedView() || (STRATEGIES[cur] ? cur : "balanced");
+    MODEL_STATE.viewInited = true;
+  }
   syncChips();
 }
 // 排序 chip 处理已在上方统一绑定

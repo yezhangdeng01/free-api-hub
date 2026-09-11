@@ -84,6 +84,8 @@ OpenRouter 返回里的 `benchmarks.artificial_analysis.intelligence_index`—�
 - 排序硬分组（在策略分之前）：收藏置顶 → 可用(ok) → 受限(limited) → 策略分 → 版本号 → 名称。
 
 ### auto 路由 = 按排序逐个试（「能用的排前面」在哪一层保证）
+`RESERVED_AUTO`：`auto` ≡ `auto:balanced`（均衡）/ `auto:quality` / `auto:stability` / `auto:speed` /
+`auto:vision`——每个界面视图名都有对应的 `auto:<名>` 写法，命名与界面统一。
 `/v1/chat/completions` 收到 `auto` / `auto:quality` / `auto:stability` / `auto:speed` / `auto:vision`
 时走 `candidates_for_auto(strategy, cfg)`，然后 **for 循环逐个尝试**（失败就冷却该组合并试下一个）。
 所以「能用的排前面」是在**候选层**保证的：冷却中 / 渠道熔断 / 429 预判 / 模型级 down 的
@@ -105,8 +107,15 @@ OpenRouter 返回里的 `benchmarks.artificial_analysis.intelligence_index`—�
     要精确控制顺序，用 `model_tiers` 显式覆盖（覆盖 → 该档顶值，既改标签也改排序分）。
 
 ### 表格排版（都是为了让「特点」列一行放得下）
-- 排序标签一行 5 个：`均衡 / 智能优先 / 稳定优先 / 速度优先 / 视觉`。「视觉」是**视图**不是路由策略，
-  点了不写回 `route_strategy`（提示行给出可复制的 `auto:vision`）。
+- 排序标签一行 5 个：`均衡 / 智能优先 / 稳定优先 / 速度优先 / 视觉`。
+  **整排 chip 都是「视图」= 只决定列表排序，不切换路由策略**（路由策略在 Agent 端按模型名选，
+  `auto` / `auto:quality` / …）。点 chip **不发** `/api/settings`；视图选择存 localStorage
+  （`apihub.view`），刷新后保持；首次打开若没有记录，则用当前 `route_strategy` 当默认视图。
+  视图名与 Agent 端模型名一一对应（`VIEW_ALIAS`），排序口径与对应策略同源，所以**列表顺序 =
+  该策略的实际切换顺序**；提示行常显当前视图对应的模型名（点一下可复制）。
+  - 坑：`renderSettings()` 每次 `loadOverview()` 都会跑，早先在里面无条件
+    `MODEL_STATE.sort = route_strategy` → 在视觉视图里点「测试」（测完会 loadOverview）就被打回均衡。
+    现在改成**只在首次加载时初始化**（`MODEL_STATE.viewInited`）。
 - **渠道名短写**（`chName()`）：魔搭 ModelScope→魔搭、HuggingFace Router→HF、NVIDIA NIM→NIM、
   Google Gemini→Gemini、智谱 GLM→GLM、Agnes AI→Agnes；规则兜底：`xxx AI/Router/API` 去尾、
   「中文 + 英文」保留中文。**完整名保留在 chip 的 hover 里**。
