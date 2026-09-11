@@ -67,6 +67,7 @@ def _show_window(initial_hidden: bool = False):
     #   getattr(w, "destroyed", True) 恒为 True，导致每点一次托盘就多一个窗口）
     if w is not None and w in webview.windows:
         w.show()
+        _bring_to_front(w)
         return w
     w = webview.create_window(
         "API Hub · 大模型聚合网关", f"http://127.0.0.1:{cfgmod.load_config()['port']}",
@@ -92,6 +93,62 @@ def window_is_destroyed():
     import webview
     w = _window_ref["w"]
     return w is None or w not in webview.windows
+
+
+def _bring_to_front(w):
+    """把窗口可靠地置前并聚焦。
+
+    Windows 前台锁会拦截后台线程（如 pystray 回调）的 Activate()，导致
+    任务栏图标抖动但窗口不上浮。用 Win32 AttachThreadInput 把当前线程挂接到
+    前台窗口所属线程，即可让 SetForegroundWindow 生效（微软允许的破解方式）。
+    """
+    import ctypes
+    from ctypes import wintypes
+    try:
+        hwnd = int(w.native.Handle)
+    except Exception:
+        try:
+            w.show()
+        except Exception:
+            pass
+        return
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.BringWindowToTop.argtypes = [wintypes.HWND]
+    user32.BringWindowToTop.restype = wintypes.BOOL
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    # 1) 最小化则先恢复
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)   # SW_RESTORE
+    else:
+        user32.ShowWindow(hwnd, 5)   # SW_SHOW
+
+    # 2) 挂接到前台线程破解前台锁，再设前台
+    fg = user32.GetForegroundWindow()
+    cur_tid = kernel32.GetCurrentThreadId()
+    fg_pid = wintypes.DWORD()
+    fg_tid = user32.GetWindowThreadProcessId(fg, ctypes.byref(fg_pid))
+    if fg_tid and fg_tid != cur_tid:
+        user32.AttachThreadInput(cur_tid, fg_tid, True)
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+        user32.AttachThreadInput(cur_tid, fg_tid, False)
+    else:
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
 
 
 def _launch_cmd() -> list[str]:
@@ -137,22 +194,13 @@ def _tray_loop(port: int):
             _show_window()
 
         def on_settings(icon, item):
-            # 设置页即「渠道」标签里的「网关设置」卡片：唤起窗口并切到该标签。
-            # 切换放到独立线程：evaluate_js 会等页面就绪（最多 20s），
-            # 若在 pystray 回调线程里同步执行会卡住托盘菜单。
-            _show_window()
-
-            def _goto_channels():
-                w = _window_ref["w"]
-                if w is None:
-                    return
-                try:
-                    w.evaluate_js(
-                        "document.querySelector('nav button[data-tab=\"channels\"]').click()")
-                except Exception:
-                    pass  # 页面未就绪时忽略，窗口已显示用户可手动点
-
-            threading.Thread(target=_goto_channels, daemon=True).start()
+            # 打开 api-hub 目录（config.json / data 数据文件所在地），
+            # 便于手动改 config.json（端口、model_tiers 能力档位覆盖等），
+            # 或查看 data/api-hub.log / launch.log。只做前端做不到的事。
+            try:
+                os.startfile(cfgmod.ROOT)  # type: ignore[attr-defined]  # Windows 脚本
+            except Exception as e:
+                _launch_log(f"打开配置目录失败: {e}")
 
         def on_restart(icon, item):
             _restart()
@@ -178,7 +226,7 @@ def _tray_loop(port: int):
 
         menu = pystray.Menu(
             pystray.MenuItem("显示窗口", on_show, default=True),
-            pystray.MenuItem("设置", on_settings),
+            pystray.MenuItem("打开配置文件夹", on_settings),
             pystray.MenuItem("重启服务", on_restart),
             pystray.MenuItem("隐藏窗口", on_hide),
             pystray.MenuItem("开机自启", on_autostart,
