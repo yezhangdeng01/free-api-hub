@@ -43,6 +43,8 @@
   .btn.primary:hover { background: var(--accent); }
   .btn.pinned { color: var(--warn); border-color: var(--warn); font-weight: 700; }
   .btn.pinned:hover { color: var(--warn); }
+  .btn.mini { padding: 2px 7px; font-size: 11.5px; border-radius: 5px; }
+  th .th-col { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
   .vdiv { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
   .chip-btn {
     background: var(--panel2); color: var(--muted);
@@ -130,14 +132,17 @@
           <button class="chip-btn" data-sort="speed">速度优先</button>
         </span>
         <span style="margin-left:auto; display:flex; gap:8px; align-items:center">
-          <button class="btn" id="pg-test-all" title="对所有未测试模型各发一次 1 token 探测">测试未测</button>
           <button class="btn" id="pg-prev">‹</button>
           <span class="muted small" id="pg-info"></span>
           <button class="btn" id="pg-next">›</button>
         </span>
       </div>
       <table>
-        <thead><tr><th style="width:44px">#</th><th>模型</th><th>特点</th><th style="width:92px">操作</th></tr></thead>
+        <thead><tr><th style="width:44px">#</th><th>模型</th><th>特点</th>
+          <th style="width:74px; text-align:center">收藏</th>
+          <th style="width:128px"><div class="th-col"><span>单次测试</span>
+            <button class="btn mini" id="pg-test-all" title="对所有未测试模型各发一次 1 token 探测">测试未测</button></div></th>
+        </tr></thead>
         <tbody id="model-rows"></tbody>
       </table>
       <div class="empty" id="model-empty" style="display:none"></div>
@@ -433,13 +438,23 @@ const STRAT_W = {
   speed:     [0.10, 0.25, 0.65],   // 速度优先
 };
 const CAP_NORM = {3: 1.0, 2: 0.6, 1: 0.25};
+// 模型分 = 「该模型最优渠道」的综合分。逐渠道算完取最大，不能用
+// 「稳定分取最好的渠道 + 延迟取最快的渠道」拼分——那会拼出一个不存在的组合。
+// 与后端 _model_composite / _composite(候选) 同口径，保证「列表顺序 = 实际选用顺序」。
 function compScore(m){
   const s = overview?.settings?.route_strategy || "balanced";
   const w = STRAT_W[s] || STRAT_W.balanced;
   const cap = CAP_NORM[m.tier] ?? 0.6;
-  const lat = bestLat(m);
-  const spd = isFinite(lat) ? 400 / (400 + lat) : 0;
-  return w[0] * cap + w[1] * bestScore(m) + w[2] * spd;
+  const chans = m.channels || [];
+  const pool = chans.filter(c => c.available).length ? chans.filter(c => c.available) : chans;
+  let best = 0;
+  for (const c of pool){
+    const lat = c.latency_ms;
+    const spd = (lat != null && isFinite(lat)) ? 400 / (400 + lat) : 0;
+    const v = w[0] * cap + w[1] * (c.score ?? 0.7) + w[2] * spd;
+    if (v > best) best = v;
+  }
+  return best;
 }
 function modelSort(a, b){
   const pa = isPinned(a.id), pb = isPinned(b.id);
@@ -468,7 +483,6 @@ function _lastVersion(s){
   return val;
 }
 function bestLat(m){ return Math.min(...(m.channels||[]).filter(c=>c.available).map(c=>c.latency_ms ?? Infinity)); }
-function bestScore(m){ return Math.max(...(m.channels||[]).map(c=>c.score ?? 0)); }
 
 // 搜索语法：裸词匹配模型名；provider:x 筛渠道；v: 筛视觉；t:3 筛档位
 function kwMatch(m, tokens){
@@ -551,7 +565,8 @@ function renderModels(){
       </td>
       <td><div class="small" style="display:flex; gap:5px; flex-wrap:wrap">${chips.join("")}${oneline ? (chChips ? '<span class="tag-sep"></span>' + chChips : "") : ""}</div>
           ${(!oneline && chChips) ? '<div class="small" style="display:flex; gap:5px; flex-wrap:wrap; margin-top:6px">'+chChips+'</div>' : ''}</td>
-      <td style="white-space:nowrap"><span style="display:inline-flex; gap:6px">${pinBtn}<button class="btn" onclick="testModel('${esc(m.id)}', this)" ${m.isAlias?'disabled':''}>测试</button></span></td>
+      <td style="text-align:center">${pinBtn}</td>
+      <td style="white-space:nowrap"><button class="btn" onclick="testModel('${esc(m.id)}', this)" ${m.isAlias?'disabled':''}>测试</button></td>
     </tr>`;
   }).join("");
   // 测试台模型下拉：只列「当前可调」模型，按当前路由策略排序

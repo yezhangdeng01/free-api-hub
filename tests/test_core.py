@@ -62,7 +62,66 @@ def test_tier_overrides():
     assert capability.tier_of("custom-xyz", {"bad:": 5}) == 2  # 非法覆盖忽略
 
 
+def test_tier_scale_not_generation():
+    """2026-09 修的那批「名不符实」：轻量只由规模决定，代际只降一档。"""
+    # 前沿家族的「同代加速档」不是轻量（曾把 deepseek-v4-flash 标成轻量）
+    assert capability.tier_of("deepseek-ai/deepseek-v4-flash-0731") == 2
+    assert capability.tier_of("deepseek-v4-flash") == 2
+    # 无名家族：光凭 super/字面不再拿智能；真·超大规模才算智能
+    assert capability.tier_of("nvidia/nemotron-3-super-120b-a12b:free") == 2
+    assert capability.tier_of("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B") == 3
+    assert capability.tier_of("nvidia/nemotron-3.5-lightning-30b-a3b") == 2
+    # 同代 flash：gemini/glm 的 flash 是同代主力 → 智能；flash-lite 仍轻量
+    assert capability.tier_of("models/gemini-3.6-flash") == 3
+    assert capability.tier_of("models/gemini-3.5-flash-lite") == 1
+    # 名字里写明 10~200B → 封顶中档（同代 ≠ 同尺寸）
+    assert capability.tier_of("Qwen/Qwen3-14B") == 2
+    assert capability.tier_of("Qwen/Qwen3.8-27B") == 2
+    # 非对话模型（图片/视频/向量/翻译/安全）→ 轻量，不占智能档
+    assert capability.tier_of("google/gemini-3-pro-image") == 1
+    assert capability.tier_of("agnes-video-2.5-fast") == 1
+    assert capability.tier_of("Qwen/Qwen3-Embedding-0.6B") == 1
+    assert capability.tier_of("nvidia/riva-translate-4b-instruct-v2") == 1
+    assert capability.tier_of("nvidia/llama-3.1-nemotron-safety-guard-8b-v3") == 1
+
+
+def test_family_version_not_polluted_by_params():
+    """家族版本号解析不能被参数量污染：Qwen-14B 不是「qwen 第 14 代」。"""
+    from app import capability as cap
+    cap._observed_frontier.clear()
+    cap.update_frontier(["deepseek-ai/DeepSeek-R1-Distill-Qwen-14B", "Qwen/Qwen3.8-2.4T-A95B"])
+    assert cap._observed_frontier["qwen"] == 3.8, cap._observed_frontier
+    assert capability.tier_of("Qwen/Qwen3-235B-A22B") == 3   # ≥200B 仍是智能
+    cap._observed_frontier.clear()
+
+
+def test_model_composite_takes_best_single_channel():
+    """模型分必须取自**同一条渠道**：不能「稳定分来自 A + 延迟来自 B」拼出不存在的组合。"""
+    m = {"tier": 3, "channels": [
+        {"available": True, "score": 1.0, "latency_ms": 5000},   # 很稳但很慢
+        {"available": True, "score": 0.1, "latency_ms": 100},    # 很快但很不稳
+    ]}
+    got = gateway._model_composite(m, "speed")
+    fast = 0.10 * 1.0 + 0.25 * 0.1 + 0.65 * (400 / 500)         # 快渠道那条
+    assert abs(got - fast) < 1e-9, got
+    mixed = 0.10 * 1.0 + 0.25 * 1.0 + 0.65 * (400 / 500)        # 旧口径的「拼分」
+    assert got < mixed
+    assert gateway._model_composite({"tier": 2, "channels": []}, "balanced") == 0.0
+
+
 # ---------------- gateway：评分、冷却、别名、路由策略 ----------------
+def test_model_view_latency_prefers_model_stat():
+    """界面里的延迟 = 该模型在该渠道的实测延迟，没实测过才退回渠道健康检查延迟
+    （与 _composite 同口径，否则界面顺序与真实选路对不上）。"""
+    _reset()
+    ch = _chan("c1", ["m1"], latency=1800)
+    gateway.stats[("m1", "c1")] = {"score": 0.9, "latency": 250}
+    entry = gateway.model_view(_cfg([ch]))[0]["channels"][0]
+    assert entry["latency_ms"] == 250 and entry["score"] == 0.9
+    gateway.stats.clear()
+    assert gateway.model_view(_cfg([ch]))[0]["channels"][0]["latency_ms"] == 1800
+
+
 def test_mark_result_cooldown_kinds():
     import time as _t
     _reset()

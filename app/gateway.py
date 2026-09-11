@@ -528,20 +528,23 @@ _SPEED_K = 400.0  # 400/(400+ms) 把延迟映射到 0~1（400ms 为 0.5）
 
 
 def _model_composite(m: dict, strategy: str) -> float:
-    """模型级综合分（用于 /v1/models 列表、模型视图排序，与 FE compScore 对齐）
+    """模型级综合分 = 该模型**最优渠道**的综合分（用于 /v1/models 排序）
 
-    m 是 model_view() 输出的字典（含 tier / channels / status / test_reason / ...）。"""
+    与 candidates_for 的候选排序（_composite 单渠道版）同口径——这样「/v1/models 里
+    排前面的」就是「auto 实际会先用到的」。旧版把「稳定分取最好的渠道、延迟取最快的
+    渠道」分开取值，会拼出一个任何一次请求都拿不到的组合。"""
     wcap, wstab, wspd = _STRATEGY_WEIGHTS.get(strategy, _STRATEGY_WEIGHTS["balanced"])
     cap = _CAP_BY_TIER.get(m.get("tier") or 2, 0.6)
-    score, lat = 0.0, float("inf")
-    for c in m.get("channels") or []:
-        if c.get("score") and c["score"] > score:
-            score = c["score"]
-        if c.get("available") and c.get("latency_ms") and c["latency_ms"] < lat:
-            lat = c["latency_ms"]
-    score = score or 0.7
-    speed = _SPEED_K / (_SPEED_K + lat) if lat < 1e8 else 0.0
-    return wcap * cap + wstab * score + wspd * speed
+    chans = m.get("channels") or []
+    pool = [c for c in chans if c.get("available")] or chans
+    best = 0.0
+    for c in pool:
+        lat = c.get("latency_ms")
+        speed = _SPEED_K / (_SPEED_K + lat) if lat else 0.0
+        cand = wcap * cap + wstab * (c.get("score") or 0.7) + wspd * speed
+        if cand > best:
+            best = cand
+    return best
 
 
 import re as _re_ver  # 与 FE _lastVersion 对齐：剥 -\d+[bB]$ 取末位数字
@@ -647,7 +650,9 @@ def model_view(cfg: dict) -> list:
                 "in_cooldown": in_cool or ch_cool,
                 "down": ch_down,
                 "preempted": preempted,
-                "latency_ms": cs.latency_ms,
+                # 延迟优先用「该模型在该渠道的实测延迟」，没实测过才退回渠道健康检查延迟
+                # ——与 _composite(候选) / FE compScore 同一口径，否则界面顺序会与真实选路不符
+                "latency_ms": s["latency"] or cs.latency_ms,
                 "score": s["score"],
             })
     models = []
