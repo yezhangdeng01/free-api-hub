@@ -38,12 +38,16 @@ def init():
             latency_ms INTEGER DEFAULT 0,
             success INTEGER DEFAULT 1,
             error TEXT,
-            upstream_model TEXT DEFAULT ''
+            upstream_model TEXT DEFAULT '',
+            cancelled INTEGER DEFAULT 0
         )""")
         # 兼容老库：缺列就补（PUT request 实际命中模型，用于 auto* 路由的归因）
         cols = [r[1] for r in con.execute("PRAGMA table_info(usage)").fetchall()]
         if "upstream_model" not in cols:
             con.execute("ALTER TABLE usage ADD COLUMN upstream_model TEXT DEFAULT ''")
+        # cancelled：客户端主动断开（用户点停止 / 客户端超时）。上游没错，不该算失败
+        if "cancelled" not in cols:
+            con.execute("ALTER TABLE usage ADD COLUMN cancelled INTEGER DEFAULT 0")
 
 
 # ---------------- 模型可用性状态持久化（重启不丢） ----------------
@@ -102,27 +106,31 @@ def model_usage_24h() -> dict:
 
 
 def log_usage(channel_id, channel_name, model, prompt_tokens, completion_tokens,
-              latency_ms, success, error=None, upstream_model=""):
+              latency_ms, success, error=None, upstream_model="", cancelled=False):
     with _lock, _conn() as con:
         con.execute(
             "INSERT INTO usage (ts, channel_id, channel_name, model, prompt_tokens,"
-            " completion_tokens, latency_ms, success, error, upstream_model) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " completion_tokens, latency_ms, success, error, upstream_model, cancelled)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), channel_id, channel_name, model,
              prompt_tokens or 0, completion_tokens or 0, latency_ms or 0,
-             1 if success else 0, error or None, upstream_model or ""))
+             1 if success else 0, error or None, upstream_model or "",
+             1 if cancelled else 0))
 
 
 def recent_outcomes(days: int = 120, per_pair: int = 10) -> list:
     """每个 (上游模型, 渠道) 最近 per_pair 次的成败（新→旧），供回填稳定分窗口用。
 
     模型名优先取 `upstream_model`（真实上游名，与稳定分的 key 一致），没有才退回 `model`。
-    用窗口函数在 SQL 里取「每组最近 N 条」，Python 侧按顺序取即可。"""
+    用窗口函数在 SQL 里取「每组最近 N 条」，Python 侧按顺序取即可。
+    返回元组最后一位是 `cancelled`：客户端主动中断（用户点停止/客户端超时）不是模型的账，
+    回填时必须跳过，否则会把它当成一次失败灌进稳定分窗口。"""
     since = time.time() - days * 86400
     with _conn() as con:
         return con.execute(
-            "SELECT m, channel_id, success, COALESCE(error, ''), ts FROM ("
+            "SELECT m, channel_id, success, COALESCE(error, ''), ts, cancelled FROM ("
             "  SELECT COALESCE(NULLIF(upstream_model, ''), model) AS m, channel_id, success,"
-            "         error, ts, ROW_NUMBER() OVER ("
+            "         error, ts, COALESCE(cancelled, 0) AS cancelled, ROW_NUMBER() OVER ("
             "           PARTITION BY COALESCE(NULLIF(upstream_model, ''), model), channel_id"
             "           ORDER BY ts DESC) AS rn"
             "  FROM usage WHERE ts >= ?)"
@@ -142,25 +150,34 @@ def recent(limit: int = 50, offset: int = 0) -> dict:
     with _conn() as con:
         logs = [dict(r) for r in con.execute(
             "SELECT id, ts, channel_name, model, upstream_model,"
-            " prompt_tokens, completion_tokens, latency_ms, success, error"
+            " prompt_tokens, completion_tokens, latency_ms, success, error,"
+            " COALESCE(cancelled, 0) AS cancelled"
             " FROM usage ORDER BY id DESC LIMIT ? OFFSET ?",
             (limit, offset))]
     return {"logs": logs}
 
 
 def summary(days: int = 7) -> dict:
+    """请求统计。
+
+    `cancelled` = 客户端主动中断（用户点停止 / 客户端超时）：上游返回了 200 且正常工作，
+    只是没读完，**不算失败**，因此 `errors` 一律排除它，单独出 `cancelled` 计数。
+    注意 `requests` 仍含中断（它确实是发出去的代理请求），所以成功率要用
+    `requests - cancelled` 当分母（前端按此口径计算）。"""
     since = time.time() - days * 86400
     with _conn() as con:
         totals = dict(con.execute(
             "SELECT COUNT(*) AS requests,"
             " COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens,"
-            " COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS errors,"
+            " COALESCE(SUM(CASE WHEN success = 0 AND COALESCE(cancelled,0) = 0 THEN 1 ELSE 0 END), 0) AS errors,"
+            " COALESCE(SUM(COALESCE(cancelled, 0)), 0) AS cancelled,"
             " COALESCE(AVG(CASE WHEN success = 1 THEN latency_ms END), 0) AS avg_latency"
             " FROM usage WHERE ts >= ?", (since,)).fetchone())
         daily = [dict(r) for r in con.execute(
             "SELECT date(ts, 'unixepoch', 'localtime') AS date, COUNT(*) AS requests,"
             " COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens,"
-            " COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS errors"
+            " COALESCE(SUM(CASE WHEN success = 0 AND COALESCE(cancelled,0) = 0 THEN 1 ELSE 0 END), 0) AS errors,"
+            " COALESCE(SUM(COALESCE(cancelled, 0)), 0) AS cancelled"
             " FROM usage WHERE ts >= ? GROUP BY date ORDER BY date", (since,))]
         by_model = [dict(r) for r in con.execute(
             "SELECT COALESCE(NULLIF(upstream_model, ''), model) AS model,"
@@ -171,6 +188,6 @@ def summary(days: int = 7) -> dict:
         by_channel = [dict(r) for r in con.execute(
             "SELECT COALESCE(channel_name, channel_id) AS name, COUNT(*) AS requests,"
             " COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens,"
-            " COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS errors"
+            " COALESCE(SUM(CASE WHEN success = 0 AND COALESCE(cancelled,0) = 0 THEN 1 ELSE 0 END), 0) AS errors"
             " FROM usage WHERE ts >= ? GROUP BY channel_id ORDER BY requests DESC", (since,))]
     return {"totals": totals, "daily": daily, "by_model": by_model, "by_channel": by_channel}

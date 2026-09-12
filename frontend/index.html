@@ -990,18 +990,21 @@ async function loadStats(){
   const days = $("#stat-days").value;
   const s = await api("/api/usage?days="+days, undefined, "GET");
   const t = s.totals || {};
-  const okCount = t.requests - t.errors;
-  const rate = t.requests ? (okCount*100/t.requests).toFixed(1)+"%" : "—";
+  // 客户端主动中断（用户点停止/客户端超时）不算失败：分母剔掉它，失败数后端已排除
+  const cancelled = t.cancelled || 0;
+  const valid = Math.max(0, t.requests - cancelled);
+  const okCount = valid - t.errors;
+  const rate = valid ? (okCount*100/valid).toFixed(1)+"%" : "—";
   $("#stat-cards").innerHTML = `
     <div class="stat"><div class="num">${fmtNum(t.requests)}</div><div class="lbl">总请求数</div></div>
     <div class="stat"><div class="num">${fmtNum(t.tokens)}</div><div class="lbl">总 Tokens</div></div>
-    <div class="stat"><div class="num" style="color:${t.errors?'var(--bad)':'inherit'}">${fmtNum(t.errors)}</div><div class="lbl">失败请求</div></div>
+    <div class="stat"><div class="num" style="color:${t.errors?'var(--bad)':'inherit'}">${fmtNum(t.errors)}</div><div class="lbl">失败请求${cancelled?`<span title="客户端主动断开，不计失败"> · ${fmtNum(cancelled)} 中断</span>`:""}</div></div>
     <div class="stat"><div class="num">${rate}</div><div class="lbl">成功率</div></div>`;
   // 柱状图
   const daily = s.daily || [];
   const max = Math.max(1, ...daily.map(d=>d.requests));
   $("#chart").innerHTML = daily.length ? daily.map(d => `
-    <div class="bar-wrap" title="${d.date}：${d.requests} 次请求，${fmtNum(d.tokens)} tokens，${d.errors} 次失败">
+    <div class="bar-wrap" title="${d.date}：${d.requests} 次请求，${fmtNum(d.tokens)} tokens，${d.errors} 次失败${d.cancelled?`，${d.cancelled} 次中断`:''}">
       <div class="bar ${d.errors?'err':''}" style="height:${Math.max(12, d.requests*100/max)}%">
         <span class="bar-val">${d.requests}</span>
       </div>
@@ -1037,7 +1040,10 @@ async function loadLogs(silent){
       <td class="small">${esc(l.channel_name||"—")}</td>
       <td>${fmtLatency(l.latency_ms)}</td>
       <td>${fmtNum(l.prompt_tokens+l.completion_tokens)}</td>
-      <td>${l.success?'<span style="color:var(--ok)">成功</span>':'<span style="color:var(--bad)" title="点击看详情">失败</span>'}</td>
+      <td>${l.cancelled
+        ? '<span class="muted" title="客户端主动断开（用户停止或客户端超时），上游返回正常，不计失败">已中断</span>'
+        : (l.success ? '<span style="color:var(--ok)">成功</span>'
+                     : '<span style="color:var(--bad)" title="点击看详情">失败</span>')}</td>
     </tr>`;
     }).join("");
     if (!silent && btn) toast(`已刷新：${logs.length} 条请求记录`);

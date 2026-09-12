@@ -113,10 +113,20 @@ async def probe_used_models():
                 latency = int((time.time() - t0) * 1000)
                 gateway.note_ratelimit_headers(ch["id"], m, r.headers)
                 if r.status_code == 200:
-                    gateway.mark_result(m, ch["id"], True, latency)
-                    gateway.mark_model_status(m, True, "", ch.get("name"))
-                    gateway.last_probe_ok[(m, ch["id"])] = time.time()
-                    ok_cnt += 1
+                    bad = _probe_body_ok(r)
+                    if bad:
+                        # 200 但内容不可信（错误对象/结构不对）→ 别标绿。
+                        # 标 limited（不参与路由、但可恢复），不标 down，下轮探测还会再验一次
+                        gateway.mark_result(m, ch["id"], False, kind="bad_json")
+                        gateway.mark_model_status(m, True, f"响应异常（{bad}）",
+                                                  ch.get("name"), state="limited")
+                        logger.warning("渠道[%s] 模型[%s] 探测返回 200 但内容不可信: %s",
+                                       ch.get("name"), m, bad)
+                    else:
+                        gateway.mark_result(m, ch["id"], True, latency)
+                        gateway.mark_model_status(m, True, "", ch.get("name"))
+                        gateway.last_probe_ok[(m, ch["id"])] = time.time()
+                        ok_cnt += 1
                 else:
                     kind = _kind_of(r.status_code)
                     if r.status_code == 429:
@@ -158,10 +168,16 @@ async def probe_used_models():
                         gateway.mark_model_status(m, True,
                             f"暂时不可用 (HTTP {r.status_code})", ch.get("name"), state="limited")
                     if r.status_code in (401, 403):
-                        cs.valid = False
-                        cs.error = f"运行时检测: Key 无效 (HTTP {r.status_code})"
-                        logger.warning("渠道[%s] 探测时发现 Key 无效 (%s)，暂停使用", ch.get("name"), r.status_code)
-                        break
+                        # 同 _classify：401 或「渠道最近没成功过」才认定账号级、停用整渠道；
+                        # 否则只是这个模型没权限（付费/地区），不该把整渠道一起停掉
+                        if r.status_code == 401 or not gateway.channel_recently_ok(ch["id"]):
+                            cs.valid = False
+                            cs.error = f"运行时检测: Key 无效 (HTTP {r.status_code})"
+                            logger.warning("渠道[%s] 探测时发现 Key/账号级问题 (%s)，暂停使用",
+                                           ch.get("name"), r.status_code)
+                            break
+                        logger.warning("渠道[%s] 模型[%s] 被拒 (HTTP %s)：渠道其他模型正常 → "
+                                       "只标该模型，不停渠道", ch.get("name"), m, r.status_code)
                     logger.warning("渠道[%s] 模型[%s] 探测失败 (HTTP %s)",
                                    ch.get("name"), m, r.status_code)
             except Exception as e:
@@ -448,6 +464,29 @@ def _kind_of(status: int) -> str:
     return "client"
 
 
+def _probe_body_ok(r) -> str:
+    """探测响应的**内容**校验：通过返回空串，否则返回原因（用作 limited 的理由）。
+
+    只看 HTTP 200 会被两类「假可用」骗到：① 上游拿 200 包一个错误对象；
+    ② 上游返回了结构不对的东西。这类模型会被标绿、进 auto 候选，真用起来才失败。
+
+    注意**不要求 content 非空**：推理模型在 `max_tokens=1` 时可能只输出思考、
+    content 为空，但 `choices` 本身是有的 —— 那不代表模型不可用，
+    真用起来 max_tokens 大得多。所以判据只要「有 choices 且不是错误对象」。"""
+    try:
+        d = r.json()
+    except Exception:
+        return "响应不是 JSON"
+    if not isinstance(d, dict):
+        return "响应结构异常"
+    if d.get("error"):
+        return f"响应内含错误对象: {str(d['error'])[:80]}"
+    choices = d.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return "响应没有 choices"
+    return ""
+
+
 def _quota_exhausted(cid: str) -> bool:
     """渠道账户余额是否已知 ≤ 0（只看平台余额接口查到的数据，没有就不猜）"""
     cs = gateway.get_cs(cid)
@@ -469,12 +508,25 @@ def _classify(cid, name, upstream_model, requested_model, t0, errors, status, ra
     kind = _kind_of(status)
     cooldown_seconds = None
     if kind == "auth":
-        cs = gateway.get_cs(cid)
-        cs.valid = False
-        cs.error = f"运行时检测: Key 无效或无权限 (HTTP {status})"
-        logger.warning("渠道[%s] Key 鉴权失败 (HTTP %s)，暂停使用，等待下次健康检查", name, status)
+        # 401/403 有两种来源，**不能只看状态码就把整个渠道停掉**：
+        #   账号级（Key 失效/权限被撤）→ 所有模型都会失败 → 停渠道是对的；
+        #   模型级（该模型要付费订阅/无权限/地区限制）→ 渠道其他模型还好好的
+        #     → 只标这一个 (模型,渠道)，别让一个模型拖垮整渠道（HF 有 139 个模型）。
+        # 判据用「这个渠道最近有没有成功过」：刚成功过 → Key 没问题，是模型级。
+        # 401 例外：连鉴权都没过，几乎必然是 Key 级。
+        account_level = status == 401 or not gateway.channel_recently_ok(cid)
+        if account_level:
+            cs = gateway.get_cs(cid)
+            cs.valid = False
+            cs.error = f"运行时检测: Key 无效或无权限 (HTTP {status})"
+            logger.warning("渠道[%s] Key 鉴权失败 (HTTP %s)，暂停使用，等待下次健康检查", name, status)
+        else:
+            logger.warning("渠道[%s] 模型[%s] 被拒 (HTTP %s)：渠道其他模型刚成功过 → 按模型级权限问题处理，"
+                           "不停用渠道", name, upstream_model, status)
         # 按 (模型, 渠道) 记录，不再把同名模型在其他渠道的状态一起标红
-        gateway.mark_channel_down(upstream_model, cid, f"Key 无效: HTTP {status}")
+        gateway.mark_channel_down(
+            upstream_model, cid,
+            f"Key 无效: HTTP {status}" if account_level else f"该模型无权限/需付费: HTTP {status}")
     elif kind == "rate_limit":
         # 429 分三档：余额不足（要充值）/ 免费额度用尽（等明天）/ 每分钟限流（等一会）。
         # 判别必须结合渠道类型——魔搭的「每日免费额度用完」正文就是 insufficient balance，
@@ -552,16 +604,56 @@ def _fail(cid, name, upstream_model, requested_model, t0, errors, msg, exc=None)
     errors.append(f"{name}: {msg[:120]}")
 
 
-async def _stream_gen(resp, cid, name, model, t0, upstream_model=""):
-    """流式转发，同时从 SSE 里抽 usage 记账，并记录**首字节时间(TTFT)**与**是否完整收尾**。
+def _sse_line_marks(line: bytes):
+    """解析一行 SSE，返回 `(usage 字典或 None, 是否结束标记)`。
 
-    成功只有在整条流正常读完时才算：中途断流/超时记 `kind="stream_break"` 的失败
-    （旧版一收到 200 就记成功，断流被当成功，稳定分完全看不到这种最真实的失败）。
-    客户端主动断开（GeneratorExit/CancelledError）不是模型的错 → 不记失败、只落用量。"""
+    「结束标记」= 上游已经明确说「这条回答完了」：`finish_reason` 非空 / 带 usage 的收尾块 /
+    `[DONE]`。**这才是流式请求的成败依据**（见 `_stream_ok`），不要依赖 TCP 流自然关闭。"""
+    line = line.strip()
+    if not line.startswith(b"data:"):
+        return None, False
+    payload = line[5:].strip()
+    if payload in (b"[DONE]", b"[done]"):
+        return None, True
+    try:
+        j = json.loads(payload)
+    except Exception:
+        return None, False
+    if not isinstance(j, dict):
+        return None, False
+    u = j.get("usage")
+    if isinstance(u, dict) and u:
+        return u, True          # usage 收尾块：内容已在它之前全部送出
+    for ch in (j.get("choices") or []):
+        if isinstance(ch, dict) and ch.get("finish_reason"):
+            return None, True
+    return None, False
+
+
+def _stream_ok(completed: bool, saw_end: bool, aborted: bool) -> tuple:
+    """流式请求的成败判定 → `(ok, cancelled)`。
+
+    成功 = 拿到了结束标记（`finish_reason` / usage 收尾块 / `[DONE]`），**不是**「上游把 TCP
+    流关干净了」。两者不等价：客户端读完完整答案立刻关连接是正常行为，而有些平台（魔搭最典型）
+    发完数据后拖一会儿才关连接，网关就卡在 `aiter_bytes` 等最后几个字节时被取消 —— 旧版据此
+    把大量正常完成的请求记成「客户端断开」的失败。
+
+    `cancelled` 只在**没拿到结束标记就断了**时为真（真·用户点停止 / 客户端等不及）。"""
+    ok = bool(completed or saw_end)
+    return ok, bool(aborted and not ok)
+
+
+async def _stream_gen(resp, cid, name, model, t0, upstream_model=""):
+    """流式转发，同时从 SSE 里抽 usage 记账，并记录**首字节时间(TTFT)**与**是否正常收尾**。
+
+    成败看语义结束信号（见 `_stream_ok`）：收到 `finish_reason`/usage/`[DONE]` 就是成功，
+    上游之后怎么关连接都不影响。真·中断（没有结束标记就断）才算 `cancelled`。
+    上游中途断流/超时走异常分支，记 `kind="stream_break"` 的失败（稳定分能看到）。"""
     usage = {}
     buf = b""
     ttft = None
     completed = False
+    saw_end = False
     aborted = False
     err = None
     try:
@@ -572,18 +664,14 @@ async def _stream_gen(resp, cid, name, model, t0, upstream_model=""):
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
-                line = line.strip()
-                if line.startswith(b"data:") and b'"usage"' in line:
-                    try:
-                        j = json.loads(line[5:].strip())
-                        u = j.get("usage")
-                        if isinstance(u, dict):
-                            usage = u
-                    except Exception:
-                        pass
+                u, is_end = _sse_line_marks(line)
+                if u is not None:
+                    usage = u
+                if is_end:
+                    saw_end = True
         completed = True
     except (GeneratorExit, asyncio.CancelledError):
-        aborted = True       # 客户端断开：不算上游失败
+        aborted = True       # 消费方断开：上游没错，但不一定成功（要看到没看到结束标记）
         raise
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
@@ -592,16 +680,20 @@ async def _stream_gen(resp, cid, name, model, t0, upstream_model=""):
     finally:
         if ttft is not None and upstream_model:
             gateway.mark_ttft(upstream_model, cid, ttft)
-        await resp.aclose()
-        if upstream_model and not aborted:
-            gateway.mark_result(upstream_model, cid, completed,
-                                int((time.time() - t0) * 1000) if completed else None,
-                                kind=None if completed else "stream_break", source="real")
+        try:
+            await resp.aclose()
+        except BaseException:      # 取消路径下 aclose 可能再抛，不能让它吞掉下面的记账
+            pass
+        ok, cancelled = _stream_ok(completed, saw_end, aborted)
+        latency = int((time.time() - t0) * 1000)
+        if upstream_model and (ok or not aborted):
+            gateway.mark_result(upstream_model, cid, ok, latency if ok else None,
+                                kind=None if ok else "stream_break", source="real")
         store.log_usage(cid, name, model, usage.get("prompt_tokens", 0),
                         usage.get("completion_tokens", 0),
-                        int((time.time() - t0) * 1000), completed,
-                        error=("客户端断开" if aborted else (err[:200] if err else None)),
-                        upstream_model=upstream_model)
+                        latency, ok,
+                        error=("客户端中断（无结束标记）" if cancelled else (err[:200] if err else None)),
+                        upstream_model=upstream_model, cancelled=cancelled)
 
 
 @app.post("/api/models/test")
@@ -680,6 +772,17 @@ async def model_test(req: Request):
                 result = {"available": False, "channel": ch.get("name"), "error": last_err}
                 break
             if r.status_code == 200:
+                bad = _probe_body_ok(r)
+                if bad:
+                    # 200 但内容不可信（错误对象/结构不对）→ 别标绿（见 _probe_body_ok）
+                    last_err = f"HTTP 200 但内容不可信：{bad}"
+                    gateway.mark_result(upstream_model, ch["id"], False, kind="bad_json")
+                    if cid:
+                        gateway.mark_model_status(model, True, last_err, ch.get("name"),
+                                                  state="limited")
+                        return {"available": False, "channel": ch.get("name"), "error": last_err}
+                    result = {"available": False, "channel": ch.get("name"), "error": last_err}
+                    break
                 gateway.note_ratelimit_headers(ch["id"], upstream_model, r.headers)
                 gateway.mark_model_status(model, True, "", ch.get("name"))
                 gateway.mark_result(upstream_model, ch["id"], True, latency)

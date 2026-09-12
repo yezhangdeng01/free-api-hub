@@ -32,6 +32,21 @@ _channel_429_events: dict = {}  # channel_id -> deque[(ts, model_id)]
 channel_cool: dict = {}  # channel_id -> 冷却截止时间
 channel_last_ok: dict = {}  # channel_id -> 最近一次成功请求的 ts（区分账号级/按模型限流）
 
+# 渠道被拒（401/403）后，多久之内算「最近成功过」——用它区分账号级与模型级的权限问题
+_AUTH_MODEL_LEVEL_WINDOW = 600.0
+
+
+def channel_recently_ok(cid: str, within: float = _AUTH_MODEL_LEVEL_WINDOW) -> bool:
+    """该渠道最近（默认 10 分钟内）有没有成功服务过请求。
+
+    用来区分 401/403 的两种来源，**不要只看状态码**：
+    - **账号级**（Key 失效 / 权限被撤）：所有模型都会失败，最近没有成功 → 该停用整个渠道；
+    - **模型级**（这个模型要付费订阅 / 无权限 / 地区限制）：渠道其他模型还好好的 →
+      只该标这一个模型，不能让一个模型的权限问题把整渠道（如 HF 的 139 个模型）
+      一起停到下次健康检查。"""
+    ts = channel_last_ok.get(cid)
+    return bool(ts and time.time() - ts < within)
+
 
 class ChannelState:
     def __init__(self):
@@ -199,6 +214,9 @@ def kind_from_error(err: str) -> str:
         return "geo"
     if "getaddrinfo" in t or "name resolution" in t or "proxy" in t:
         return "local_net"
+    if ("客户端断开" in t or "客户端中断" in t or "client disconnect" in t
+            or "cancelled" in t or "canceled" in t):
+        return "cancelled"      # 消费方断开且没拿到结束标记，上游没错（见 _STAB_SKIP_KINDS）
     if "429" in t or "rate limit" in t or "限流" in t or "频繁" in t:
         return "rate_limit"
     if "insufficient" in t or "balance" in t or "余额" in t or "额度" in t or "欠费" in t:
@@ -214,9 +232,13 @@ def backfill_stab(rows) -> int:
     为什么需要：稳定分只认真实调用，而历史真实调用全在 usage.db 里；旧口径（探测与真实
     混算的 score/n）已按新口径丢弃，不回填的话所有模型从空窗口起步，「稳定优先」要等很久
     才有效。只填**还没有窗口**的 (模型,渠道)，实时攒下的样本绝不被覆盖。
-    失败按 kind_from_error 分类：429/余额/4xx/本地网络/地域 一律跳过。返回回填条数。"""
+    失败按 kind_from_error 分类：429/余额/4xx/本地网络/地域/客户端中断 一律跳过。返回回填条数。"""
     per = {}
-    for model, cid, success, err, _ts in rows:
+    for row in rows:
+        model, cid, success, err = row[0], row[1], row[2], row[3]
+        # 第 6 位是 cancelled（老库/老调用可能没有这一列）
+        if len(row) > 5 and row[5]:
+            continue
         lst = per.setdefault((model, cid), [])
         if len(lst) >= STAB_WIN:
             continue
@@ -587,7 +609,9 @@ _STAB_COLS = ("win", "latency", "ttft")
 #   client/auth = 4xx（模型在该渠道下线/无权限 → 走「硬不可用」，不是质量信号）
 #   local_net  = 本地 DNS/代理问题（你自己的网络抖了）
 #   geo        = 上游地域封锁（也是出口网络问题，见 is_geo_block）
-_STAB_SKIP_KINDS = {"rate_limit", "balance", "quota", "client", "auth", "local_net", "geo"}
+#   cancelled  = 客户端主动断开（用户点停止 / 客户端超时），上游返回是正常的
+_STAB_SKIP_KINDS = {"rate_limit", "balance", "quota", "client", "auth", "local_net", "geo",
+                    "cancelled"}
 
 
 def stab_of(s: dict):

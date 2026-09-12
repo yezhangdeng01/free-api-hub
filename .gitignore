@@ -14,3 +14,8 @@ api-hub-export-*.json
 build/
 dist/
 .build-venv/
+
+# 本地排查报告（html），不入库
+*-report.html
+*排查报告.html
+*-audit.html

@@ -17,6 +17,7 @@ def _reset():
     gateway.channel_cool.clear()
     gateway.channel_down.clear()
     gateway.unverified.clear()
+    gateway.channel_last_ok.clear()
 
 
 def _chan(cid, models, latency=100):
@@ -449,6 +450,8 @@ def test_backfill_stab_from_usage_rows(monkeypatch, tmp_path):
     rows = [                                                            # (模型,渠道,成功,error,ts) 新→旧
         ("m1", "c1", 1, "", 300.0),                                     # 成功 → 1
         ("m1", "c1", 0, "connect: Server disconnected", 200.0),          # 技术性失败 → 0
+        ("m1", "c1", 0, "客户端断开", 150.0),                             # 客户端中断（老数据无列，靠文本兜底）→ 跳过
+        ("m1", "c1", 0, "客户端断开", 130.0, 1),                           # 客户端中断（带 cancelled 列）→ 跳过
         ("m1", "c1", 0, "HTTP 429 当日额度用完", 100.0),                  # 429 → 跳过
         ("m1", "c1", 0, "connect: [Errno 11001] getaddrinfo failed", 50.0),  # 本地 DNS → 跳过
         ("m2", "c1", 0, 'HTTP 400: {"error":"User location is not supported"}', 40.0),  # 地域 → 跳过
@@ -505,6 +508,160 @@ def test_store_log_and_query(tmp_path, monkeypatch):
     assert s["totals"]["errors"] == 1
     assert store.recent(limit=10)["logs"][0]["success"] == 0
     assert "gpt-4o" in store.distinct_models(days=1)
+
+
+def test_cancelled_client_abort_not_counted(tmp_path, monkeypatch):
+    """客户端主动断开（用户点停止 / 客户端超时）上游其实正常：不计失败、不进稳定分。
+
+    背景：魔搭推理模型响应慢，客户端等不及先断，旧版把这些记成 success=0，
+    统计页显示一堆假失败（某天魔搭 80 条）。"""
+    from app.gateway import kind_from_error, _STAB_SKIP_KINDS
+    monkeypatch.setattr(store, "DB_PATH", str(tmp_path / "t_cancel.db"))
+    store.init()
+    store.log_usage("c1", "ch1", "m", 10, 0, 4000, False, "客户端断开",
+                    upstream_model="m", cancelled=True)
+    store.log_usage("c1", "ch1", "m", 10, 20, 3000, True, upstream_model="m")
+    s = store.summary(days=1)
+    assert s["totals"]["requests"] == 2      # 中断也是真实发出的请求，计数保留
+    assert s["totals"]["errors"] == 0        # 但不算失败
+    assert s["totals"]["cancelled"] == 1
+    assert s["totals"]["tokens"] == 40
+    logs = store.recent(limit=5)["logs"]
+    assert logs[0]["success"] == 1 and logs[0]["cancelled"] == 0
+    assert logs[1]["success"] == 0 and logs[1]["cancelled"] == 1
+    # 回填口径：中断不是模型不稳
+    assert kind_from_error("客户端断开") == "cancelled"
+    assert kind_from_error("客户端中断（无结束标记）") == "cancelled"
+    assert "cancelled" in _STAB_SKIP_KINDS
+
+
+def test_probe_body_check_and_403_levels():
+    """两条审计发现：① 探测只认 200 不够，要看 body；② 403 分账号级 / 模型级。
+
+    ① 上游拿 200 包错误对象、或给空 choices 时，旧版会把「假可用」模型标绿并放进 auto 候选。
+    ② 单个模型没权限（付费/地区）不该把整渠道停掉 —— 判据是「渠道最近有没有成功过」。"""
+    import time as _t
+
+    from app.main import _probe_body_ok
+
+    class FakeResp:
+        def __init__(self, payload):
+            self._p = payload
+
+        def json(self):
+            if isinstance(self._p, Exception):
+                raise self._p
+            return self._p
+
+    # 正常响应 → 放行。注意 content 为空也放行：推理模型 max_tokens=1 时就是这样，
+    # 它不代表模型不可用（真用起来 max_tokens 大得多）
+    ok = {"object": "chat.completion",
+          "choices": [{"index": 0, "message": {"role": "assistant", "content": ""},
+                       "finish_reason": "length"}]}
+    assert _probe_body_ok(FakeResp(ok)) == ""
+    assert "错误对象" in _probe_body_ok(FakeResp({"error": {"message": "boom"}}))
+    assert "choices" in _probe_body_ok(FakeResp({"choices": []}))
+    assert "不是 JSON" in _probe_body_ok(FakeResp(ValueError("bad json")))
+    assert "结构异常" in _probe_body_ok(FakeResp(["a"]))
+
+    # 账号级 vs 模型级 403
+    _reset()
+    assert not gateway.channel_recently_ok("c1")                 # 从没成功过 → 账号级（停渠道）
+    gateway.channel_last_ok["c1"] = _t.time() - 5
+    assert gateway.channel_recently_ok("c1")                     # 刚成功过 → 模型级（只标该模型）
+    gateway.channel_last_ok["c1"] = _t.time() - 3600
+    assert not gateway.channel_recently_ok("c1")                 # 过期 → 又算账号级
+    gateway.channel_last_ok.clear()
+
+
+def test_sse_marks_and_stream_outcome():
+    """流式成败看「语义结束标记」，不是「上游 TCP 流关没关干净」。
+
+    背景：魔搭发完数据后不马上关连接，客户端读完答案就关连接 → 网关卡在等最后几个字节时
+    被取消，旧版据此把 80 条**已完成**的请求记成「客户端断开」的失败。"""
+    from app.main import _sse_line_marks, _stream_ok
+
+    # 增量块：既不是结束也没有 usage
+    assert _sse_line_marks(b'data: {"choices":[{"delta":{"content":"\xe4\xbd\xa0"}}]}') == (None, False)
+    # finish_reason 非空 → 结束
+    assert _sse_line_marks(b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}') == (None, True)
+    # finish_reason 为 null → 不是结束（别误判）
+    assert _sse_line_marks(
+        b'data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}') == (None, False)
+    # usage 收尾块 → 结束 + 取到 usage
+    u, end = _sse_line_marks(
+        b'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20}}')
+    assert end and u["completion_tokens"] == 20
+    # [DONE]
+    assert _sse_line_marks(b"data: [DONE]") == (None, True)
+    # 非 data 行、坏 JSON、空 usage 都不该误判
+    assert _sse_line_marks(b"event: ping") == (None, False)
+    assert _sse_line_marks(b"data: {oops") == (None, False)
+    assert _sse_line_marks(b'data: {"choices":[],"usage":{}}') == (None, False)
+
+    # 判定表：(completed, saw_end, aborted) → (ok, cancelled)
+    assert _stream_ok(True, False, False) == (True, False)     # 正常读完
+    assert _stream_ok(False, True, True) == (True, False)      # 拿到结束标记后被取消 = 收尾竞态 → 成功
+    assert _stream_ok(False, True, False) == (True, False)     # [DONE] 之后上游掐线 → 仍算成功
+    assert _stream_ok(False, False, True) == (False, True)     # 没结束标记就断 = 真中断
+    assert _stream_ok(False, False, False) == (False, False)   # 上游断流（异常路径）→ 失败
+
+
+def test_stream_gen_records_race_as_success(tmp_path, monkeypatch):
+    """端到端：读完 [DONE] 后连接被客户端关掉 → 记成功；只吐半截被掐 → 记中断。"""
+    import asyncio
+    import time as _t
+
+    from app.main import _stream_gen
+    monkeypatch.setattr(store, "DB_PATH", str(tmp_path / "race.db"))
+    monkeypatch.setattr(gateway, "mark_ttft", lambda *a, **k: None)
+    marked = []
+    monkeypatch.setattr(gateway, "mark_result", lambda *a, **k: marked.append(a))
+    store.init()
+
+    full = (b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+            b'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":9}}\n\n'
+            b'data: [DONE]\n\n')
+    half = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+
+    class FakeResp:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def aiter_bytes(self):
+            yield self.payload
+            raise asyncio.CancelledError()      # 客户端在这一刻关掉了连接
+
+        async def aclose(self):
+            pass
+
+    async def run(payload):
+        async for _ in _stream_gen(FakeResp(payload), "c1", "ch1", "m", _t.time(), "m"):
+            pass
+
+    # A：完整读完（含 usage + [DONE]）后连接被关 → 请求其实是成功的
+    try:
+        asyncio.run(run(full))
+    except asyncio.CancelledError:
+        pass
+    log = store.recent(limit=1)["logs"][0]
+    assert log["success"] == 1, log
+    assert log["cancelled"] == 0, log
+    assert log["completion_tokens"] == 9
+    assert log["error"] is None
+    assert marked and marked[-1][2] is True          # mark_result(..., ok=True)
+
+    # B：只吐了一块、没有结束标记就被掐 → 真中断
+    try:
+        asyncio.run(run(half))
+    except asyncio.CancelledError:
+        pass
+    log = store.recent(limit=1)["logs"][0]
+    assert log["success"] == 0, log
+    assert log["cancelled"] == 1, log
+    assert "中断" in (log["error"] or "")
+    # 真中断不写稳定分（aborted 且没成功）
+    assert len(marked) == 1
 
 
 # ---------------- model_view：三态状态机（ok/limited/down） ----------------
