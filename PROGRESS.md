@@ -109,6 +109,18 @@ v1.0.4 = 重启 404 根因修复 + 托盘左键恢复 + 能力档位改「AA 榜
   seed 300s 保守冷却，避免重启即回绿再撞限。
 - 落盘节流：`mark_result` 走 1s 节流 + 后台每 30s 兜底 flush；托盘退出 / 停机前手动 `save_runtime_state()`（`os._exit` 会跳过 lifespan 清理）。
 
+### 手动测试 vs 自动（改冷却 / 恢复逻辑前必读）
+
+- **自动侧尊重冷却**：真实路由走 `candidates_for()`（渠道级熔断 `channel_cooling` 连兜底 `ignore_cooldown=True` 都过滤）、
+  后台探测 `probe_used_models()` 开头就 skip 冷却渠道——24h 硬冷却防的就是自动探测烧额度。
+- **手动测试绕过冷却**：`/api/models/test`（用户点「测试」按钮）走 `gateway.candidates_for_test()`——
+  绕过 channel_cool / cooldown / unverified / 429 预判，但仍排除 channel_down 硬失败、渠道无效、限流头耗尽
+  （无自愈可能的测了也白测）。用户主动点测试 = 明确承担额度消耗。
+- **测成功即恢复**：`mark_result(ok)` 会 pop channel_cool + 清 `_channel_429_events` 熔断计数 + 即时落盘（防重启复活）。
+  自动探测/路由不会在冷却期间发请求，所以只有手动测试能触发这个解锁路径。
+- 背景：魔搭 free_daily 实测恢复周期 **<24h**（非严格自然日刷新），「冷却到明天 00:05」偏保守；
+  有了手动解锁，额度提前恢复时点一下测试即可回绿，不浪费可用时段，也不牺牲自动侧保护。
+
 ## 平台保护机制（代码已有，勿误删）
 
 | 平台 | 保护点 |
@@ -138,7 +150,7 @@ _serve → _bind_listen(8787) 先抢监听 socket → uvicorn.Server(Config(app,
 
 ```bash
 cd E:\文档\workbuddy\api-hub
-.venv\Scripts\python.exe -m pytest tests/ -q     # 52 passed，全部离线、不打外部 API
+.venv\Scripts\python.exe -m pytest tests/ -q     # 60 passed，全部离线、不打外部 API
 ```
 
 - 日常：双击 `API Hub.vbs`（静默托盘）；调试 `run.bat`（带控制台）；源码 `.venv\Scripts\python.exe desktop.py`。
