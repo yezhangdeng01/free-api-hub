@@ -379,6 +379,41 @@ def test_channel_quota_exhausted_cools_whole_channel(tmp_path, monkeypatch):
     assert gateway.channel_cooling("sc")
 
 
+def test_candidates_for_test_bypasses_channel_cool():
+    """手动测试候选：渠道级冷却中的渠道也给出（用户主动测试），硬失败仍排除。"""
+    _reset()
+    a = _chan("c1", ["m1"], latency=50)
+    b = _chan("c2", ["m1"], latency=80)
+    cfg = _cfg([a, b])
+    gateway.mark_channel_quota_exhausted("c1", "当日额度用完")
+    # 正常候选：c1（渠道级冷却）被过滤，只剩 c2
+    assert [c["channel"]["id"] for c in gateway.candidates_for("m1", cfg)] == ["c2"]
+    # 手动测试候选：冷却中的 c1 也在（顺序按策略分，正常渠道不一定排前）
+    got = gateway.candidates_for_test("m1", cfg)
+    assert {c["channel"]["id"] for c in got} == {"c1", "c2"}
+    # 硬失败渠道仍排除（无自愈可能，测了也白测）
+    gateway.mark_channel_down("m1", "c2", "HTTP 403")
+    got = gateway.candidates_for_test("m1", cfg)
+    assert [c["channel"]["id"] for c in got] == ["c1"]
+
+
+def test_mark_result_ok_clears_channel_cool(tmp_path, monkeypatch):
+    """手动测试成功 → 解除渠道级冷却（额度已恢复），且落盘后重启不复活。"""
+    from app import store as _store
+    _reset()
+    monkeypatch.setattr(_store, "RUNTIME_STATE_PATH", str(tmp_path / "rt.json"))
+    a = _chan("sc", ["m1"], latency=50)
+    cfg = _cfg([a])
+    gateway.mark_channel_quota_exhausted("sc", "当日额度用完")
+    assert gateway.channel_cooling("sc")
+    assert gateway.candidates_for_test("m1", cfg)            # 冷却中但手动测试仍可拿到候选
+    gateway.mark_result("m1", "sc", True)                    # 手动测试成功
+    assert not gateway.channel_cooling("sc")                 # 渠道冷却被解除
+    assert gateway.candidates_for("m1", cfg) != []           # 正常候选恢复
+    gateway.restore_runtime_state()                          # 重启模拟：不复活
+    assert not gateway.channel_cooling("sc")
+
+
 def test_mark_result_scoring():
     """真实调用的结果进稳定分窗口；探测（默认 source）只碰可用性、不进窗口"""
     _reset()

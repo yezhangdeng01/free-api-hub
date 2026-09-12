@@ -555,6 +555,13 @@ def mark_result(model: str, cid: str, ok: bool, latency_ms=None,
         unverified.discard(key)      # 实测成功 → 恢复状态被确认
         channel_down.pop(key, None)  # 之前硬失败的 (模型,渠道) 也随之恢复
         channel_last_ok[cid] = time.time()
+        if cid in channel_cool:
+            # 成功调用 = 渠道确实可用（额度可能已刷新）→ 解除渠道级冷却并即时落盘，
+            # 避免「手动测试成功但冷却到明天的状态还在、重启后渠道仍被封」。
+            # 自动探测/路由不会在渠道冷却期间发请求，只有用户手动测试能走到这里。
+            channel_cool.pop(cid, None)
+            _channel_429_events.pop(cid, None)  # 清掉熔断计数，恢复后不再被旧账立刻熔断
+            save_runtime_state()
     else:
         seconds = COOLDOWN_SECONDS.get(kind, DEFAULT_COOLDOWN)
         if retry_after and retry_after > 0 and not cooldown_seconds:
@@ -841,6 +848,38 @@ def candidates_for(model: str, cfg: dict) -> list:
     if not out:
         collect(ignore_cooldown=True)  # 兜底：全被冷却/预判跳过也给出候选，避免直接 404
 
+    strategy = cfg.get("route_strategy", "balanced")
+    out.sort(key=lambda c: -_composite(c, cfg, strategy))
+    return out
+
+
+def candidates_for_test(model: str, cfg: dict) -> list:
+    """手动测试专用候选（`/api/models/test` 用户点按钮）：**绕过所有冷却**。
+
+    渠道级冷却（channel_cool，如魔搭 free_daily → 明天）、模型级冷却、待验证(unverified)、
+    429 自学预判(throttle.blocked) 一律不挡——用户主动点测试 = 明确承担额度消耗，
+    而且测试成功应立即可恢复（见 mark_result 成功分支解除 channel_cool）。
+    自动探测 / 真实路由仍走 candidates_for / probe 逻辑，继续尊重冷却，不受影响。
+
+    仍排除：渠道未启用 / 健康检查未通过 / 模型不在该渠道 / 该渠道上该模型硬失败
+    (channel_down) / 官方限流头显示额度耗尽未重置(ratelimit_exhausted)。
+    返回结构与 candidates_for 一致，按当前策略综合分排序（正常渠道仍排前面先试）。"""
+    now = time.time()
+    out, seen = [], set()
+    for mid in model_targets(model, cfg):
+        for ch in cfg["channels"]:
+            if not ch.get("enabled", True):
+                continue
+            cs = channels.get(ch["id"])
+            if not cs or cs.valid is not True or mid not in cs.models:
+                continue
+            key = (mid, ch["id"])
+            if key in seen or key in channel_down:
+                continue
+            if ratelimit_exhausted(mid, ch["id"], now):
+                continue
+            seen.add(key)
+            out.append({"channel": ch, "model": mid})
     strategy = cfg.get("route_strategy", "balanced")
     out.sort(key=lambda c: -_composite(c, cfg, strategy))
     return out

@@ -626,7 +626,9 @@ async def model_test(req: Request):
             return {"available": False, "error": "渠道无效、已停用或未提供该模型"}
         candidates = [{"channel": ch, "model": model}]
     else:
-        candidates = gateway.candidates_for(model, cfg)
+        # 手动测试专用候选：绕过所有冷却（渠道级/模型级/预判），用户主动点测试
+        # 愿意承担额度，测成功即恢复（mark_result ok 会解除 channel_cool）。
+        candidates = gateway.candidates_for_test(model, cfg)
         if not candidates:
             gateway.mark_model_status(model, False, "没有任何可用渠道（渠道未配置或健康检查未通过）")
             raise HTTPException(404, "该模型当前没有任何可用渠道")
