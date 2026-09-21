@@ -174,6 +174,24 @@ def _restart():
     os._exit(0)
 
 
+def _reload_window():
+    """刷新界面：让窗口重新拉一次页面。
+
+    为什么要有这一项：前端 `frontend/index.html` 是服务端现读磁盘，改完本该「刷新即生效」，
+    但 WebView2 自己会缓存页面（响应没带 Cache-Control 时按启发式新鲜度用缓存），
+    界面里按 F5 不一定刷得出来；而「重启服务」要重连、要等健康检查，只为看一次前端改动太重。
+    服务端已给 `/` 加了 no-store，这里再提供一个**看得见**的动作，别让人去猜快捷键。
+    """
+    w = _show_window()          # 已存在就显示并置前；没有就新建（顺带解决「窗口被关掉了」）
+    try:
+        w.evaluate_js("location.reload()")
+    except Exception as e:
+        try:
+            w.load_url(f"http://127.0.0.1:{cfgmod.load_config()['port']}")
+        except Exception:
+            _launch_log(f"刷新界面失败: {e}")
+
+
 def _build_menu(cb: dict):
     """托盘菜单。
 
@@ -188,6 +206,7 @@ def _build_menu(cb: dict):
     return pystray.Menu(
         pystray.MenuItem("显示窗口", cb["show"], default=True, visible=False),
         pystray.MenuItem("打开配置文件夹", cb["settings"]),
+        pystray.MenuItem("刷新界面", cb["reload"]),
         pystray.MenuItem("重启服务", cb["restart"]),
         pystray.MenuItem("开机自启", cb["autostart"],
                          checked=lambda item: autostart_enabled()),
@@ -221,6 +240,9 @@ def _tray_loop(port: int):
         def on_restart(icon, item):
             _restart()
 
+        def on_reload(icon, item):
+            _reload_window()
+
         def on_autostart(icon, item):
             set_autostart(not autostart_enabled())
             icon.update_menu()
@@ -237,8 +259,8 @@ def _tray_loop(port: int):
             os._exit(0)
 
         menu = _build_menu({
-            "show": on_show, "settings": on_settings, "restart": on_restart,
-            "autostart": on_autostart, "quit": on_quit,
+            "show": on_show, "settings": on_settings, "reload": on_reload,
+            "restart": on_restart, "autostart": on_autostart, "quit": on_quit,
         })
         pystray.Icon("api-hub", img, "API Hub", menu).run()
     except Exception as e:

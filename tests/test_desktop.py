@@ -23,10 +23,10 @@ def test_tray_menu_default_item_hidden():
             called.append(key)
         return _cb
 
-    cb = {k: mk(k) for k in ("show", "settings", "restart", "autostart", "quit")}
+    cb = {k: mk(k) for k in ("show", "settings", "reload", "restart", "autostart", "quit")}
     menu = desktop._build_menu(cb)
     visible = [i.text for i in menu if i.text != "- - - -"]  # 迭代只含可见项
-    assert visible == ["打开配置文件夹", "重启服务", "开机自启", "退出"]
+    assert visible == ["打开配置文件夹", "刷新界面", "重启服务", "开机自启", "退出"]
     assert "显示窗口" not in visible and "隐藏窗口" not in visible
     menu(None)  # pystray 左键路径：Menu.__call__ → 第一个 default 项
     assert called == ["show"]

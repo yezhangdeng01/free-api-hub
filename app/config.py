@@ -98,14 +98,32 @@ DEFAULT_CONFIG = {
     # 模型 1-token 实测探测：会消耗免费额度 / 占请求数，60 分钟一次，
     # 避免把 OpenRouter :free 这类按天计次的小限额烧在探测上
     "probe_interval_minutes": 60,
+    # AA 榜分/视觉能力的缓存新鲜度阈值（小时）：超过才去 OpenRouter 公开端点补一次。
+    # 榜分是月级更新的，没必要每次刷新都拿；本地缓存永不失效，只是「旧了就去补」。
+    "bench_cache_hours": 24,
     "auth_enabled": True,
     "api_token": "",
     "aliases": {},
     "pinned": [],
+    # 视觉专属收藏（界面「视觉」视图里的 ★，2026-09-20 用户要求与主收藏分开）：
+    # 只影响「视觉」视图的排序与 `auto-vision` 的实际切换顺序，不参与其它策略的候选排序。
+    "pinned_vision": [],
     "channels": [],
     "route_strategy": "balanced",    # balanced / quality / stability / speed
     "probe_used_models": True,       # 是否启用模型 1-token 主动探测
     "adaptive_preemption": True,     # 429 自学水位：预计要越线时提前换路
+    # 手动档位（界面点档位 chip 写的，{模型id: 1|2|3}）。与 model_tiers 的分工：
+    # 这里是「点名」——按模型 id 原文精确匹配；model_tiers 是「批量规则」——正则匹配。
+    # 优先级：model_tier_exact > model_tiers > AA 榜分 > 名字启发式（见 capability.tier_overrides）。
+    "model_tier_exact": {},
+    "model_tiers": None,             # 手改的正则覆盖，默认不写（null = 没有规则）
+    # ---- /v1/responses 翻译层（见 app/responses.py）----
+    # 流式请求时给上游加 stream_options.include_usage，好让 response.completed 里有
+    # token 用量。主流兼容层都认；哪个渠道因此报 400 就关掉（关掉只丢用量，不影响功能）。
+    "responses_stream_usage": True,
+    # 把 Responses 的 reasoning.effort 译成 chat 的 reasoning_effort 传给上游。
+    # 默认关：个别渠道不认这个字段会整条 400，而少了它只是丢掉一个提示。
+    "responses_reasoning_effort": False,
 }
 
 _lock = threading.Lock()

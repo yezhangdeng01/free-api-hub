@@ -9,27 +9,18 @@ logger = logging.getLogger("api-hub")
 
 # 智谱网页端额度接口（社区逆向，非官方文档，失败会自动降级）
 ZHIPU_BALANCE_URL = "https://www.bigmodel.cn/api/biz/account/query-customer-account-report"
+# OpenRouter 公开模型目录（**无需密钥**）：作为 AA 榜分/视觉能力的兜底数据源
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 
-async def fetch_models(client: httpx.AsyncClient, base_url: str, api_key: str) -> list:
-    """拉取渠道的模型列表（OpenAI 兼容 /models）
+def _harvest(items) -> tuple:
+    """从 /models 的返回项里收割「AA 榜分 + 视觉能力」（OpenRouter 系接口才带这两样）
 
-    顺带收割两样白拿的权威数据（OpenRouter 的返回里带，不用额外密钥、不多发请求）：
-
-    1. `benchmarks.artificial_analysis.intelligence_index` — Artificial Analysis 智能指数；
-    2. `architecture.input_modalities` — **是否支持图像输入**（比名字猜准得多）。
+    返回 (ids, bench, vision_ok, vision_no)，并顺手落库到 capability。
     """
-    r = await client.get(
-        base_url.rstrip("/") + "/models",
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=25,
-    )
-    r.raise_for_status()
-    data = r.json()
-    items = data.get("data", []) if isinstance(data, dict) else data
     ids, bench = [], {}
     vision_ok, vision_no = set(), set()
-    for it in items:
+    for it in items or []:
         if not isinstance(it, dict):
             if it:
                 ids.append(str(it))
@@ -56,7 +47,50 @@ async def fetch_models(client: httpx.AsyncClient, base_url: str, api_key: str) -
         vin = capability.update_vision_models(vision_ok, vision_no)
         logger.info("收割视觉能力 %d 支持 / %d 不支持（累计 %d / %d）",
                     len(vision_ok), len(vision_no), vin["ok"], vin["no"])
+    return ids, bench, vision_ok, vision_no
+
+
+async def fetch_models(client: httpx.AsyncClient, base_url: str, api_key: str) -> list:
+    """拉取渠道的模型列表（OpenAI 兼容 /models）
+
+    顺带收割两样白拿的权威数据（OpenRouter 的返回里带，不用额外密钥、不多发请求）：
+
+    1. `benchmarks.artificial_analysis.intelligence_index` — Artificial Analysis 智能指数；
+    2. `architecture.input_modalities` — **是否支持图像输入**（比名字猜准得多）。
+    """
+    r = await client.get(
+        base_url.rstrip("/") + "/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=25,
+    )
+    r.raise_for_status()
+    data = r.json()
+    items = data.get("data", []) if isinstance(data, dict) else data
+    ids, _bench, _ok, _no = _harvest(items)
     return sorted(set(ids))
+
+
+async def fetch_bench_public(client: httpx.AsyncClient) -> dict:
+    """兜底榜分源：直连 OpenRouter **公开** /models（不传密钥）收割 AA 榜分与视觉能力。
+
+    为什么需要它：榜分只藏在 OpenRouter 的 /models 里，渠道一被停用 / Key 失效 / 上游故障，
+    数据就断供，档位退回名字启发式（表现就是「评分没了」）。而 AA 智能指数是月级更新的，
+    没必要每次刷新都去拿 —— 只在本地缓存过期时来补一次，失败就继续用旧分。
+    实测（2026-09-15）：公开端点免密钥即返回 445 个模型，139 个带 AA 榜分（比带密钥的渠道
+    返回还多），且全部带 `architecture.input_modalities`。
+    返回 {"bench": n, "vision": n, "ok": bool}。
+    """
+    try:
+        r = await client.get(OPENROUTER_MODELS_URL, timeout=25)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        logger.warning("公开榜分源不可用（继续用本地缓存）: %s", str(e)[:160])
+        return {"bench": 0, "vision": 0, "ok": False}
+    items = data.get("data", []) if isinstance(data, dict) else data
+    _, bench, vision_ok, vision_no = _harvest(items)
+    return {"bench": len(bench), "vision": len(vision_ok) + len(vision_no),
+            "ok": bool(bench or vision_ok)}
 
 
 async def check_quota(client: httpx.AsyncClient, channel: dict):

@@ -21,7 +21,10 @@
   nav button { background: none; border: none; color: var(--muted); font-size: 14px; padding: 11px 18px; cursor: pointer; border-bottom: 2px solid transparent; }
   nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
   nav button:hover { color: var(--text); }
-  main { padding: 20px 24px 48px; max-width: 1180px; margin: 0 auto; }
+  /* 1300：模型页工具条不压缩需要 1181px（搜索框 230 + 计数 + 3 个状态开关 + 5 个排序 chip
+     + 分页），而 1180 的 main 只给工具条 1098px —— 差的 83px 会被 flex 摊到子项上，
+     把「● 可用 / ● 受限 / ● 不可用」这组挤成两行。整页加宽到 1300 后留 ~80px 余量。 */
+  main { padding: 20px 24px 48px; max-width: 1300px; margin: 0 auto; }
   .tab { display: none; } .tab.active { display: block; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 14px; }
   h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
@@ -56,6 +59,7 @@
   .chip-btn.active { background: var(--accent-dim); color: #17150f; border-color: var(--accent-dim); font-weight: 600; }
   .chip-btn.ok-dot.active { background: rgba(76,175,80,.18); color: var(--ok); border-color: var(--ok); }
   .chip-btn.warn-dot.active { background: rgba(224,177,63,.15); color: var(--warn); border-color: var(--warn); }
+  .chip-btn.bad-dot.active { background: rgba(201,106,90,.16); color: var(--bad); border-color: var(--bad); }
   .light-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:7px; vertical-align:middle; }
   .light-dot.ok { background: var(--ok); box-shadow: 0 0 5px var(--ok); }
   .light-dot.limited { background: var(--warn); box-shadow: 0 0 5px var(--warn); }
@@ -67,6 +71,29 @@
   }
   .tag-chip.ok { color: var(--ok); border-color: var(--accent-dim); }
   .tag-chip.bad { color: var(--bad); border-color: var(--bad); }
+  /* 档位 chip：可点（弹手动档位面板）。手动指定过的用主色 + 小圆点标出来 */
+  .tier-btn { cursor: pointer; font-family: inherit; font-size: 11px; line-height: 1.5; }
+  .tier-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .tier-btn .tier-caret { opacity: .4; margin-left: 4px; font-size: 9px; }
+  .tier-btn.manual { color: var(--accent); border-color: var(--accent-dim); }
+  .tier-btn.manual::after {
+    content: ""; display: inline-block; width: 5px; height: 5px; margin-left: 5px;
+    border-radius: 50%; background: var(--accent); vertical-align: 1px;
+  }
+  .tier-btn.flash { background: var(--accent-dim); color: var(--bg); }
+  .tier-pop {
+    position: fixed; z-index: 60; min-width: 216px; padding: 6px;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 10px;
+  }
+  .tier-pop-h { display: flex; flex-direction: column; gap: 2px; padding: 4px 8px 6px; font-size: 12px; }
+  .tier-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    width: 100%; padding: 6px 8px; background: transparent; border: 0; border-radius: 6px;
+    color: var(--text); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer;
+  }
+  .tier-item:hover { background: var(--panel); }
+  .tier-item.on { color: var(--accent); }
+  .tier-pop-f { padding: 6px 8px 2px; margin-top: 4px; border-top: 1px solid var(--border); line-height: 1.6; }
   .tag-sep { width:1px; height:13px; background: var(--border); margin: 0 2px; display:inline-block; vertical-align: middle; }
   input[type=text], input[type=password], select, textarea {
     background: var(--panel2); color: var(--text); border: 1px solid var(--border);
@@ -80,8 +107,14 @@
   .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); padding-bottom: 8px; }
   #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--accent-dim); color: var(--accent); border-radius: 8px; padding: 9px 20px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 99; }
   #toast.show { opacity: 1; }
-  .toolbar { display: flex; gap: 10px; margin-bottom: 12px; align-items: center; }
-  .toolbar input { width: 260px; }
+  /* 工具条：宁可整组换行，也不要把组内 chip 挤成两行。
+     默认 flex 是 nowrap + 允许 shrink —— 空间不够时它不去换行，而是把每个子项压窄，
+     压到「● 可用 74 ● 受限 35 ● 不可用 555」这种多元素组内部折行，看着像 UI 错位。
+     所以：① wrap（不够就整组下移一行）；② .grp 不参与压缩（flex:0 0 auto + nowrap）。 */
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px 12px; margin-bottom: 12px; align-items: center; }
+  .toolbar input { width: 230px; flex: 0 0 auto; }
+  .toolbar .grp { display: flex; gap: 6px; align-items: center; flex: 0 0 auto; white-space: nowrap; }
+  .toolbar .muted, .toolbar .small { white-space: nowrap; }
   .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
   .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
   .stat .num { font-size: 22px; font-weight: 600; font-family: var(--mono); }
@@ -116,23 +149,25 @@
   <!-- 模型 -->
   <section class="tab active" id="tab-models">
     <div class="card">
-      <div class="toolbar" style="gap:14px">
+      <div class="toolbar">
         <input type="text" id="model-search" placeholder="搜索模型…  支持 provider:xxx / v: / t:3">
         <span class="muted small" id="model-count"></span>
         <span class="vdiv"></span>
-        <span style="display:flex; gap:6px; align-items:center">
+        <span class="grp">
           <button class="chip-btn ok-dot" id="show-ok-btn" title="显示免费可调模型（绿点）">● 可用</button>
           <button class="chip-btn warn-dot" id="show-limited-btn" title="暂时限流/冷却中的免费模型（黄点）">● 受限</button>
+          <button class="chip-btn bad-dot" id="show-down-btn" title="硬不可用模型（红点）：余额/权限/已下线等，等不来自愈；点这行右侧「测试」可强制真测一次">● 不可用</button>
         </span>
         <span class="vdiv"></span>
-        <span style="display:flex; gap:6px" id="sort-chips">
+        <span class="grp" id="sort-chips">
           <button class="chip-btn" data-sort="balanced">均衡</button>
           <button class="chip-btn" data-sort="quality">智能优先</button>
           <button class="chip-btn" data-sort="stability">稳定优先</button>
           <button class="chip-btn" data-sort="speed">速度优先</button>
-          <button class="chip-btn" data-sort="vision" title="只看能看图的模型；顺序即 auto:vision 的实际切换顺序">视觉</button>
+          <span class="vdiv"></span>
+          <button class="chip-btn" data-sort="vision" title="只看能看图的模型；顺序即 auto-vision 的实际切换顺序。这一屏的 ★ 是视觉专属收藏（与前面几个视图的收藏互不影响）">视觉</button>
         </span>
-        <span style="margin-left:auto; display:flex; gap:8px; align-items:center">
+        <span class="grp" style="margin-left:auto; gap:8px">
           <button class="btn" id="pg-prev">‹</button>
           <span class="muted small" id="pg-info"></span>
           <button class="btn" id="pg-next">›</button>
@@ -204,9 +239,11 @@
         「429 限流预判」（撞过一次 429 就记住当时用量，之后接近这个水位提前换路，而不是等被打回再冷却）
         <b>默认开启</b>，无需设置，需要关就在 config.json 里把 <span class="mono">probe_used_models</span> /
         <span class="mono">adaptive_preemption</span> 设为 false。<br>
-        能力档位是启发式估算（按模型名 + AA 榜分），可在 config.json 的
-        <span class="mono">model_tiers</span> 里用正则手动覆盖；<span class="mono">route_strategy</span>
-        只作为「显式写真实模型名时渠道排序」的兜底（<span class="mono">auto:*</span> 由模型名决定，见「网关用法」页）。
+        能力档位是启发式估算（按模型名 + AA 榜分），**点模型页「特点」列里的档位 chip 就能手动改**
+        （存进 config.json 的 <span class="mono">model_tier_exact</span>，点名优先，再点「自动」可撤销）；
+        也可以在 config.json 的 <span class="mono">model_tiers</span> 里用正则批量覆盖（优先级低于点名）。
+        <span class="mono">route_strategy</span>
+        只作为「显式写真实模型名时渠道排序」的兜底（<span class="mono">auto-*</span> 由模型名决定，见「网关用法」页）。
       </p>
     </div>
     <div class="card">
@@ -240,7 +277,7 @@
     <div class="card">
       <h2>最近请求</h2>
       <table>
-        <thead><tr><th style="width:150px">时间</th><th>请求模型</th><th>上游模型</th><th style="width:130px">渠道</th><th style="width:90px">延迟</th><th style="width:110px">Tokens</th><th style="width:70px">状态</th></tr></thead>
+        <thead><tr><th style="width:150px">时间</th><th>请求模型</th><th>上游模型</th><th style="width:130px">渠道</th><th style="width:90px">延迟</th><th style="width:110px" title="上游返回的真实 token 数。客户端提前断开时上游的 usage 收尾块收不到 → 改显示模型已输出的字符数（带「字」）">Tokens</th><th style="width:70px">状态</th></tr></thead>
         <tbody id="log-rows"></tbody>
       </table>
       <div class="empty" id="log-empty" style="display:none">还没有请求记录</div>
@@ -285,11 +322,21 @@
               · 失败的「模型 × 渠道」组合进入冷却（时长按错误类型：连接失败短、限流/当天额度用完等冷却到明）；<br>
               · 健康检查自动定期运行（间隔在「设置」页调整，默认 30 分钟）；<br>
               · 响应头 <span class="mono">X-Api-Hub-Channel</span> 显示本次实际由哪个渠道服务（在「测试台」发一条消息，输出末尾就会写出渠道与延迟；命令行 <span class="mono">curl -i</span> 也能看到）；<br>
-              · 模型名填 <span class="mono">auto:balanced</span> / <span class="mono">auto:quality</span> /
-                <span class="mono">auto:stability</span> / <span class="mono">auto:speed</span> /
-                <span class="mono">auto:vision</span> 时，网关会自动选最优真实模型并跨模型无感切换
-                （按「模型」页对应视图的排序逐个尝试，能用的排前面；<span class="mono">auto:vision</span>
-                只挑能看图的模型，适合当 Hermes 的辅助视觉模型）。</p>
+              · 模型名填 <span class="mono">auto-balanced</span> / <span class="mono">auto-quality</span> /
+                <span class="mono">auto-stability</span> / <span class="mono">auto-speed</span> /
+                <span class="mono">auto-vision</span> 时，网关会自动选最优真实模型并跨模型无感切换
+                （按「模型」页对应视图的排序逐个尝试，能用的排前面；<span class="mono">auto-vision</span>
+                只挑能看图的模型，适合当 Hermes 的辅助视觉模型）。<br>
+              · <b>同一个会话里不会来回换模型</b>：网关会认会话（客户端每轮都带完整历史，
+                所以按<b>第一条 user 消息</b>识别），上一次成功产出的模型在这个会话里一直优先用，
+                只有它失败或整个不可用才换 —— 想看当前粘在谁身上：
+                <span class="mono">GET /api/sticky</span>；想立刻让它重新按策略选：
+                <span class="mono">DELETE /api/sticky</span>（可加 <span class="mono">?strategy=quality</span>
+                只清一个视图）。会话闲置 2 小时自动失效。<br>
+              · 候选的第一顺位是<b>会话粘性</b>（本会话上次成功的模型），其次是<b>收藏</b>，
+                然后才是策略分：「模型」页每个视图的 ★ 只管自己那一屏，
+                <span class="mono">视觉</span> 视图的 ★ 是独立的一套（<span class="mono">pinned_vision</span>），
+                只影响这一屏与 <span class="mono">auto-vision</span> 的切换顺序。</p>
       <h3 style="margin-top:14px">常用客户端配置（点击复制）</h3>
       <div id="guide-snippets"></div>
     </div>
@@ -305,8 +352,8 @@ const MODEL_TIERS = {1:"轻量", 2:"中档", 3:"智能"};
 // 列表「视图」= 只决定排序展示，**不切换路由策略**（路由策略在 Agent 端按模型名选）。
 // 视图名 ↔ Agent 端模型名一一对应，且排序口径与对应策略完全同源。
 const VIEW_KEY = "apihub.view";
-const VIEW_ALIAS = {balanced:"auto:balanced", quality:"auto:quality", stability:"auto:stability",
-                    speed:"auto:speed", vision:"auto:vision"};
+const VIEW_ALIAS = {balanced:"auto-balanced", quality:"auto-quality", stability:"auto-stability",
+                    speed:"auto-speed", vision:"auto-vision"};
 function savedView(){
   try { const v = localStorage.getItem(VIEW_KEY); if (VIEW_ALIAS[v]) return v; } catch(e){}
   return null;
@@ -349,6 +396,7 @@ async function api(path, body, method){
   const opt = body !== undefined
     ? {method: method || "POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)}
     : {};
+  opt.cache = "no-store";   // 统计数据类接口不吃 HTTP 缓存，否则刷新也拿旧值
   const r = await fetch(path, opt);
   if (!r.ok) throw new Error((await r.json().catch(()=>({detail:r.statusText}))).detail || r.statusText);
   return r.json();
@@ -374,21 +422,21 @@ function renderGuide(){
   const base = g.base_url || "", tok = g.token || "";
   $("#guide-url").textContent = base;
   $("#guide-token").textContent = tok || "(鉴权已关闭)";
-  // 示例模型名用 auto:quality（网关自动选最优 + 失败无感切换），
+  // 示例模型名用 auto-quality（网关自动选最优 + 失败无感切换），
   // 比写死某个具体模型名更贴合"通用规则"，模型下架/改名也不用改这里
   $("#guide-py").textContent =
     'from openai import OpenAI\n' +
     'client = OpenAI(base_url="' + base + '",\n' +
     '                api_key="' + tok + '")\n' +
     'resp = client.chat.completions.create(\n' +
-    '    model="auto:quality",  # 或换成 models 列表里任意一个模型名\n' +
+    '    model="auto-quality",  # 或换成 models 列表里任意一个模型名\n' +
     '    messages=[{"role": "user", "content": "你好"}])\n' +
     'print(resp.choices[0].message.content)';
   $("#guide-curl").textContent =
     'curl -i ' + base + '/chat/completions \\\n' +
     '  -H "Content-Type: application/json" \\\n' +
     '  -H "Authorization: Bearer ' + tok + '" \\\n' +
-    '  -d \'{"model":"auto:quality","messages":[{"role":"user","content":"你好"}]}\'';
+    '  -d \'{"model":"auto-quality","messages":[{"role":"user","content":"你好"}]}\'';
   // 常用客户端配置片段（借鉴 FreeLLMAPI 的 setup-* 思路）
   const snippets = [
     ["环境变量（OpenAI SDK 系工具通用）",
@@ -406,19 +454,30 @@ function renderGuide(){
 // ---- 模型（分页；排序与状态逻辑见下方 MODEL_STATE 区块） ----
 const PAGE = {size: 100, n: 0};
 // ---- 模型：状态/收藏/搜索语法/排序 ----
-const MODEL_STATE = {sort: "balanced", showOk: true, showLimited: true};
-// 收藏持久化在后端 config.json（overview.pinned），不依赖浏览器 localStorage
-function pinList(){ return overview?.pinned || []; }
+// showDown 默认关：红点模型（硬不可用）平时不混进列表，要诊断再打开。
+// 为什么需要这个开关：`down` 没有出口，而唯一能救回它的入口（模型页「测试」）以前
+// 因为模型不渲染而根本点不到 → 2026-09-21 起后端允许手动测试穿透 channel_down，
+// 前端补上这一屏，两边合起来才是「点一下就救回来」。
+const MODEL_STATE = {sort: "balanced", showOk: true, showLimited: true, showDown: false};
+// 收藏持久化在后端 config.json，不依赖浏览器 localStorage。
+// 两套收藏（2026-09-20 起）：「视觉」视图有自己的 `pinned_vision`，只管这一屏的排序
+// 与 `auto-vision` 的实际切换顺序；其余视图用主收藏 `pinned`。同一个模型要两边各收一次。
+function pinScope(){ return MODEL_STATE.sort === "vision" ? "vision" : "main"; }
+function pinList(){
+  const o = overview || {};
+  return (pinScope() === "vision" ? o.pinned_vision : o.pinned) || [];
+}
 function isPinned(id){ return pinList().includes(id); }
 async function togglePin(id){
   const pinned = !isPinned(id);
-  // 乐观更新界面
+  const scope = pinScope();
+  // 乐观更新界面（只动当前这一套，另一套保持原样）
   if (!overview) overview = {};
-  overview.pinned = pinned
-    ? (pinList().concat([id]))
-    : pinList().filter(x => x !== id);
+  const next = pinned ? pinList().concat([id]) : pinList().filter(x => x !== id);
+  if (scope === "vision") overview.pinned_vision = next;
+  else overview.pinned = next;
   renderModels();
-  try { await api("/api/pins", {model: id, pinned}); }
+  try { await api("/api/pins", {model: id, pinned, list: scope}); }
   catch(e){ toast("收藏保存失败: "+e.message); await loadOverview(); }
 }
 // 迁移旧版 localStorage 收藏 → 后端
@@ -440,11 +499,13 @@ function syncChips(){
     b.classList.toggle("active", b.dataset.sort === MODEL_STATE.sort));
   $("#show-ok-btn").classList.toggle("active", MODEL_STATE.showOk);
   $("#show-limited-btn").classList.toggle("active", MODEL_STATE.showLimited);
+  $("#show-down-btn").classList.toggle("active", MODEL_STATE.showDown);
 }
 $("#show-ok-btn").onclick = () => { MODEL_STATE.showOk = !MODEL_STATE.showOk; syncChips(); renderModels(); };
 $("#show-limited-btn").onclick = () => { MODEL_STATE.showLimited = !MODEL_STATE.showLimited; syncChips(); renderModels(); };
+$("#show-down-btn").onclick = () => { MODEL_STATE.showDown = !MODEL_STATE.showDown; syncChips(); renderModels(); };
 // 「视觉」也在这一排：整排 chip 都是**视图**（只决定列表排序），不写回 route_strategy——
-// 路由策略在 Agent 端填模型名选（auto / auto:quality / …），这里点了只是「换一种看法」。
+// 路由策略在 Agent 端填模型名选（auto / auto-quality / …），这里点了只是「换一种看法」。
 document.querySelectorAll("#sort-chips .chip-btn").forEach(b =>
   b.onclick = () => setView(b.dataset.sort));
 
@@ -465,23 +526,42 @@ function chName(n){
 // 排序：收藏置顶 → 可用(ok) → 受限(limited) → 策略分 → 版本号 → 名称
 // 策略 = 主维度优先（按**容忍带宽**分档：「差得不多」就算同等）+ 档内再按另两维加权；
 // 均衡是三维直接加权。与后端 _STRATEGY_SPEC / _score_dims 完全同口径。
+// **带宽是按维度各自校准的**：能力带 0.10 ≈ AA 3.5 分；速度带 0.10 ≈ 1.9 倍延迟
+// （速度维已 log 线性化，各档等比，见 speedScore）。
 // 为什么用带宽而不是严格主键：主维度是连续值（AA 34.5 vs 34.6 也算不同），
 // 严格排序等于只看主键，稳定/速度两维就废了。
 const STRAT_SPEC = {
   quality:   {primary: 0, band: 0.10, tie: [0.60, 0.40]},   // 智能优先：能力接近时看稳定6/速度4
   stability: {primary: 1, band: 0.08, tie: [0.60, 0.40]},   // 稳定优先：稳定接近时看智能6/速度4
   speed:     {primary: 2, band: 0.10, tie: [0.55, 0.45]},   // 速度优先：速度接近时看智能5.5/稳定4.5
-  vision:    {primary: 0, band: 0.10, tie: [0.60, 0.40]},   // 视觉分组：只看能看图的，能力优先+均衡（= auto:vision）
+  vision:    {primary: 0, band: 0.10, tie: [0.60, 0.40]},   // 视觉分组：只看能看图的，能力优先+均衡（= auto-vision）
   balanced:  {weights: [0.35, 0.40, 0.25]},                 // 均衡：三维加权
 };
 const OTHER_DIMS = [[1, 2], [0, 2], [0, 1]];                // 主维度 → 剩下两维
 const CAP_NORM = {3: 0.76, 2: 0.28, 1: 0.10};               // 无榜分时的档位锚点（同后端 _TIER_ANCHOR）
 const STAB_PRIOR = 0.7;                                     // 稳定维先验（同后端 _SCORE_PRIOR）
+// 速度维：延迟(ms) → 0~1，**log 线性化**（100ms→1.0，60s→0.0）。⚠️ 必须与后端
+// `gateway.speed_score` 完全同口径，改一边不改另一边 = 界面顺序与 auto 选路分叉。
+// 旧版是双曲 400/(400+ms)：极度右偏，真实样本全挤进 (0,0.1)，于是 band 分档退化成
+// 「延迟 <3.6s 全算同一档」——速度优先视图里同档内速度完全不起作用（用户 2026-09-20 报）。
+// log 线性化后各档是等比延迟（band 0.10 ≈ 1.9 倍），快慢两端粒度一致。
+const SPD_FAST_MS = 100, SPD_SLOW_MS = 60000;
+const SPD_LOG_SPAN = Math.log(SPD_SLOW_MS / SPD_FAST_MS);
+function speedScore(lat){
+  if (lat == null || !isFinite(lat)) return 0;   // 未知延迟按最慢算（同后端）
+  if (lat <= SPD_FAST_MS) return 1;
+  if (lat >= SPD_SLOW_MS) return 0;
+  return (Math.log(SPD_SLOW_MS) - Math.log(lat)) / SPD_LOG_SPAN;
+}
 // 模型分 = 「该模型最优渠道」的策略分。逐渠道算完取最大，不能用
 // 「稳定分取最好的渠道 + 延迟取最快的渠道」拼分——那会拼出一个不存在的组合。
 function compScore(m){
-  // 「视觉」视图按视觉策略排序（= auto:vision 的实际顺序），其余按当前路由策略
-  const s = MODEL_STATE.sort === "vision" ? "vision"
+  // 视图名 ↔ Agent 端策略名一一对应（视图 balanced = auto-balanced…），
+  // 所以排序口径**就跟当前视图走**——切哪个 chip 用哪套 spec。
+  // 曾经的写法是「除视觉外一律用 settings.route_strategy」：那是个配置里的固定值，
+  // 于是 均衡/智能/稳定/速度 四个 chip 切来切去都是同一套排序（顺序纹丝不动）。
+  // settings.route_strategy 只作兜底：视图名不在 STRAT_SPEC 里时才回退。
+  const s = STRAT_SPEC[MODEL_STATE.sort] ? MODEL_STATE.sort
             : (overview?.settings?.route_strategy || "balanced");
   const spec = STRAT_SPEC[s] || STRAT_SPEC.balanced;
   const cap = m.cap_score ?? CAP_NORM[m.tier] ?? 0.28;      // 连续能力分（后端按 AA 榜分算好）
@@ -495,7 +575,7 @@ function compScore(m){
     // 加权策略（均衡）里把它剔除、权重归一给另外两维——与后端 _score_dims 完全同口径：
     // 不让一个假的 0.7 先验干扰排序，有真实数据了再以完整权重生效。
     const dims = [cap, (c.stab ?? null),
-                  (lat != null && isFinite(lat)) ? 400 / (400 + lat) : 0];
+                  speedScore(lat)];
     let v;
     if (spec.weights){
       const w = spec.weights;
@@ -513,9 +593,12 @@ function compScore(m){
 function modelSort(a, b){
   const pa = isPinned(a.id), pb = isPinned(b.id);
   if (pa !== pb) return pa ? -1 : 1;
-  const rank = {ok: 0, limited: 1};
+  // ⚠️ down 也要在表里：现在的渲染链路会先把 down 过滤掉（见 `all` 的定义），所以
+  // 正常走不到这里；但一旦哪天不过滤了，undefined - 0 = NaN 会让 sort 顺序静默错乱。
+  const rank = {ok: 0, limited: 1, down: 2};
   const sa = a.status || "ok", sb = b.status || "ok";
-  if (rank[sa] !== rank[sb]) return rank[sa] - rank[sb];
+  const ra = rank[sa] ?? 2, rb = rank[sb] ?? 2;      // 未知状态一律垫底，不再返回 NaN
+  if (ra !== rb) return ra - rb;
   const d = compScore(b) - compScore(a);
   if (d) return d;
   return _versionCmp(a.id, b.id) || a.id.localeCompare(b.id);
@@ -538,7 +621,37 @@ function _lastVersion(s){
 }
 function bestLat(m){ return Math.min(...(m.channels||[]).filter(c=>c.available).map(c=>c.latency_ms ?? Infinity)); }
 
-// 搜索语法：裸词匹配模型名；provider:x 筛渠道；v: 筛视觉；t:3 筛档位
+// 搜索语法：裸词匹配模型名（**精确等于某个渠道名**时改按渠道筛）；
+// provider: / p: / 渠道: 筛渠道（全名、表格里显示的短名、渠道类型、渠道 id 都能命中）；
+// v: 筛视觉；t:3 筛档位。
+// 2026-09-21 修：原来只拿 channel_name 做 includes →
+//   ① 表格里显示的是短名（HF / NIM / GLM），而 "HF" 并不在 "HuggingFace Router" 里 → 搜不到；
+//   ② 渠道改名后，按平台名（modelscope / nim）也搜不到；
+//   ③ "provider: 魔搭"（冒号后带空格）会切成两个 token，前半截空值 includes("") 恒真。
+function chShortOf(name){
+  if (!name) return "";
+  return CH_SHORT[name] || chName(name);
+}
+function chHit(c, v){
+  const hay = [c.channel_name, chShortOf(c.channel_name), c.channel_type, c.channel_id]
+    .filter(Boolean).join(" ").toLowerCase();
+  return hay.includes(v);
+}
+// 裸词精确等于渠道全名/短名/平台类型（modelscope / nim / custom）→ 返回这些渠道 id。
+// **只做精确匹配**：若改成 includes，"glm" 就会把「智谱 GLM」整条渠道带出来，
+// 模型名搜索立刻变味。返回数组是因为同一类型可能有多条渠道（两个 custom）。
+function chIdsByExactName(tok){
+  const out = [];
+  if (!tok) return out;
+  for (const c of (overview?.channels || [])){
+    const full = (c.name || "").toLowerCase();
+    const ty = (c.type || "").toLowerCase();
+    if (tok === full || tok === chShortOf(c.name || "").toLowerCase() || (ty && tok === ty)) {
+      out.push(c.id);
+    }
+  }
+  return out;
+}
 function kwMatch(m, tokens){
   if (!tokens.length) return true;
   return tokens.every(t => {
@@ -552,31 +665,157 @@ function kwMatch(m, tokens){
       const n = parseInt(tq.split(":")[1], 10);
       return m.tier === n;
     }
-    if (tq.startsWith("provider:") || tq.startsWith("p:")) {
-      const v = tq.split(":")[1] || "";
-      return (m.channels||[]).some(c => (c.channel_name||"").toLowerCase().includes(v));
+    if (tq.startsWith("provider:") || tq.startsWith("p:") || tq.startsWith("渠道:")) {
+      const v = tq.slice(tq.indexOf(":") + 1).trim();
+      if (!v) return true;                      // 「provider:」后面没写 → 不过滤
+      return (m.channels || []).some(c => chHit(c, v));
     }
-    return (m.id||"").toLowerCase().includes(tq);
+    if ((m.id || "").toLowerCase().includes(tq)) return true;
+    const cids = chIdsByExactName(tq);          // 裸词正好是渠道名/平台类型 → 按渠道筛
+    return cids.length > 0 && (m.channels || []).some(c => cids.includes(c.channel_id));
   });
 }
+// 搜索框提示跟着渠道走：provider: 后面能写什么，一眼可见（短名 = 表格里显示的那个）
+// 注意：输入框只有 230px，把 6 个短名全列进 placeholder 必然被浏览器截断（看起来像乱码）。
+// 所以 placeholder 只留最简语法，完整短名清单放 title（hover 可见）。
+function syncSearchHint(){
+  const box = $("#model-search");
+  if (!box) return;
+  const shorts = [];
+  for (const c of (overview?.channels || [])){
+    if (c.enabled === false) continue;
+    const s = chShortOf(c.name || c.type || "");
+    if (s && !shorts.includes(s)) shorts.push(s);
+  }
+  box.placeholder = "搜索模型…  provider:渠道 · v: · t:3";
+  box.title = shorts.length
+    ? `搜索：模型名 / 渠道短名（${shorts.join(" / ")}）/ provider:<短名|类型|渠道id> / v: 只看视觉 / t:3 档位`
+    : "搜索：模型名 / provider:<渠道> / v: 只看视觉 / t:3 档位";
+}
+
+// 档位 chip：**真模型可点**（点开小面板手动指定档位）；别名行不可点 —— 别名是路由名，
+// 它的档位没有意义（路由时展开成真实模型，各按各的档位算分）。
+// 手动指定过的：chip 用主色 + 小圆点标出来，hover 里同时给出「自动判定」值，方便对比。
+function tierChip(m){
+  const txt = MODEL_TIERS[m.tier] || "中档";
+  const aa  = m.aa != null ? " " + Number(m.aa).toFixed(1) : "";
+  const src = m.aa != null
+    ? `Artificial Analysis 智能指数 ${Number(m.aa).toFixed(1)}（经 OpenRouter 榜单自动更新）`
+    : `无 AA 榜分，按家族/规模推断`;
+  if (m.isAlias) return `<span class="tag-chip ok" title="档位 ${txt} · ${src}">${txt}${aa}</span>`;
+  const tip = `档位 ${txt} · ${src}`
+    + (m.tier_manual ? `　·　手动指定（自动判定：${MODEL_TIERS[m.tier_auto] || "中档"}）` : "")
+    + "　—— 点这里手动改";
+  return `<button class="tag-chip ok tier-btn${m.tier_manual ? " manual" : ""}"`
+       + ` title="${esc(tip)}" data-model="${esc(m.id)}">${txt}${aa}`
+       + `<span class="tier-caret">▾</span></button>`;
+}
+
+// ---- 手动档位：点档位 chip 弹小面板 ----
+// 为什么要有它：档位靠启发式猜（AA 榜分 > 名字规则），总会有判错的模型
+// （例：qwen 的 flash 不在「同代主力」白名单里 → 被降成中档）。与其改白名单一个一个治，
+// 不如让用户就地拍板。写进 config.json 的 model_tier_exact（点名表），自动判定照旧可回退。
+let TIER_POP = null;
+function closeTierMenu(){
+  if (!TIER_POP) return;
+  TIER_POP.remove(); TIER_POP = null;
+  document.removeEventListener("click", _tierDocClick, true);
+  document.removeEventListener("keydown", _tierEsc, true);
+}
+function _tierDocClick(e){
+  if (!TIER_POP) return;
+  if (TIER_POP.contains(e.target)) return;
+  // 点 chip 的活交给 #model-rows 那个处理器：同一个 chip = 收起，换一个 chip = 换面板。
+  // 这里若也去关，就会「先关再开」——点同一个 chip 永远关不掉。
+  if (e.target.closest && e.target.closest(".tier-btn")) return;
+  closeTierMenu();
+}
+function _tierEsc(e){ if (e.key === "Escape") closeTierMenu(); }
+function openTierMenu(btn, id){
+  const wasOpen = TIER_POP && TIER_POP.dataset.for === id;
+  closeTierMenu();
+  if (wasOpen) return;                                  // 同一个 chip 再点一次 = 收起
+  const m = (overview?.models || []).find(x => x.id === id) || {};
+  const auto = m.tier_auto ?? m.tier ?? 2, cur = m.tier ?? auto, man = !!m.tier_manual;
+  const row = (t, label, note) =>
+    `<button class="tier-item${(man ? t === cur : t === 0) ? " on" : ""}" data-tier="${t}">`
+    + `<span>${label}</span><span class="muted small">${note}</span></button>`;
+  const pop = document.createElement("div");
+  pop.className = "tier-pop";
+  pop.dataset.for = id;
+  pop.innerHTML =
+      `<div class="tier-pop-h">档位<span class="muted small">影响「智能优先」排序与 auto-quality 路由</span></div>`
+    + row(0, "自动", (man ? "清除手动指定 · " : "") + `当前判定：${MODEL_TIERS[auto] || "中档"}`)
+    + row(3, "智能", "3 · 同代旗舰")
+    + row(2, "中档", "2 · 加速档 / 落后代")
+    + row(1, "轻量", "1 · 小尺寸 / 非对话")
+    + `<div class="tier-pop-f muted small">手动指定后以你为准，不再看榜分与名字推断<br>`
+    + `<span class="mono">${esc(id)}</span></div>`;
+  document.body.appendChild(pop);
+  const r = btn.getBoundingClientRect();
+  pop.style.left = Math.max(8, Math.min(r.left, innerWidth - pop.offsetWidth - 8)) + "px";
+  pop.style.top  = Math.max(8, Math.min(r.bottom + 6, innerHeight - pop.offsetHeight - 8)) + "px";
+  TIER_POP = pop;
+  pop.querySelectorAll(".tier-item").forEach(b => b.onclick = async () => {
+    const t = Number(b.dataset.tier);
+    closeTierMenu();
+    try {
+      const res = await api("/api/model-tier", {model: id, tier: t});
+      const autoTxt = MODEL_TIERS[res.tier_auto] || "中档";
+      toast(t ? `已设为${MODEL_TIERS[t]}档（自动判定：${autoTxt}）` : `已交回自动判定（${autoTxt}）`);
+      await loadOverview();                            // 重取 → 重排（这正是改档位的目的）
+      flashTierChip(id);
+    } catch(e){ toast("档位保存失败: " + e.message); }
+  });
+  // 本次点击先走完再挂全局监听，否则它自己立刻把面板关掉
+  setTimeout(() => {
+    document.addEventListener("click", _tierDocClick, true);
+    document.addEventListener("keydown", _tierEsc, true);
+  }, 0);
+}
+// 改完档位列表会重排（模型可能因此换位置甚至换页）：能看见就滚过去闪一下，看不见就只靠 toast
+function flashTierChip(id){
+  // 按 dataset 比对而不是拼选择器：模型 id 里有 `/` `.` `:`，何必跟转义较劲（CSS.escape 也不是处处都有）
+  const el = Array.from(document.querySelectorAll("#model-rows .tier-btn"))
+    .find(b => b.dataset.model === id);
+  if (!el) return;
+  el.closest("tr")?.scrollIntoView({block: "nearest"});
+  el.classList.add("flash");
+  setTimeout(() => el.classList.remove("flash"), 1200);
+}
+$("#model-rows").addEventListener("click", e => {
+  const btn = e.target.closest(".tier-btn");
+  if (btn) openTierMenu(btn, btn.dataset.model);
+});
 
 function renderModels(){
-  const kw = $("#model-search").value.trim();
+  syncSearchHint();
+  // 容错：全角冒号、「provider : 魔搭」这种冒号前后带空格的写法。
+  // 不归一化的话会被空格切成两个 token —— "provider:" 拿到空值（includes("") 恒真，
+  // 等于没筛），后半截又跑去匹配模型名，结果既不是渠道筛也不是报空，纯属误导。
+  const kw = $("#model-search").value.trim()
+    .replace(/：/g, ":")
+    .replace(/(^|\s)(provider|p|渠道)\s*:\s*/gi, (s, pre, key) => pre + key.toLowerCase() + ":");
   const tokens = kw ? kw.toLowerCase().split(/\s+/) : [];
   const aliases = (overview?.aliases || []).map(a => ({
     id: a.name, available: a.available, isAlias: true,
     status: a.available ? "ok" : "limited",
     tier: 2, channel_count: a.targets.length, channels: [], targets: a.targets }));
-  const all = [...aliases, ...(overview?.models || [])].filter(m => m.status !== "down");
+  // 不再在这里把 down 过滤掉——改由下面的「不可用」开关控制（默认关，视图象原来一样）。
+  // 保留在 all 里是为了：① 红点那一屏能列出来并点「测试」；② 计数/空态文案能报出真实数量。
+  const all = [...aliases, ...(overview?.models || [])];
   // 视觉分组：只列能看图的模型（别名不算）
   const inGroup = m => MODEL_STATE.sort !== "vision" || !!m.vision;
   // 先算可见计数（未按 ok/受限 开关收窄，供 chip 文案与空态提示）
   const okN = all.filter(m => m.status === "ok" && inGroup(m) && kwMatch(m, tokens)).length;
   const limN = all.filter(m => m.status === "limited" && inGroup(m) && kwMatch(m, tokens)).length;
+  const downN = all.filter(m => m.status === "down" && inGroup(m) && kwMatch(m, tokens)).length;
   const filtered = all
     .filter(inGroup)
     .filter(m => kwMatch(m, tokens))
-    .filter(m => (m.status === "ok" && MODEL_STATE.showOk) || (m.status === "limited" && MODEL_STATE.showLimited))
+    .filter(m => (m.status === "ok" && MODEL_STATE.showOk)
+              || (m.status === "limited" && MODEL_STATE.showLimited)
+              || (m.status === "down" && MODEL_STATE.showDown))
     .sort(modelSort);
   const total = filtered.length;
   const maxPage = Math.max(0, Math.ceil(total / PAGE.size) - 1);
@@ -585,31 +824,41 @@ function renderModels(){
   // 计数：放在「可用 / 受限」开关上——任何视图（含视觉）下都能一眼看到当前视图的可用/受限分布
   $("#show-ok-btn").textContent = `● 可用 ${okN}`;
   $("#show-limited-btn").textContent = `● 受限 ${limN}`;
+  $("#show-down-btn").textContent = `● 不可用 ${downN}`;
   $("#show-ok-btn").title = `显示/隐藏可用的免费模型（当前视图 ${okN} 个）`;
   $("#show-limited-btn").title = `显示/隐藏暂时受限的免费模型（限流/冷却中，当前视图 ${limN} 个）`;
+  $("#show-down-btn").title = `显示/隐藏硬不可用模型（当前视图 ${downN} 个）：余额/权限/已下线等，等不来自愈。`
+    + `误判的可点「测试」强制真测一次救回；真用不了的点了还是同一句错。`;
   $("#model-count").textContent = `共 ${okN + limN} 个`;
   $("#model-empty").style.display = total ? "none" : "block";
-  $("#model-empty").textContent = !okN && !limN
+  $("#model-empty").textContent = !okN && !limN && !downN
     ? "还没有模型。请到「渠道」页添加渠道，保存后会自动测试连接；再点「扫描全部模型」确认哪些真能免费调用。"
     : (MODEL_STATE.showOk && !MODEL_STATE.showLimited && limN
         ? `另有 ${limN} 个模型暂时受限（限流/冷却中），点上方「受限」查看。`
-        : "当前筛选下没有符合条件的模型，试试调整上方的「可用/受限」开关或搜索词。");
+        : "当前筛选下没有符合条件的模型，试试调整上方的「可用/受限/不可用」开关或搜索词。");
   $("#pg-info").textContent = total ? `${PAGE.n*PAGE.size+1}-${PAGE.n*PAGE.size+rows.length} / ${total}` : "";
   $("#model-rows").innerHTML = rows.map((m, i) => {
     const lat = bestLat(m);
-    const st = m.status === "ok" ? "ok" : "limited";
-    const stLabel = st === "ok" ? "免费可调" : "受限：暂时限流/冷却中";
+    const st = m.status === "ok" ? "ok" : (m.status === "down" ? "down" : "limited");
+    const stLabel = st === "ok" ? "免费可调"
+      : (st === "down" ? "不可用：等不来自愈" : "受限：暂时限流/冷却中");
+    // 最近一次实测记录是**模型级**的（后端 model_status，不带渠道维度）→ 显示时必须带上
+    // 渠道名，否则多渠道模型只显示一句「HTTP 403」，用户不知道是哪条渠道的账。
+    // 想逐条渠道看实时状态，看右边那些渠道 chip（带各自的不可用原因）。
+    const lastTest = m.test_reason
+      ? `${m.test_channel ? m.test_channel + "：" : ""}${m.test_reason}` : "";
     const stTitle = st === "ok"
-      ? (m.test_ts ? `上次实测可调 ${fmtTime(m.test_ts)}` : "渠道健康、未做单模型实测")
-      : (m.test_reason || "限流/冷却中，稍后可恢复");
-    const stChip = st === "limited" ? '<span class="tag-chip" style="color:var(--warn); border-color:var(--warn)">受限</span>' : "";
+      ? (m.test_ts ? `上次实测可调 ${fmtTime(m.test_ts)}${m.test_channel ? " · " + m.test_channel : ""}` : "渠道健康、未做单模型实测")
+      : (lastTest || (st === "down" ? "硬不可用（余额不足/无权限/已下线）"
+                                    : "限流/冷却中，稍后可恢复"));
+    const stChip = st === "limited"
+      ? '<span class="tag-chip" style="color:var(--warn); border-color:var(--warn)">受限</span>'
+      : (st === "down"
+          ? '<span class="tag-chip" style="color:var(--bad); border-color:var(--bad)" title="等不来自愈；点右侧「测试」强制真测一次">不可用</span>'
+          : "");
     // 特点 chips（档位与 AA 分合成一个 chip：一行里少占 ~50px，术语在 hover 里解释）
     const chips = [];
-    const tierTxt = MODEL_TIERS[m.tier] || "中档";
-    const aaTip = (m.aa != null)
-      ? ` title="档位 ${tierTxt} · Artificial Analysis 智能指数 ${Number(m.aa).toFixed(1)}（经 OpenRouter 榜单自动更新）"`
-      : ` title="档位 ${tierTxt}（无 AA 榜分，按家族/规模推断）"`;
-    chips.push(`<span class="tag-chip ok"${aaTip}>${tierTxt}${m.aa != null ? " " + Number(m.aa).toFixed(1) : ""}</span>`);
+    chips.push(tierChip(m));
     chips.push(isFinite(lat) ? `<span class="tag-chip" title="响应延迟（流式请求为首字节时间 TTFT）">${fmtLatency(lat)}</span>` : `<span class="tag-chip">—</span>`);
     if (m.vision) chips.push('<span class="tag-chip ok" title="支持图像输入（能看图）">👁</span>');
     if (m.context) chips.push(`<span class="tag-chip">${esc(m.context)}</span>`);
@@ -617,11 +866,24 @@ function renderModels(){
     if (u.requests) chips.push(`<span class="tag-chip">24h ${u.requests} 次</span>`);
     // 来源渠道 chips（≤4 个与特点同一行，≥5 才换行；渠道名已短写）
     // 百分比 = 近 N 次**真实调用**的成功率（后端 stab_raw；没真实样本就不显示）
-    const srcChips = (m.channels || []).slice(0, 4).map(c =>
-      `<span class="tag-chip ${c.available?'ok':''}" title="${esc(c.channel_name)} · ${c.score!=null?`近 ${c.samples} 次真实调用成功率 ${Math.round(c.score*100)}%`:'暂无真实调用样本'} · ${fmtLatency(c.latency_ms)}">${esc(chName(c.channel_name))}${(c.score!=null)?` ·${Math.round((c.score*100))}%`:''}</span>`).join("");
+    // 2026-09-21：chip 直接画这条渠道自己的状态 —— **绿=可调 / 红=不可用**，就这两档。
+    // 不可用时**不加任何文字后缀**（曾经加过「 ·不可用」，用户嫌啰嗦）：红边红字本身就是信号，
+    // chip 宽度不再随状态变化，同一列 chip 左右对齐也稳。具体原因全部进悬停，第一行就是
+    // 「⚠ 渠道名 当前不可用：<原因>」，来源是后端 unavail_reason（硬失败原文 / 冷却到几点 /
+    // 健康检查没过…）；百分比仍是近 N 次**真实调用**成功率（后端 stab_raw，无样本则不显示）。
+    const srcChips = (m.channels || []).slice(0, 4).map(c => {
+      const why = c.available ? "" : (c.unavail_reason || "不可用");
+      const stat = `${c.score!=null?`近 ${c.samples} 次真实调用成功率 ${Math.round(c.score*100)}%`:'暂无真实调用样本'} · ${fmtLatency(c.latency_ms)}`;
+      const tip = why ? `⚠ ${c.channel_name} 当前不可用：${why}\n${stat}` : `${c.channel_name} · ${stat}`;
+      return `<span class="tag-chip ${c.available?'ok':'bad'}" title="${esc(tip)}">${esc(chName(c.channel_name))}${(c.score!=null)?` ·${Math.round((c.score*100))}%`:''}</span>`;
+    }).join("");
     const more = (m.channels||[]).length > 4 ? `<span class="tag-chip">+${(m.channels||[]).length-4}</span>` : "";
     const chChips = (m.channels || []).length ? srcChips + more : "";
-    const pinBtn = `<button class="btn${isPinned(m.id)?' pinned':''}" style="padding:4px 8px" title="收藏置顶（★=已收藏）" onclick="togglePin('${esc(m.id)}')">${isPinned(m.id)?'★':'☆'}</button>`;
+    // 视觉视图里这颗 ★ 是「视觉专属收藏」——只影响这一屏与 auto-vision
+    const pinTitle = pinScope() === "vision"
+      ? "视觉专属收藏（★=已收藏）：只影响这一屏排序与 auto-vision 的切换顺序，与其它视图的收藏互不影响"
+      : "收藏置顶（★=已收藏）：影响均衡/智能/稳定/速度四个视图与对应 auto 策略";
+    const pinBtn = `<button class="btn${isPinned(m.id)?' pinned':''}" style="padding:4px 8px" title="${pinTitle}" onclick="togglePin('${esc(m.id)}')">${isPinned(m.id)?'★':'☆'}</button>`;
     const oneline = (m.channels||[]).length <= 4;
     return `<tr>
       <td class="muted small" style="width:44px">${PAGE.n*PAGE.size+i+1}</td>
@@ -636,7 +898,7 @@ function renderModels(){
       <td style="white-space:nowrap"><button class="btn" onclick="testModel('${esc(m.id)}', this)" ${m.isAlias?'disabled':''}>测试</button></td>
     </tr>`;
   }).join("");
-  // 测试台模型下拉：只列「当前可调」模型，按当前路由策略排序
+  // 测试台模型下拉：只列「当前可调」模型，按当前视图顺序（同列表口径）
   const cur = $("#pg-model").value;
   const opts = all.filter(m => m.status === "ok").sort(modelSort)
     .map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`);
@@ -654,8 +916,17 @@ async function testModel(model, btn){
   try {
     const r = await api("/api/models/test", {model});
     const note = r.note ? `\n${r.note}` : "";
+    // 渠道名：后端按「未记硬失败的渠道优先、逐个试、第一个成功即返回」的顺序走，
+    // 成功时显示的就是真正被打到的那条。
+    // 失败时（2026-09-21 起口径：试完所有渠道才定论）后端附 `attempts` —— 逐条列出来，
+    // 只报最后一条会让人以为「只试了一条」，而口径是「所有渠道都失败才算不可用」。
+    const tries = r.attempts || [];
+    const more = tries.length > 1
+      ? "\n已试 " + tries.length + " 条渠道：" + tries.map(
+          t => `${t.channel || "?"}（${(t.error || "").slice(0, 60)}）`).join("；")
+      : "";
     toast(r.available ? `✔ ${model} 可用 · ${r.channel||""} ${fmtLatency(r.latency_ms||0)}${note}`
-                       : `✘ ${model} 不可用：${(r.error||"").slice(0,120)}${note}`);
+                       : `✘ ${model} 不可用${r.channel?`（最后试到 ${r.channel}）`:""}：${(r.error||"").slice(0,120)}${more}${note}`);
     await loadOverview();
   } catch(e){ toast("测试失败："+e.message); }
   finally { if (btn) { btn.disabled = false; btn.textContent = "测试"; } }
@@ -986,40 +1257,74 @@ async function delCh(id){ if(!confirm("确定删除该渠道？")) return;
   try{ await api("/api/channels/"+id, undefined, "DELETE"); await loadOverview(); toast("已删除"); }catch(e){toast(e.message);} }
 
 // ---- 统计 ----
-async function loadStats(){
+// 静默刷新时按块比对签名，只有内容真变了才重绘，避免每几秒重建 DOM 造成闪烁
+const _statSig = { cards: "", chart: "", model: "", channel: "" };
+let _statSeq = 0;   // 请求序号：慢响应回来时若已有更新的请求，丢弃本次结果
+
+async function loadStats(silent){
   const days = $("#stat-days").value;
-  const s = await api("/api/usage?days="+days, undefined, "GET");
+  const seq = ++_statSeq;
+  let s;
+  try {
+    s = await api("/api/usage?days="+days, undefined, "GET");
+  } catch(e) {
+    if (!silent) toast("统计加载失败：" + e.message);
+    return;
+  }
+  if (seq !== _statSeq) return;
   const t = s.totals || {};
-  // 客户端主动中断（用户点停止/客户端超时）不算失败：分母剔掉它，失败数后端已排除
+  // 统计口径 = 按「模型×尝试」：这一跳失败就是失败（含后面换了渠道的那几次）。
+  //   cancelled  = 客户端主动中断（用户点停止/客户端超时），上游其实正常 → 不算失败
+  //   superseded = 补充信息：这些失败里有几次后面换到了别的候选（不改变失败归属）
   const cancelled = t.cancelled || 0;
+  const superseded = t.superseded || 0;
   const valid = Math.max(0, t.requests - cancelled);
   const okCount = valid - t.errors;
   const rate = valid ? (okCount*100/valid).toFixed(1)+"%" : "—";
-  $("#stat-cards").innerHTML = `
+  const sub = (cancelled?`<span title="客户端主动断开的次数：模型已正常输出 token 的按成功算（明细里带小字「客户端中断」），一个字都没输出的记「已中断」—— 两种都不计入失败"> · ${fmtNum(cancelled)} 客户端中断</span>`:"")
+            + (superseded?`<span title="这些失败里有几次后面又换到了别的候选渠道（明细里带小字「已换路」）；失败归属不变，仍计在失败数里">（其中 ${fmtNum(superseded)} 次已换路）</span>`:"");
+  const cards = `
     <div class="stat"><div class="num">${fmtNum(t.requests)}</div><div class="lbl">总请求数</div></div>
     <div class="stat"><div class="num">${fmtNum(t.tokens)}</div><div class="lbl">总 Tokens</div></div>
-    <div class="stat"><div class="num" style="color:${t.errors?'var(--bad)':'inherit'}">${fmtNum(t.errors)}</div><div class="lbl">失败请求${cancelled?`<span title="客户端主动断开，不计失败"> · ${fmtNum(cancelled)} 中断</span>`:""}</div></div>
+    <div class="stat"><div class="num" style="color:${t.errors?'var(--bad)':'inherit'}">${fmtNum(t.errors)}</div><div class="lbl">失败请求${sub}</div></div>
     <div class="stat"><div class="num">${rate}</div><div class="lbl">成功率</div></div>`;
+  if (cards !== _statSig.cards) { _statSig.cards = cards; $("#stat-cards").innerHTML = cards; }
   // 柱状图
   const daily = s.daily || [];
   const max = Math.max(1, ...daily.map(d=>d.requests));
-  $("#chart").innerHTML = daily.length ? daily.map(d => `
-    <div class="bar-wrap" title="${d.date}：${d.requests} 次请求，${fmtNum(d.tokens)} tokens，${d.errors} 次失败${d.cancelled?`，${d.cancelled} 次中断`:''}">
+  const chart = daily.length ? daily.map(d => `
+    <div class="bar-wrap" title="${d.date}：${d.requests} 次请求，${fmtNum(d.tokens)} tokens，${d.errors} 次失败${d.cancelled?`，${d.cancelled} 次客户端中断`:''}${d.superseded?`（其中 ${d.superseded} 次已换路）`:''}">
       <div class="bar ${d.errors?'err':''}" style="height:${Math.max(12, d.requests*100/max)}%">
         <span class="bar-val">${d.requests}</span>
       </div>
       <div class="bar-lbl">${d.date?.slice(5)}</div></div>`).join("")
     : '<div class="empty">暂无数据</div>';
+  if (chart !== _statSig.chart) { _statSig.chart = chart; $("#chart").innerHTML = chart; }
   const rows = (arr, nameKey) => arr.length ? arr.map(r => `<tr>
       <td class="mono">${esc(r[nameKey])}</td><td>${fmtNum(r.requests)} 次</td>
       <td>${fmtNum(r.tokens)} tk</td><td class="muted small">${r.avg_latency?fmtLatency(Math.round(r.avg_latency)):"—"}</td></tr>`).join("")
     : '<tr><td class="empty">暂无数据</td></tr>';
-  $("#stat-model").innerHTML = rows(s.by_model||[], "model");
-  $("#stat-channel").innerHTML = rows(s.by_channel||[], "name");
+  const modelTbl = rows(s.by_model||[], "model");
+  if (modelTbl !== _statSig.model) { _statSig.model = modelTbl; $("#stat-model").innerHTML = modelTbl; }
+  const chTbl = rows(s.by_channel||[], "name");
+  if (chTbl !== _statSig.channel) { _statSig.channel = chTbl; $("#stat-channel").innerHTML = chTbl; }
 }
-$("#stat-days").onchange = loadStats;
+$("#stat-days").onchange = () => loadStats(false);   // 不能直接挂 loadStats：onchange 会把 event 当 silent 传进去
 
 // ---- 请求日志 ----
+// Tokens 列：优先上游 usage 里的真实 token 数；客户端提前断开时 usage 的收尾块收不到，
+// 就显示模型已输出的**字符数**、照实标「字」——不换算成 token（中英混排没有稳定比例，
+// 换算出来的数只会更误导）。此前这一格只显示「—」而行 hover 里却有个 17374，
+// 两边对不上（用户 2026-09-17 质疑「鼠标指过去有 token 数，行里怎么是横线」），现在给同一个数。
+function tkCell(l){
+  const tk = (l.prompt_tokens || 0) + (l.completion_tokens || 0);
+  if (tk) return fmtNum(tk);
+  if (l.cancelled && l.out_chars)
+    return `<span class="muted" title="客户端提前断开，上游的 usage 收尾块没收到 → 真实 token 数拿不到；`
+         + `这里显示模型已输出的字符数（不是 token）">${fmtNum(l.out_chars)} 字</span>`;
+  if (l.cancelled) return '<span class="muted" title="客户端中断，模型一个字都没输出">—</span>';
+  return "0";
+}
 async function loadLogs(silent){
   const btn = $("#logs-refresh");
   if (!silent && btn) { btn.disabled = true; btn.textContent = "加载中…"; }
@@ -1039,11 +1344,19 @@ async function loadLogs(silent){
       <td class="small">${used}</td>
       <td class="small">${esc(l.channel_name||"—")}</td>
       <td>${fmtLatency(l.latency_ms)}</td>
-      <td>${fmtNum(l.prompt_tokens+l.completion_tokens)}</td>
-      <td>${l.cancelled
-        ? '<span class="muted" title="客户端主动断开（用户停止或客户端超时），上游返回正常，不计失败">已中断</span>'
-        : (l.success ? '<span style="color:var(--ok)">成功</span>'
-                     : '<span style="color:var(--bad)" title="点击看详情">失败</span>')}</td>
+      <td>${tkCell(l)}</td>
+      <td>${l.success
+        ? '<span style="color:var(--ok)">成功</span>'
+          + (l.cancelled
+             ? ' <span class="muted small" title="客户端主动断开（用户停止或客户端超时），但模型已正常输出内容 —— 按成功算；本行 hover 有输出字符数">客户端中断</span>'
+             : '')
+        : (l.cancelled
+           ? '<span class="muted" title="客户端主动断开，且模型一个字都没输出 —— 既不是成功也不是失败，不计失败">已中断</span>'
+           : '<span style="color:var(--bad)" title="这一跳失败（本行 hover 看原因）">失败</span>'
+             + (l.superseded
+                ? ' <span class="muted small" title="这一跳失败后，网关换到了下一个候选渠道继续 —— '
+                  + '失败归属不变（仍计入失败数），只标出这一次后面还接着换过渠道。">已换路</span>'
+                : ''))}</td>
     </tr>`;
     }).join("");
     if (!silent && btn) toast(`已刷新：${logs.length} 条请求记录`);
@@ -1055,14 +1368,16 @@ async function loadLogs(silent){
 }
 $("#logs-refresh").onclick = () => loadLogs(false);
 
-// 统计页打开时自动轮询日志，新请求记录自动出现；离开统计页停止轮询
-let _logTimer = null;
+// 统计页打开时自动轮询：日志 3 秒（新记录立刻出现）、统计卡片/图表 5 秒（聚合查询稍重，慢一拍）；
+// 离开统计页停止轮询
+let _logTimer = null, _statTimer = null;
 function startLogPolling(){
-  if (_logTimer) return;  // 已在轮询中
-  _logTimer = setInterval(() => loadLogs(true), 3000);  // 静默刷新，不动按钮不弹 toast
+  if (!_logTimer) _logTimer = setInterval(() => loadLogs(true), 3000);     // 静默刷新，不动按钮不弹 toast
+  if (!_statTimer) _statTimer = setInterval(() => loadStats(true), 5000);  // 静默刷新顶部数字
 }
 function stopLogPolling(){
   if (_logTimer) { clearInterval(_logTimer); _logTimer = null; }
+  if (_statTimer) { clearInterval(_statTimer); _statTimer = null; }
 }
 
 // ---- 测试台 ----

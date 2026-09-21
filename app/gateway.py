@@ -1,5 +1,8 @@
 """运行时状态：渠道健康、模型注册表、评分排序、错误分类冷却"""
 import collections
+import hashlib
+import logging
+import math
 import re
 import time
 
@@ -18,10 +21,21 @@ DEFAULT_COOLDOWN = 120
 cooldown: dict = {}   # (上游模型ID, channel_id) -> 冷却截止时间
 unverified: set = set()  # 冷却到期但还没实测确认恢复的 (模型, 渠道)
 stats: dict = {}      # (上游模型ID, channel_id) -> {"score": 0~1, "latency": EMA毫秒}
-model_status: dict = {}  # model_id -> {"available": bool, "reason": str, "ts": float, "channel": str}
+# 模型级测试记录。**自 2026-09-21（用户拍板 A1）起不再参与任何可用性 / 路由判定**，只用于
+# 界面展示「最近一次测过什么」（tested / test_reason / test_channel / test_ts）。
+# 能不能用一律由 (模型,渠道) 级状态决定（channel_down / cooldown / unverified / ratelimit）——
+# 只有带渠道维度的记录才不会被跨渠道污染。详见 mark_model_status 与 model_view 的说明。
+model_status: dict = {}  # model_id -> {"available": bool, "state": str, "reason": str, "ts": float, "channel": str}
 channel_down: dict = {}  # (上游模型ID, channel_id) -> {"reason": str, "ts": float} 该渠道上此模型硬不可用
-# 上游响应头里的官方限流信息（Groq/NIM 等返回 x-ratelimit-*）：(模型, 渠道) -> {"remaining": int, "reset_ts": float}
+# 上游响应头里的官方限流信息（Groq/NIM 的 x-ratelimit-*；魔搭的 modelscope-ratelimit-*）：
+# (模型, 渠道) -> {"remaining": int, "reset_ts": float, "source": str, "limit": int|None}
 ratelimit: dict = {}
+# 魔搭 ModelScope 的**账号级**日额度（`modelscope-ratelimit-requests-remaining`）：
+# 该 Key 下所有模型共享，粒度是「渠道」而不是「模型×渠道」，塞不进 ratelimit，所以单开一张表。
+# channel_id -> {"remaining": int, "limit": int|None, "reset_ts": float}
+user_quota: dict = {}
+# 各口径限流头的命中计数（排障用）：重启后看一眼就知道魔搭的头到底有没有被读到
+ratelimit_hits: dict = {"modelscope": 0, "x-ratelimit": 0}
 last_probe_ok: dict = {}  # (模型, 渠道) -> 上次探测成功的 ts（魔搭等按次计费平台用于省探测预算）
 
 # ---- 渠道级 429 熔断（修魔搭等账号级限流：整个 Key 被限，所有模型一起 429）----
@@ -31,6 +45,18 @@ _CH429_COOL = 600      # 渠道冷却 10 分钟
 _channel_429_events: dict = {}  # channel_id -> deque[(ts, model_id)]
 channel_cool: dict = {}  # channel_id -> 冷却截止时间
 channel_last_ok: dict = {}  # channel_id -> 最近一次成功请求的 ts（区分账号级/按模型限流）
+
+# ---- 额度型 429（free_daily）：模型级 vs 账号级 ----
+# 上面那套是「10 分钟窗口内 ≥2 个模型」的分钟级熔断；这里判的是额度型 429 的**层级**：
+# 免费额度型渠道普遍是两层限额（账号级 + 模型级），429 正文分不出来 → 按**爆发度**判。
+# 为什么用「短窗口内多少个不同模型」而不是「当天累计多少」：账号级额度耗尽是**一瞬间**的
+# （额度见底之后每一个模型都立刻 429），模型级则是**一天里慢慢攒**（大模型日额度只有 100）。
+# 用当天累计会把「一天内先后耗完的 4 个大模型」误判成账号级 → 反而又误伤一整条渠道。
+_CH429_QUOTA_WINDOW = 1800   # 30 分钟
+_CH429_QUOTA_MODELS = 4      # 窗口内 ≥4 个不同模型撞额度 429 → 判账号级（见 note_channel_quota_429）
+# channel_id -> deque[(ts, 上游模型ID)]
+# 不落盘：重启后从 0 重新累计，代价只是再撞几次 429；而账号级判定后的 channel_cool 是落盘的。
+channel_quota_429: dict = {}
 
 # 渠道被拒（401/403）后，多久之内算「最近成功过」——用它区分账号级与模型级的权限问题
 _AUTH_MODEL_LEVEL_WINDOW = 600.0
@@ -89,6 +115,9 @@ def sync_channels(cfg: dict):
     for key in list(ratelimit):
         if key[1] not in ids:
             ratelimit.pop(key, None)
+    for cid_ in list(user_quota):
+        if cid_ not in ids:
+            user_quota.pop(cid_, None)
     for key in list(last_probe_ok):
         if key[1] not in ids:
             last_probe_ok.pop(key, None)
@@ -96,6 +125,9 @@ def sync_channels(cfg: dict):
         if cid not in ids:
             channel_cool.pop(cid, None)
             _channel_429_events.pop(cid, None)
+    for cid in list(channel_quota_429):
+        if cid not in ids:
+            channel_quota_429.pop(cid, None)
     for cid in list(channel_last_ok):
         if cid not in ids:
             channel_last_ok.pop(cid, None)
@@ -142,7 +174,9 @@ def classify_429(body: str, ch_type: str = None, retry_after=None) -> tuple:
     """解析 429 响应体 → (类型, 建议冷却秒数, 可读说明)。四档：
 
     paid_balance → 冷却 0（调用方按 down 处理：等不来自愈，要充值/换 key）
-    free_daily   → 冷却到明天凌晨（免费额度按天刷新，次日自动回来）
+    free_daily   → 冷却到明天凌晨（免费额度按天刷新，次日自动回来）。
+                   **这只是「该模型冷却到明天」**；要不要升级成整渠道停摆，由调用方用
+                   `note_channel_quota_429` 按「短窗口内几个不同模型撞过」判定（见那里）
     minute       → 90 秒（上游给了 Retry-After 就用它）
     unknown      → 300 秒（保守；交给 429 自学水位接着调）
 
@@ -188,6 +222,25 @@ _PERMANENT_KEYWORDS = (
 )
 
 
+# 启动归正（restore_model_status）专用的「永久」判据 —— **刻意比 `_PERMANENT_KEYWORDS` 窄**。
+# 为什么不能共用：上面那套是判**上游响应正文**的，含「已用完 / 用尽」这类**额度进展**措辞；
+# 而归正函数判的是**我们自己写的 reason**，其中每日额度冷却的文案里就有「额度已用完 / 用尽」
+# → 会把「明天就恢复」的 limited 在下次重启时静默升成永久 down（down 没有出口 → 再也回不来）。
+# 2026-09-21 核查：当时 limited 记录里只有 1 条命中（`余额不足，请充值`，本就是 down 语义），
+# 所以这条是**潜在**坑；但同日新增的额度 429 文案（「该模型额度已用完，冷却到明天」）正好
+# 会踩中它，不修就等于把白天的修复在重启时自己撤销掉。
+_DOWN_REASON_MARKERS = (
+    "http 402", "http 403", "http 404", "http 405",   # reason 里的状态码串
+    "余额", "充值", "欠费", "资源包", "购买", "非免费", "所有提供方均收费",
+    "insufficient", "balance", "recharge", "top up", "purchase",
+    "never purchase", "only available", "credit balance", "no credit",
+)
+# 注意：这里**故意不收裸 "credit"**。OpenRouter 免费模型的日额度 429 正文是
+# 「Rate limit exceeded: free-models-per-day. **Add 10 credits** to unlock 1000 free
+# model requests per day」——裸 "credit" 会命中它，把一条「明天就恢复」记成永久 down。
+# 这句英文的真实含义是「你现在每天只有 50 次，想升到 1000 次请充 10 美元」，**不是余额不足**。
+
+
 # ---- 地域封锁：本机出口网络的问题，不是模型的错 ----
 _GEO_HINTS = ("user location is not supported", "location is not supported",
               "not available in your country", "not available in your region",
@@ -203,6 +256,31 @@ def is_geo_block(text: str) -> bool:
     是本机出口网络的问题；所以不写稳定分、不标 down、不冷却（与本地 DNS 同等对待）。"""
     t = (text or "").lower()
     return any(k in t for k in _GEO_HINTS)
+
+
+# 本机网络类失败的文本特征（**只用于「整轮全挂」判定**，见 is_local_net_error）
+_LOCAL_NET_HINTS = (
+    "getaddrinfo", "11001", "11004",               # Windows DNS 解析失败（唤醒后典型）
+    "name resolution", "name or service not known", "nodename nor servname",
+    "temporary failure in name resolution",
+    "network is unreachable", "10051", "10065", "10060",   # 网络不可达/主机不可达/连接超时
+    "all connection attempts failed", "connecterror", "connect: ",
+)
+
+
+def is_local_net_error(text) -> bool:
+    """这条失败是不是「本机网络没就绪」（DNS 解析不了 / 根本连不出去）。
+
+    **只在「整轮所有渠道一起挂」时才采信**（`main._note_sweep_health`）：单独一个渠道
+    报 connect 类错误不能当本机问题 —— 那可能是那家上游自己的事。整轮全挂才是本机的形状，
+    典型场景就是**睡眠/休眠唤醒后 DNS 还没起来**（2026-09-16 实测：七个渠道同时
+    `[Errno 11001] getaddrinfo failed`，而 15 分钟后网络早已恢复）。
+
+    注意：这里**不改** `kind_from_error` 的口径 —— 那个函数决定稳定分要不要记账，
+    放宽会把「上游老是断连」也放过（`_STAB_SKIP_KINDS` 含 `local_net`）。
+    """
+    t = str(text or "").lower()
+    return any(k in t for k in _LOCAL_NET_HINTS)
 
 
 def kind_from_error(err: str) -> str:
@@ -236,8 +314,9 @@ def backfill_stab(rows) -> int:
     per = {}
     for row in rows:
         model, cid, success, err = row[0], row[1], row[2], row[3]
-        # 第 6 位是 cancelled（老库/老调用可能没有这一列）
-        if len(row) > 5 and row[5]:
+        # 第 6 位是 cancelled（老库/老调用可能没有这一列）。注意：**成功的中断行要留下**
+        # （模型已正常输出、客户端先走，口径见 `_stream_ok`），只有「没成功的中断」才跳过。
+        if len(row) > 5 and row[5] and not success:
             continue
         lst = per.setdefault((model, cid), [])
         if len(lst) >= STAB_WIN:
@@ -275,7 +354,11 @@ def is_permanent_failure(status: int, text: str = "") -> bool:
     return False
 
 
-# ---- 上游 x-ratelimit-* 响应头（Groq/NIM 等）：官方给的剩余额度，比自学水位精确 ----
+# ---- 上游官方限流响应头：平台自己报的剩余额度，比自学水位精确 ----
+_MS_DAILY_TZ_OFFSET = 8 * 3600   # 魔搭日额度按 UTC+8 00:00 刷新
+_RL_NO_RESET_FALLBACK = 300.0    # 通用口径没给重置时刻时的兜底窗（见下）
+
+
 def _parse_duration(s: str) -> float:
     """解析 Groq 风格时长 "2m39.5s" / "1h" / "45s"，失败返回 0"""
     import re
@@ -286,8 +369,92 @@ def _parse_duration(s: str) -> float:
     return int(h or 0) * 3600 + int(mi or 0) * 60 + float(sec or 0)
 
 
+def _header_int(headers, name: str):
+    """读一个数值型响应头；缺失或非数字（如 "unlimited"）一律返回 None，不抛异常。
+
+    取值失败就当作「这头不存在」，而不是让整个函数挂掉 —— 上游头名/格式随时会变，
+    解析必须能安全降级。"""
+    raw = headers.get(name)
+    if raw is None:
+        return None
+    try:
+        return int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _next_ms_daily_reset(now: float = None) -> float:
+    """下一个 UTC+8 00:00 的 epoch 秒（+60s 缓冲，避开刷新瞬间的竞态）。
+
+    魔搭 API-Inference 的日额度「每日 UTC+8 00:00 重置，不跨天累计」，但
+    **响应头只给剩余数、不给重置时刻**，所以必须自己算出来。
+
+    为什么非要有值：`ratelimit_exhausted` 只在 `reset_ts` 是正数且已过期时才解除跳过，
+    `reset_ts=0` 会让那一格**永久拉黑**。魔搭这条路径不允许出现 0。"""
+    now = now if now is not None else time.time()
+    g = time.gmtime(now + _MS_DAILY_TZ_OFFSET)   # 先平移成 UTC+8 日历，再数「今天过了多少秒」
+    into_day = g.tm_hour * 3600 + g.tm_min * 60 + g.tm_sec
+    return now + (86400 - into_day) + 60
+
+
 def note_ratelimit_headers(cid: str, mid: str, headers) -> bool:
-    """从响应头读官方限流信息并记录。返回 True 表示本次记录到有效数据。"""
+    """从响应头读平台给的官方额度信息并记录。返回 True = 本次读到有效数据。
+
+    两套口径并存，**先魔搭后通用**（头名不冲突，各自独立判据）：
+
+    **① 魔搭 ModelScope**（`modelscope-ratelimit-*`；官方 API-Inference limits 文档有据，
+    **成功响应也带**，不像 OpenRouter 只有 429 才带）
+      - `...-model-requests-remaining` = 该**模型**当天剩余 → 粒度正好是 (模型,渠道)，
+        写进 `ratelimit`；归零后 `ratelimit_exhausted` 会让路由跳过这一格，不用撞墙。
+      - `...-requests-remaining`       = 该**账号**当天剩余（跨所有模型共享）→ 写 `user_quota`；
+        归零后该 Key 下所有模型都会 429，直接走既有的 `mark_channel_quota_exhausted`。
+      - 两个 `...-limit` 一并记下：官方会**动态调整**单模型上限（大模型只有 100/天，
+        新模型/濒临下线还会再降），所以「上限」要从头里读，不能写死 500。
+
+    **② 通用 `x-ratelimit-*`**（Groq / NIM；OpenRouter 只在 429 时带）
+      - `x-ratelimit-remaining-requests` / `x-ratelimit-remaining` 配
+        `x-ratelimit-reset-requests` / `x-ratelimit-reset` 的**时长**（如 "2m39.5s"）。
+      - 没带 reset 时刻时兜底 `_RL_NO_RESET_FALLBACK`，**不再写 0**：旧行为下
+        `remaining=0` + 没 reset 头 = 该模型被永久跳过，只有重启才解得开。"""
+    hit = False
+
+    # ---- ① 魔搭：模型级 + 账号级 ----
+    ms_model = _header_int(headers, "modelscope-ratelimit-model-requests-remaining")
+    if ms_model is not None:
+        cur = ratelimit.setdefault((mid, cid), {})
+        cur["remaining"] = ms_model
+        cur["reset_ts"] = _next_ms_daily_reset()
+        cur["source"] = "modelscope"
+        limit = _header_int(headers, "modelscope-ratelimit-model-requests-limit")
+        if limit is not None:
+            cur["limit"] = limit
+        hit = True
+
+    ms_user = _header_int(headers, "modelscope-ratelimit-requests-remaining")
+    if ms_user is not None:
+        user_quota[cid] = {
+            "remaining": ms_user,
+            "limit": _header_int(headers, "modelscope-ratelimit-requests-limit"),
+            "reset_ts": _next_ms_daily_reset(),
+        }
+        hit = True
+        # 账号级见底：整条渠道当天都调不动，立刻停到明天（不等第二个模型撞 429）
+        if ms_user <= 0 and not channel_cooling(cid):
+            mark_channel_quota_exhausted(cid, "魔搭账号级日额度用完")
+
+    if hit:
+        n = ratelimit_hits.get("modelscope", 0) + 1
+        ratelimit_hits["modelscope"] = n
+        if n == 1:
+            # 本进程首次读到魔搭额度头 → 明确留痕。这条日志是「流式响应到底带不带这 4 个头」
+            # 的判据：`grep 魔搭官方额度 data/api-hub.log`，有 = 接上了；一直没有 = 头没送上来，
+            # 别再怀疑解析代码。
+            logging.getLogger("api-hub").info(
+                "读到魔搭官方额度头：模型[%s] 剩余 %s / 账号剩余 %s（%s）",
+                mid, ms_model, ms_user, cid)
+        return True
+
+    # ---- ② 通用 x-ratelimit-* ----
     try:
         remaining = headers.get("x-ratelimit-remaining-requests")
         if remaining is None:
@@ -299,8 +466,10 @@ def note_ratelimit_headers(cid: str, mid: str, headers) -> bool:
         secs = _parse_duration(reset_raw)
         ratelimit[(mid, cid)] = {
             "remaining": int(float(remaining)),
-            "reset_ts": time.time() + secs if secs else 0,
+            "reset_ts": time.time() + (secs or _RL_NO_RESET_FALLBACK),
+            "source": "x-ratelimit",
         }
+        ratelimit_hits["x-ratelimit"] = ratelimit_hits.get("x-ratelimit", 0) + 1
         return True
     except (TypeError, ValueError):
         return False
@@ -359,13 +528,62 @@ def mark_channel_quota_exhausted(cid: str, reason: str = ""):
     save_runtime_state()
 
 
+def note_channel_quota_429(cid: str, mid: str, now: float = None) -> tuple:
+    """额度型 429（`classify_429` 判 `free_daily`）到底是**模型级**还是**账号级**？
+
+    返回 `(是否账号级, 最近窗口内撞过的不同模型数)`。
+
+    背景（2026-09-20 取证）：魔搭是**两层**限额——账号级 2000 次/天（该 Key 下全模型共享）
+    + 模型级 500 次/天（大模型仅 100 次/天）。两者撞限时的 429 正文**一模一样**
+    （`{"error":{"message":"insufficient balance"}}`），从响应里分不出来。
+    旧做法是「一见额度 429 就整条渠道停到明天」→ 一个大模型（日额度只有 100）先耗完，
+    撞一次就把整条渠道封十几个小时。
+
+    判据用**爆发度**：窗口内（30 分钟）有几个不同模型撞额度 429。
+    近三周 62 次魔搭 429 实测——
+      - **小簇**（窗口内 1~3 个模型）：渠道**仍在正常服务**（有成功请求为证）→ 判模型级，
+        只冷这一个 (模型,渠道)，渠道其余模型照常路由；
+      - **大簇**（19 / 15 / 8 个模型在同一两分钟内一起撞）：整条渠道确实中断 → 判账号级，
+        调 `mark_channel_quota_exhausted` 停到明天。
+    阈值 4 正好把这两类分开。代价上界：真账号级时最多白撞 4 次 429（这 4 个模型本来也确实
+    已经不可用），换来的是一条渠道不会被单个模型拖停一整天。
+
+    同样的误伤也发生在 OpenRouter `:free` 上（那是**按模型** 50 次/天）——一并修好。
+    """
+    now = now if now is not None else time.time()
+    dq = channel_quota_429.setdefault(cid, collections.deque(maxlen=200))
+    dq.append((now, mid))
+    while dq and dq[0][0] < now - _CH429_QUOTA_WINDOW:
+        dq.popleft()
+    n = len({m for _, m in dq})
+    if n >= _CH429_QUOTA_MODELS:
+        mark_channel_quota_exhausted(cid, f"{_CH429_QUOTA_WINDOW // 60} 分钟内 {n} 个不同模型撞额度 429 → 账号级")
+        return (True, n)
+    return (False, n)
+
+
+def quota_429_models(cid: str, now: float = None) -> int:
+    """最近窗口内撞过「额度型 429」的**不同模型数**（排障用：看它离判定阈值还有多远）"""
+    dq = channel_quota_429.get(cid)
+    if not dq:
+        return 0
+    now = now if now is not None else time.time()
+    return len({m for ts, m in dq if ts >= now - _CH429_QUOTA_WINDOW})
+
+
 def mark_model_status(model: str, available: bool, reason: str = "", channel: str = "",
                       state: str = None):
     """记一次模型级测试/调用的真实结果并持久化。
 
     state: 'ok' 免费可调 / 'limited' 暂时受限（429/5xx/连接，冷却后会恢复）/ 'down' 硬不可用。
     available 由 state 唯一决定：只有 'ok' 才可路由。'limited'（受限）也**不可路由**——
-    否则「余额不足/限流」的模型会冒充可用，一用就报错。"""
+    否则「余额不足/限流」的模型会冒充可用，一用就报错。
+
+    **2026-09-21（用户拍板 A1）起，这里写下的状态不再影响能不能路由**：路由与界面可用性一律
+    看 (模型,渠道) 级记录，「这条渠道不可用」由 `mark_channel_down` / `mark_result`(冷却) 承担。
+    本函数的产出退化为展示信息（最近一次测过什么、在哪条渠道测的）。`available` 字段保留只为
+    兼容磁盘旧数据与前端读取，已不再被任何判定逻辑消费。之所以要退这一步：模型级状态没有渠道
+    维度，一次渠道硬失败（或渠道停用后遗留的记录）会把该模型**所有**渠道一起判红。"""
     if state is None:
         state = "ok" if available else "down"
     model_status[model] = {"available": state == "ok", "state": state,
@@ -385,8 +603,10 @@ def restore_model_status():
     这里按 state 重新推导 available，并把「余额不足 / 402/403/404 / 非免费」这类永久不可用
     从 limited 归正为 down，无需手动清库。归正后的正确结果会一次性回写磁盘。"""
     from . import store
-    # 复用永久不可用关键词，另加状态码串（reason 里是 "HTTP 402: ..." 这种文本）
-    _PERM_REASONS = _PERMANENT_KEYWORDS + ("402", "403", "404", "405")
+    # 归正判据用**更窄**的一套（见 _DOWN_REASON_MARKERS）：这里比的是我们自己写的 reason，
+    # 不是上游正文，共用 _PERMANENT_KEYWORDS 会把「额度已用完/用尽」这种**每日额度**文案
+    # 误判成永久失败。
+    _PERM_REASONS = _DOWN_REASON_MARKERS
     dirty = False
     raw = store.load_model_status()
     # DEBUG: print dirty decision process
@@ -433,7 +653,15 @@ def save_runtime_state():
             "unverified": [f"{k[0]}|{k[1]}" for k in unverified],
             "channel_down": {f"{k[0]}|{k[1]}": v for k, v in channel_down.items()},
             "ratelimit": {f"{k[0]}|{k[1]}": v for k, v in ratelimit.items()},
+            # 魔搭账号级日额度：只存还没到刷新点的，过期的重启后自然重学
+            "user_quota": {cid: v for cid, v in user_quota.items()
+                           if (v.get("reset_ts") or 0) > now},
+            # 限流头命中计数：落盘是为了「重启后还没发请求时」也能看出魔搭的头有没有被读到
+            "ratelimit_hits": dict(ratelimit_hits),
             "channel_cool": {cid: round(v, 1) for cid, v in channel_cool.items() if v > now},
+            # 会话粘性（auto 用）：重启后同一个会话继续用同一个模型，不因为重启而换模型
+            "sticky": {f"{s}|{k}": v for (s, k), v in sticky.items()
+                       if (v.get("ts") or 0) + STICKY_TTL > now},
             "throttle": throttle.snapshot(),
             # 渠道评分（稳定分窗口/延迟/首字节）：只落「有真实调用样本或有延迟」的条目，
             # 否则模型×渠道全量落盘太大。win 存最近 N 次真实调用的 1/0，跨重启继续累计。
@@ -469,10 +697,29 @@ def restore_runtime_state():
         mid, _, cid = k.partition("|")
         if mid and cid and isinstance(v, dict) and "remaining" in v:
             ratelimit[(mid, cid)] = v
+    # 魔搭账号级日额度：只收还没到刷新点的（到点了重启后重新从响应头学）
+    for cid, v in (data.get("user_quota") or {}).items():
+        if isinstance(v, dict) and "remaining" in v and (v.get("reset_ts") or 0) > now:
+            user_quota[cid] = v
+    for src, n in (data.get("ratelimit_hits") or {}).items():
+        if isinstance(n, int):
+            ratelimit_hits[src] = n
     # 恢复渠道级冷却（含「账户级当天额度用完」的冷却到明天）
     for cid, v in (data.get("channel_cool") or {}).items():
         if v > now:
             channel_cool[cid] = v
+    # 恢复会话粘性（auto 用）：只收还没过闲置期的
+    n_sticky = 0
+    for k, v in (data.get("sticky") or {}).items():
+        s, _, key = k.partition("|")
+        if not (s and key and isinstance(v, dict)):
+            continue
+        ts = v.get("ts") or 0
+        if ts + STICKY_TTL <= now or not v.get("model"):
+            continue
+        sticky[(s, key)] = {"model": v.get("model"), "channel": v.get("channel") or "",
+                            "ts": ts, "label": v.get("label") or ""}
+        n_sticky += 1
     # 恢复 429 自学水位（throttle），并给仍在有效期内的 (渠道,模型) 一个保守短冷却，
     # 避免重启后受限模型立刻回绿、再次集中撞限（这是 Gemini/NIM 重启变绿的直接原因）
     throttle.restore(data.get("throttle") or {})
@@ -502,9 +749,10 @@ def restore_runtime_state():
             n_seeded += 1
     import logging
     logging.getLogger("api-hub").info(
-        "已恢复运行时状态：冷却 %d，待验证 %d，渠道级硬失败 %d，限流头 %d，429 预判 %d（seed 冷却 %d，评分样本 %d）",
+        "已恢复运行时状态：冷却 %d，待验证 %d，渠道级硬失败 %d，限流头 %d，429 预判 %d，会话粘性 %d"
+        "（seed 冷却 %d，评分样本 %d）",
         n_cool, len(unverified), len(channel_down), len(ratelimit),
-        len(throttle.learned_pairs()), n_seeded, n_stat)
+        len(throttle.learned_pairs()), n_sticky, n_seeded, n_stat)
 
 
 def _request_save():
@@ -755,7 +1003,31 @@ _STRATEGY_SPEC = {
 }
 _DIM_IDX = {"cap": 0, "stab": 1, "spd": 2}
 _CAP_BY_TIER = capability._TIER_ANCHOR   # 手造 dict / 无榜分时的兜底锚点
-_SPEED_K = 400.0  # 400/(400+ms) 把延迟映射到 0~1（400ms 为 0.5）
+# 速度维：延迟 → 0~1，用 **log 线性化**（100ms→1.0，60s→0.0）。
+# 旧版是双曲映射 400/(400+ms)：看着合理，但它极度右偏，真实样本全挤在 (0, 0.1)，
+# 而 `_score_dims` 是「主维度按 band 分档」→ 等价于「延迟 <3.6s 全算同一档」，
+# 速度优先视图里 13 个收藏有 12 个落在桶 0、**桶内速度完全不起作用**（用户 2026-09-20 报）。
+# log 线性化后各档之间是等比延迟（band 0.10 ≈ 1.9 倍），快慢两端粒度一致。
+# ⚠️ 改这里必须同步改前端 `speedScore`（frontend/index.html 的 compScore），
+#    否则「界面显示的顺序」和「auto 实际选路」会分叉——那比现在更糟。
+_SPEED_FAST_MS = 100.0     # ≤100ms → 满分 1.0
+_SPEED_SLOW_MS = 60000.0   # ≥60s → 0.0
+_SPEED_LOG_SPAN = math.log(_SPEED_SLOW_MS / _SPEED_FAST_MS)
+
+
+def speed_score(lat_ms) -> float:
+    """延迟(ms) → 0~1 速度分（log 线性化，见上）。None / 非法值 → 0（未知按最慢算）。"""
+    if lat_ms is None:
+        return 0.0
+    try:
+        x = float(lat_ms)
+    except (TypeError, ValueError):
+        return 0.0
+    if x <= _SPEED_FAST_MS:
+        return 1.0
+    if x >= _SPEED_SLOW_MS:
+        return 0.0
+    return (math.log(_SPEED_SLOW_MS) - math.log(x)) / _SPEED_LOG_SPAN
 
 
 def _score_dims(dims: tuple, strategy: str) -> float:
@@ -798,7 +1070,7 @@ def _model_composite(m: dict, strategy: str) -> float:
     best = -1.0
     for c in pool:
         lat = c.get("latency_ms")
-        speed = _SPEED_K / (_SPEED_K + lat) if lat else 0.0
+        speed = speed_score(lat)
         stab = c.get("stab")            # None = 该渠道没有真实调用样本（不参与加权）
         cand = _score_dims((cap, stab, speed), strategy)
         if cand > best:
@@ -829,9 +1101,10 @@ def _composite(c, cfg, strategy: str) -> float:
     s = get_stat(c["model"], c["channel"]["id"])
     cs_lat = (channels.get(c["channel"]["id"]).latency_ms) or 9999
     lat = s.get("ttft") or s["latency"] or cs_lat
-    tier = capability.tier_of(c["model"], cfg.get("model_tiers"))
-    cap = capability.capability_score(c["model"], tier, cfg.get("model_tiers"))
-    speed = _SPEED_K / (_SPEED_K + lat) if lat else 0.0
+    ov = capability.tier_overrides(cfg)     # 手动档位：精确表 > 正则表
+    tier = capability.tier_of(c["model"], ov)
+    cap = capability.capability_score(c["model"], tier, ov)
+    speed = speed_score(lat)
     return _score_dims((cap, stab_of(s), speed), strategy)
 
 
@@ -885,9 +1158,19 @@ def candidates_for_test(model: str, cfg: dict) -> list:
     而且测试成功应立即可恢复（见 mark_result 成功分支解除 channel_cool）。
     自动探测 / 真实路由仍走 candidates_for / probe 逻辑，继续尊重冷却，不受影响。
 
-    仍排除：渠道未启用 / 健康检查未通过 / 模型不在该渠道 / 该渠道上该模型硬失败
-    (channel_down) / 官方限流头显示额度耗尽未重置(ratelimit_exhausted)。
-    返回结构与 candidates_for 一致，按当前策略综合分排序（正常渠道仍排前面先试）。"""
+    **2026-09-21 起也不再排除 `channel_down`（用户拍板）**：`down` 没有过期时间，只靠
+    「一次成功调用」清除，而能发起那次调用的入口本来全被它自己挡住（自动路由排除、
+    本函数也排除）→ 误判成 down 的模型再也回不来，只能去渠道卡片「扫描全部模型」，
+    粒度还连带整条渠道。让手动测试穿透 `channel_down`：**错的能救回、真死的点几次
+    还是同一句错**（比"一律放回 limited"少一层假乐观——真用不了的模型不该回到候选里）。
+    代价：在真·硬失败（余额不足 / 已下线）的模型上点测试会真发一次上游请求。
+
+    仍排除：渠道未启用 / 健康检查未通过 / 模型不在该渠道 /
+    官方限流头显示额度耗尽未重置(ratelimit_exhausted)——它和 down 不同，是**自愈**的
+    时间窗封锁（到点自动解），点了也还是失败，没必要白烧一次请求。
+    返回结构与 candidates_for 一致；排序是**两段式**：未记硬失败的渠道在前，组内按策略
+    综合分（2026-09-21 调整，见函数末尾注释——此前是纯综合分，会把死渠道排到活渠道前面，
+    点一次测试先在死渠道上白等两分钟）。"""
     now = time.time()
     out, seen = [], set()
     for mid in model_targets(model, cfg):
@@ -898,14 +1181,21 @@ def candidates_for_test(model: str, cfg: dict) -> list:
             if not cs or cs.valid is not True or mid not in cs.models:
                 continue
             key = (mid, ch["id"])
-            if key in seen or key in channel_down:
+            if key in seen:
                 continue
             if ratelimit_exhausted(mid, ch["id"], now):
                 continue
             seen.add(key)
             out.append({"channel": ch, "model": mid})
     strategy = cfg.get("route_strategy", "balanced")
-    out.sort(key=lambda c: -_composite(c, cfg, strategy))
+    # 2026-09-21（用户拍板）：先分两组 —— **没被记过硬失败的渠道排在前面**，组内再按策略分。
+    # 手动测试要回答的是「这个模型现在能不能用」，所以先打有希望的渠道；已知硬失败的渠道
+    # 仍留在候选末尾（Plan B 的出口不丢：活的都失败后才轮到它，用来确认它是否已恢复）。
+    # 动因（线上实测）：`z-ai/glm-5.3-flash` 在 OpenRouter 有 402 记录、NIM 无失败记录，
+    # 但 OR 的稳定维按先验给分、NIM 的 38.8s 延迟被速度维拖死 → OR 反而排前面，点一次测试
+    # 白等 122s 才拿到那句 402，而模型其实在 NIM 上可用。分组排序后这类倒挂不会再发生。
+    out.sort(key=lambda c: (0 if (c["model"], c["channel"]["id"]) not in channel_down else 1,
+                            -_composite(c, cfg, strategy)))
     return out
 
 
@@ -915,7 +1205,12 @@ def model_view(cfg: dict) -> list:
     语义：暂时超过额度被限流的模型仍算「可用」范畴，只是标注受限；仅 402/403/下线 等
     硬失败才记为 down，且按 (模型, 渠道) 粒度记录——只有所有渠道都硬失败才算整个模型 down。
     冷却到期但未实测确认（unverified）、429 预判跳过（preempted）、渠道级熔断（账号级限流）
-    都会让该渠道显示受限，避免「界面绿色但实际用不了」。"""
+    都会让该渠道显示受限，避免「界面绿色但实际用不了」。
+
+    **2026-09-21（用户拍板 A1）**：`model_status`（模型级）**不再参与这里的任何判定**，
+    模型能不能用完全由渠道级状态聚合得出。它只提供 `tested / test_reason / test_channel / test_ts`
+    这几个展示字段。上面那句「只有所有渠道都硬失败才算整个模型 down」现在才是真的成立 ——
+    在此之前，任何一次渠道硬失败写下的模型级 down 都会推翻它，把健康渠道一起判红。"""
     now = time.time()
     agg = {}
     for ch in cfg["channels"]:
@@ -933,17 +1228,41 @@ def model_view(cfg: dict) -> list:
             ch_down = key in channel_down
             preempted = bool(preempt and not in_cool and not ch_down
                              and not ch_cool and throttle.blocked(ch["id"], m))
-            ms_m = model_status.get(m)
-            model_down = ms_m is not None and not ms_m.get("available")
             s = get_stat(m, ch["id"])
+            # 「这条渠道上这个模型为什么不可用」——只给界面 chip 悬停解释用。
+            # 判定次序就是下面 available 表达式的取反，保证两处永远一致（改了这里必须同步改那里）。
+            if cs.valid is not True:
+                unavail = "渠道健康检查未通过"
+            elif ch_down:
+                _r = (channel_down.get(key) or {}).get("reason") or "已下线/无权限/需充值"
+                unavail = "硬失败：" + _r
+            elif ch_cool:
+                unavail = "渠道级冷却（账号级限流），到点自动恢复"
+            elif key in unverified:
+                unavail = "冷却已到期，待实测确认"
+            elif in_cool:
+                unavail = "限流冷却至 " + time.strftime(
+                    "%H:%M", time.localtime(cooldown.get(key, now)))
+            elif preempted:
+                unavail = "限流预判，本轮跳过（等额度刷新）"
+            else:
+                unavail = ""
             entry.append({
                 "channel_id": ch["id"],
                 "channel_name": ch.get("name") or ch["type"],
+                # 渠道类型：前端搜索要按「平台」筛（provider:modelscope / provider:nim），
+                # 只靠展示名匹配的话，用户把渠道改名成「小魔搭」就搜不到了。
+                "channel_type": ch["type"],
+                # 2026-09-21（用户拍板 A1）：**去掉模型级否决**。原式末尾还有 `and not model_down`，
+                # 它让某条渠道的一次硬失败（或渠道停用后遗留的记录）把该模型的**所有**渠道一起判红。
+                # 实测受害者：z-ai/glm-5.3 的 NVIDIA NIM（从没失败过）、stepfun-ai/Step-3.x-Flash
+                # 唯一还启用的魔搭（失败记录来自已停用的 HuggingFace）。现在只看这条渠道自己的状态。
                 "available": bool(cs.valid) and not ch_cool and not ch_down
-                             and not in_cool and not preempted and not model_down,
+                             and not in_cool and not preempted,
                 "in_cooldown": in_cool or ch_cool,
                 "down": ch_down,
                 "preempted": preempted,
+                "unavail_reason": unavail,
                 # 响应速度：首字节(TTFT) 优先 → 实测总延迟 → 渠道健康检查延迟
                 # ——与 _composite / _model_composite / FE compScore 同一口径
                 "latency_ms": s.get("ttft") or s["latency"] or cs.latency_ms,
@@ -952,6 +1271,7 @@ def model_view(cfg: dict) -> list:
                 "samples": len(s.get("win") or []),
             })
     models = []
+    ov = capability.tier_overrides(cfg)     # 手动档位表：算一次，别在 600+ 个模型的循环里反复合成
     for m, chans in agg.items():
         ms = model_status.get(m)
         any_ok = any(c["available"] for c in chans)
@@ -959,33 +1279,44 @@ def model_view(cfg: dict) -> list:
         all_down = bool(chans) and all(c["down"] for c in chans)
         tested = ms is not None
         reason = (ms.get("reason", "") if ms else "")
-        ms_state = ms.get("state") if ms else None
-        if all_down or (ms is not None and (ms_state == "down"
-                        or (ms_state is None and not ms.get("available")))):
+        # 2026-09-21（用户拍板 A1）：模型级状态**退出可用性判定**，只保留「最近一次测过什么」的
+        # 展示职责（test_reason / test_channel 给界面）。以前 model_status[模型].available=False
+        # 会一票否决该模型的**所有**渠道；而 mark_model_status 的 key 不带渠道维度，于是渠道被
+        # 停用/删除后留下的模型级 down 仍会继续压住其他还在启用的渠道。现在「能不能用」纯由
+        # 渠道级状态聚合 —— 与上面 docstring 里「只有所有渠道都硬失败才算整个模型 down」一致。
+        if any_ok:
+            status = "ok"            # 至少一条渠道可调
+            available = True
+        elif all_down:
             status = "down"          # 全部渠道硬失败（402/403/下线 等）
             available = False
-        elif any_ok:
-            status = "ok"            # 免费且当前可调
-            available = True
-        elif any_cool or ms_state == "limited":
-            status = "limited"       # 暂时限流/冷却/预判跳过中，仍算可用范畴
+        elif any_cool:
+            status = "limited"       # 暂时限流/冷却/预判跳过中，等得到
             available = False
         else:
-            status = "down"
+            status = "down"          # 兜底：渠道健康检查未通过等
             available = False
-        _tier = capability.tier_of(m, cfg.get("model_tiers"))
+        # 手动档位：界面点 chip 写的（精确表）优先于 config 里手改的正则表
+        _manual = capability.override_tier(m, ov) is not None
+        _tier = capability.tier_of(m, ov)
         models.append({
             "id": m,
             "available": available,
             "status": status,
             "tested": tested,
             "test_reason": reason,
+            # 最近一次测试是在哪条渠道上做的（模型级记录自带 channel 名）。多渠道模型必须显示它，
+            # 否则用户看到「最近实测：HTTP 403」却不知道是哪条渠道的账。
+            "test_channel": ((ms.get("channel") or "") if ms else ""),
             "test_ts": (ms.get("ts", 0) if ms else 0),
             "any_channel_available": any_ok,
             "channel_count": len(chans),
             "tier": _tier,
+            "tier_manual": _manual,                    # 被手动指定过（界面画标记 + 弹层里对比「自动判定」）
+            # 纯自动判定（不带手动覆盖）：只在手动过时才算，给弹层显示「当前判定：X」用
+            "tier_auto": capability.tier_of(m) if _manual else _tier,
             "aa": capability.bench_of(m),              # Artificial Analysis 智能指数（没上榜 → None）
-            "cap_score": capability.capability_score(m, _tier, cfg.get("model_tiers")),   # 连续能力分（排序用）
+            "cap_score": capability.capability_score(m, _tier, ov),   # 连续能力分（排序用）
             "channels": chans,
         })
     models.sort(key=lambda x: (x["status"] != "ok", x["id"]))
@@ -1025,15 +1356,16 @@ def list_model_ids(cfg: dict) -> list:
 # 客户端可用的「特殊模型名」：请求这些名字时由网关自动选最优真实模型，
 # 并在请求失败时自动跨模型切换（用户感觉是「无感 failover」）。
 RESERVED_AUTO = {
-    # 命名与「模型」页视图一一对应：每个视图都有 auto:<名> 写法（不再保留裸 `auto` 简写，
-    # 用户拍板：`auto:balanced` 已经对应均衡，再留一个 `auto` 就是重复）。
-    "auto:balanced": "balanced",
-    "auto:quality": "quality",
-    "auto:stability": "stability",
-    "auto:speed": "speed",
+    # 命名与「模型」页视图一一对应：每个视图都有 auto-<名> 写法。2026-09-21 用户拍板：
+    # 冒号版（auto:balanced 等）不规范且部分客户端模型名正则限死 [A-Za-z0-9._/-]，
+    # 冒号别名全部删除，只保留连字符写法（例：vibe-astock 复盘 Agent 的 codex 引擎）。
+    "auto-balanced": "balanced",
+    "auto-quality": "quality",
+    "auto-stability": "stability",
+    "auto-speed": "speed",
     # 视觉分组：只挑「能看图」的模型，再按能力优先 + 稳定/速度均衡排序。
-    # 用途：Hermes 的「辅助视觉模型」直接填 auto:vision（失败自动换下一个能看图的模型）。
-    "auto:vision": "vision",
+    # 用途：Hermes 的「辅助视觉模型」直接填 auto-vision（失败自动换下一个能看图的模型）。
+    "auto-vision": "vision",
 }
 
 
@@ -1045,6 +1377,128 @@ def auto_strategy_of(model: str) -> str:
     return RESERVED_AUTO.get(model, "balanced")
 
 
+# ---- 会话粘性（**只对 auto-* 生效**）----
+# 起因（2026-09-20 用户报）：「模型正常输出，在同一个对话中也会出现模型切换」。
+# 根因不在成败判据，而在候选排序的第一顺位是**收藏**：auto 每个请求都重新算一遍候选，
+# 收藏的模型一过冷却就抢回第一、下次失败又让位 → 一个会话里来回换（取证见
+# PROGRESS.md「auto 路由 · 为什么正常输出也会换模型」）。
+# 粘性让「本会话上一次**成功产出**的模型」保持第一，只有它失败/不可用才换。
+# 优先级：**粘性 > 收藏 > 策略分**。
+# ⚠️ 只认「成功产出」：上游返回 200 但流中断、或一个字没吐就断，都不算（不写粘性）。
+STICKY_TTL = 7200.0   # 闲置多久算这次会话结束（每成功一次滑动续期）
+STICKY_MAX = 300      # 最多记多少个 (策略, 会话)，超出按最久没用的丢
+
+sticky: dict = {}     # (策略, 会话键) -> {"model", "channel", "ts", "label"}
+
+# 客户端愿意发这些头就用它当会话 id（最准）；不发则退回「首条 user 消息」指纹
+STICKY_HEADERS = ("x-session-id", "x-conversation-id", "x-chat-id", "conversation-id")
+
+
+def _msg_text(m: dict) -> str:
+    """取一条消息的文本内容（content 可能是字符串，也可能是多模态片段数组）"""
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = []
+        for p in c:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") == "text" and isinstance(p.get("text"), str):
+                parts.append(p["text"])
+            elif p.get("type"):
+                parts.append(f"<{p['type']}>")   # 图片/音频只记类型，不记内容
+        return "".join(parts)
+    return ""
+
+
+def session_key_of(body: dict, header_id: str = "") -> tuple:
+    """认出「同一个会话」→ `(键, 来源, 可读标签)`；认不出返回 `("", "", "")`（= 不粘）。
+
+    OpenAI 协议里**没有会话字段**（Hermes 这类客户端也不一定发），所以按这个顺序认：
+      1. 显式请求头（`X-Session-Id` / `X-Conversation-Id` …）——客户端愿意发就用它，最准；
+      2. **第一条 user 消息的指纹**——客户端每轮都把完整历史发上来（实测同一会话
+         prompt_tokens 连续增长 66k→73k），所以首条 user 消息在整个会话里不变。
+    认不出的情况（只发最后一轮、messages 为空、首条消息没文本）**一律不粘**，
+    退回原策略排序——这是安全降级：粘性失效 = 老行为，不会更糟。
+    ⚠️ 若某个客户端的首条 user 消息里塞了每轮都变的动态内容（时间戳/环境块），
+    指纹就会每轮都变、粘性永远不命中；`label` 会原样进日志，一眼能看出来。"""
+    h = (header_id or "").strip()
+    if h:
+        return hashlib.sha1(("hdr:" + h).encode("utf-8", "ignore")).hexdigest()[:12], "header", h[:40]
+    msgs = body.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return "", "", ""
+    first_user = next((m for m in msgs
+                       if isinstance(m, dict) and m.get("role") == "user"), None)
+    m0 = first_user if first_user is not None else msgs[0]
+    if not isinstance(m0, dict):
+        return "", "", ""
+    txt = _msg_text(m0)
+    if not txt.strip():
+        return "", "", ""
+    src = "first_user" if first_user is not None else "first_msg"
+    label = " ".join(txt.split())[:40]
+    # 来源也进哈希：避免「首条消息」与「首条 user 消息」文本相同时撞键
+    return hashlib.sha1(f"{src}|{txt}".encode("utf-8", "ignore")).hexdigest()[:12], src, label
+
+
+def _sticky_trim(now: float):
+    """淘汰过期条目；仍超上限就丢最久没用的"""
+    for k, v in list(sticky.items()):
+        if (v.get("ts") or 0) + STICKY_TTL <= now:
+            sticky.pop(k, None)
+    if len(sticky) > STICKY_MAX:
+        for k, _ in sorted(sticky.items(), key=lambda kv: kv[1].get("ts") or 0
+                           )[:len(sticky) - STICKY_MAX]:
+            sticky.pop(k, None)
+
+
+def mark_sticky(strategy: str, key: str, model: str, cid: str, label: str = "") -> bool:
+    """记下「这个会话这一次是谁成功服务的」。返回是否发生了**换模型**（用于日志）。"""
+    if not (strategy and key and model):
+        return False
+    now = time.time()
+    prev = sticky.get((strategy, key))
+    sticky[(strategy, key)] = {"model": model, "channel": cid, "ts": now,
+                               "label": label or (prev or {}).get("label") or ""}
+    _sticky_trim(now)
+    _request_save()   # 节流 1s 合并写盘；重启后粘性还在（见 runtime_state.json）
+    return bool(prev) and prev.get("model") != model
+
+
+def clear_sticky(strategy: str = "", key: str = "", model: str = "") -> int:
+    """清粘性（不传参数 = 全清）：换模型的兜底手段 + 排障用。"""
+    n = 0
+    for k in list(sticky):
+        s, kk = k
+        if strategy and s != strategy:
+            continue
+        if key and kk != key:
+            continue
+        if model and sticky[k].get("model") != model:
+            continue
+        sticky.pop(k, None)
+        n += 1
+    if n:
+        _request_save()
+    return n
+
+
+def sticky_view() -> list:
+    """当前粘性表（只读，给 `/api/sticky` 排障用）：哪个会话现在粘在哪个模型上"""
+    now = time.time()
+    out = []
+    for (s, k), v in sticky.items():
+        if (v.get("ts") or 0) + STICKY_TTL <= now:
+            continue
+        out.append({"strategy": s, "session": k, "model": v.get("model"),
+                    "channel": v.get("channel"), "label": v.get("label") or "",
+                    "idle_s": round(now - (v.get("ts") or now), 1), "ttl_s": int(STICKY_TTL)})
+    out.sort(key=lambda x: x["idle_s"])
+    return out
+
+
 def candidates_for_auto(strategy: str, cfg: dict) -> list:
     """给「auto」请求生成候选：**所有当前可用 (模型, 渠道) 组合**，按策略排序。
 
@@ -1053,9 +1507,14 @@ def candidates_for_auto(strategy: str, cfg: dict) -> list:
     模型级 down 的 (模型,渠道) 全部被过滤掉，列表里不会出现用不了的组合。
 
     排序规则与界面一致：收藏的模型优先（组内仍按策略综合分），然后才是未收藏模型。
-    strategy="vision" 时额外只保留「能看图」的模型（Hermes 辅助视觉模型用）。"""
+    收藏表按视图分两套（2026-09-20）：`vision` 用 `pinned_vision`（视觉专属收藏），
+    其余策略用 `pinned` —— 两表独立，同一个模型在两边要各收藏一次。
+    strategy="vision" 时额外只保留「能看图」的模型（Hermes 辅助视觉模型用）。
+
+    ⚠️ 这里给的是**策略顺序**；auto 请求实际先用谁还要再看**会话粘性**
+    （`prefer_sticky`：本会话上一次成功产出的模型优先，避免同一对话里来回换模型）。"""
     now = time.time()
-    pinned = set(cfg.get("pinned") or [])
+    pinned = set(cfg.get("pinned_vision" if strategy == "vision" else "pinned") or [])
     need_vision = strategy == "vision"
     out, seen = [], set()
     preempt = cfg.get("adaptive_preemption", True)
@@ -1077,9 +1536,9 @@ def candidates_for_auto(strategy: str, cfg: dict) -> list:
                 continue
             if cooldown.get(key, 0) > now:
                 continue
-            ms = model_status.get(m)
-            if ms is not None and not ms.get("available"):
-                continue
+            # 2026-09-21（用户拍板 A1）：不再读模型级状态。能不能路由只看 (模型,渠道) 自己的
+            # 记录 —— cooldown / channel_down / ratelimit 都在上面几行判完了。旧逻辑在这里
+            # 用 model_status[模型] 一票否决整个模型，会把该模型其他健康渠道一起踢出候选。
             if preempt and throttle.blocked(ch["id"], m):
                 continue
             seen.add(key)
@@ -1091,12 +1550,44 @@ def candidates_for_auto(strategy: str, cfg: dict) -> list:
     return out
 
 
+def prefer_sticky(cands: list, strategy: str, key: str) -> tuple:
+    """把本会话「上一次成功服务的模型」提到候选最前 → `(候选, 命中说明或 None)`。
+
+    **优先级高于收藏**（`main.chat_completions` 在 `candidates_for_auto` 之后调用它）。
+    粘的是**模型**不是渠道：原来的渠道不可用了就换同模型的另一个渠道继续用，
+    免得渠道抖一下就把整个会话换到别的模型上。
+    该模型**整个不可用**（所有渠道都在冷却/硬失败/被禁用）→ 删掉这条粘性、退回策略排序，
+    下一次成功再重新粘。"""
+    ent = sticky.get((strategy, key))
+    if not ent:
+        return cands, None
+    now = time.time()
+    if (ent.get("ts") or 0) + STICKY_TTL <= now:
+        sticky.pop((strategy, key), None)
+        return cands, None
+    same_model = [c for c in cands if c["model"] == ent.get("model")]
+    if not same_model:
+        sticky.pop((strategy, key), None)
+        return cands, None
+    exact = [c for c in same_model if c["channel"]["id"] == ent.get("channel")]
+    head = exact[0] if exact else same_model[0]   # 候选已按策略分排序 → 取该模型最优渠道
+    rest = [c for c in cands if c is not head]
+    return [head] + rest, {
+        "model": ent.get("model"), "channel": head["channel"],
+        "idle_s": round(now - (ent.get("ts") or now), 1),
+        "switched_channel": not exact,
+    }
+
+
 def list_reserved_auto() -> list:
     return list(RESERVED_AUTO.keys())
 
 
 def channel_available_models(cid: str) -> int:
-    """某渠道「当前可用」的模型数：不在冷却、未被模型级标记不可用、渠道未熔断"""
+    """某渠道「当前可用」的模型数：不在冷却、不在待验证、无该 (模型,渠道) 硬失败、渠道未熔断
+
+    2026-09-21（A1）起不再读模型级状态：这个计数要和真的能路由的路径同口径，而路由已不看
+    模型级状态（否则卡片上的「可用 N 个」会比实际能用的少）。"""
     cs = channels.get(cid)
     if not cs:
         return 0
@@ -1107,9 +1598,6 @@ def channel_available_models(cid: str) -> int:
     for m in cs.models:
         key = (m, cid)
         if cooldown.get(key, 0) > now or key in unverified or key in channel_down:
-            continue
-        ms = model_status.get(m)
-        if ms is not None and not ms.get("available"):
             continue
         avail += 1
     return avail

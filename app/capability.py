@@ -1,8 +1,9 @@
 """模型能力分层启发式
 
 按模型名关键词估算能力档位（1=轻量 / 2=中档 / 3=智能），用于「智能优先」路由策略。
-这是启发式分层，不是跑分数据；用户可在 config.json 的 model_tiers 里用正则覆盖：
-    "model_tiers": {"qwen.*max": 3, ".*-flash": 1}
+这是启发式分层，不是跑分数据；用户可以在两处覆盖（`tier_overrides()` 合成，精确优先于正则）：
+    config.json `model_tier_exact`：界面点档位 chip 写的点名表 {"Qwen/Qwen3.8-Flash-Next": 3}
+    config.json `model_tiers`      ：手改的正则批量规则 {"qwen.*max": 3, ".*-flash": 1}
 
 三条轴，先命中先返回（顺序即优先级）：
   1) **规模**决定「轻量」：小尺寸 SKU（mini/nano/tiny/haiku/micro/small）、
@@ -14,6 +15,7 @@
   3) **代」以主版本号计**（3.6 与 3.8 同属第 3 代），避免厂商小版本号把上一代打成旧货。
 """
 import re
+import time
 
 # 非对话主力：不能拿来聊天的就别占智能档（图片/视频/音频/向量/翻译/安全）
 _UTIL = re.compile(
@@ -89,9 +91,50 @@ _TIER_ANCHOR = {3: 0.76, 2: 0.28, 1: 0.10}
 # 用户在 model_tiers 里显式指定的档位 → 给该档**顶值**（他们说了算，不再保守压低）
 _OVERRIDE_ANCHOR = {3: 1.0, 2: 0.6, 1: 0.2}
 
+# ---- 榜单缓存：榜分/视觉能力落盘，OpenRouter 断供也不清零 ----
+# 问题（2026-09-15）：`_bench` / `_vision_*` 只在内存里，而且只有一个来源——OpenRouter 的
+# `/models` 返回。渠道一被停用、Key 一失效、上游一抽风，榜单就断供，档位立刻退回名字启发式，
+# 表现就是「评分没了」；重启进程同样清零。
+# 但 Artificial Analysis 智能指数是**月级更新**的，短期不会变，没有理由每次都要连上
+# OpenRouter 才给分。所以：
+#   · 分数**只增不减、不设过期**——落盘、重启、断网都还在，只有拿到更新的分才覆盖；
+#   · 「新鲜度」只用来决定**要不要去补一次数据**（见 main._topup_bench_cache），
+#     不影响已有分数能不能用。
+_CACHE_SCHEMA = 1
+_bench_last_ok: float = 0.0   # 最近一次成功收割榜分的时间（0 = 从没成功过）
+_dirty = {"v": False}
+
+
+def tier_overrides(cfg: dict) -> dict:
+    """把两张手动档位表合成一张「先精确、后正则」的查询表（喂给 `override_tier`）。
+
+    为什么两张表：`model_tier_exact`（界面点档位 chip 写的）是**点名** —— key 就是模型 id 原文；
+    `model_tiers`（手改 config 的）是**批量规则** —— key 是正则。分工不同，所以分开存：
+
+    - 点名不该走正则解析：模型 id 里的 `.` 是通配符（`Qwen3.8` 会匹配到 `Qwen3X8`），
+      带 `+` `(` 的 id 更会直接触发 `re.error` 被**静默跳过**（看着就是「改了没生效」）。
+      这里用 `^re.escape(id)$` 转义后再交给同一条匹配路径；
+    - 点名赢过批量规则：`re.search` 是**先命中先返回**，所以精确项必须排在前面。
+
+    优先级总表：`model_tier_exact` > `model_tiers` > AA 榜分 > 名字启发式。"""
+    cfg = cfg or {}
+    out = {}
+    for model, t in (cfg.get("model_tier_exact") or {}).items():
+        try:
+            t = int(t)
+        except (ValueError, TypeError):
+            continue
+        if t in (1, 2, 3) and model:
+            out["^" + re.escape(str(model)) + "$"] = t
+    out.update(cfg.get("model_tiers") or {})
+    return out
+
 
 def override_tier(model_id: str, overrides: dict = None):
-    """config.json `model_tiers` 的显式指定（正则 → 档位）；没命中返回 None"""
+    """显式指定（正则 → 档位）；没命中返回 None。
+
+    `overrides` 一般来自 `tier_overrides(cfg)`（精确表已转义并排在前面），
+    也可以直接传 `{"正则": 档位}`。"""
     for pat, t in (overrides or {}).items():
         try:
             if re.search(pat, model_id or "", re.I) and int(t) in (1, 2, 3):
@@ -128,19 +171,85 @@ def norm_id(model_id: str) -> str:
     return s.strip()
 
 
-def update_bench_scores(scores: dict) -> dict:
-    """合并榜分（{归一化名: 智能指数}）并重算分档阈值，返回 {n, hi, mid} 便于日志"""
-    global _bench_hi, _bench_mid, _bench_p10, _bench_p90
+def update_bench_scores(scores: dict, ts: float = None) -> dict:
+    """合并榜分（{归一化名: 智能指数}）并重算分档阈值，返回 {n, hi, mid} 便于日志
+
+    ts 只给「从磁盘恢复」用（保留原来的收割时间），常规收割留空即取当前时间。
+    """
+    global _bench_hi, _bench_mid, _bench_p10, _bench_p90, _bench_last_ok
     clean = {k: float(v) for k, v in (scores or {}).items() if isinstance(v, (int, float))}
-    if clean:
-        _bench.update(clean)
-        vals = sorted(_bench.values())
-        if len(vals) >= _BENCH_MIN_N:
-            _bench_hi = round(vals[min(len(vals) - 1, int(len(vals) * 0.72))], 1)
-            _bench_mid = round(vals[min(len(vals) - 1, int(len(vals) * 0.40))], 1)
-            _bench_p10 = vals[min(len(vals) - 1, int(len(vals) * 0.10))]
-            _bench_p90 = vals[min(len(vals) - 1, int(len(vals) * 0.90))]
+    if not clean:
+        return {"n": len(_bench), "hi": _bench_hi, "mid": _bench_mid}
+    _bench.update(clean)
+    vals = sorted(_bench.values())
+    if len(vals) >= _BENCH_MIN_N:
+        _bench_hi = round(vals[min(len(vals) - 1, int(len(vals) * 0.72))], 1)
+        _bench_mid = round(vals[min(len(vals) - 1, int(len(vals) * 0.40))], 1)
+        _bench_p10 = vals[min(len(vals) - 1, int(len(vals) * 0.10))]
+        _bench_p90 = vals[min(len(vals) - 1, int(len(vals) * 0.90))]
+    _bench_last_ok = time.time() if ts is None else float(ts)
+    _dirty["v"] = True
     return {"n": len(_bench), "hi": _bench_hi, "mid": _bench_mid}
+
+
+# ---- 榜单缓存读写（调用方：启动时 load_cache，停机/后台循环 save_cache） ----
+def load_cache() -> dict:
+    """启动时从磁盘恢复榜分与视觉能力 —— OpenRouter 挂着也照样有分"""
+    from . import store
+    data = store.load_capability_cache() or {}
+    if int(data.get("schema") or 0) != _CACHE_SCHEMA:
+        return {"bench": 0, "vision": 0, "loaded": False}
+    bench = data.get("bench") or {}
+    info = update_bench_scores(bench, ts=float(data.get("bench_ts") or 0))
+    ok = list(data.get("vision_ok") or [])
+    no = list(data.get("vision_no") or [])
+    if ok or no:
+        update_vision_models(ok, no)
+    _dirty["v"] = False   # 刚读回来的东西没必要原样写回去
+    return {"bench": info["n"], "vision": len(ok) + len(no),
+            "loaded": bool(info["n"] or ok or no),
+            "hi": info["hi"], "mid": info["mid"], "bench_ts": _bench_last_ok}
+
+
+def save_cache(force: bool = False) -> bool:
+    """把榜分/视觉能力落盘（脏了才写；force 用于停机收尾）
+
+    **空状态一律不写盘**——内存里没分的时候写出去，等于用一个空文件把上一份好缓存盖掉。
+    2026-09-15 就是这么丢的：测试进程收尾 `force=True` 写空 → 用户重启 → 界面「没分了」。
+    宁可盘上留旧分，不可拿空文件覆盖。
+    """
+    if not (force or _dirty["v"]):
+        return False
+    if not (_bench or _vision_ok or _vision_no):
+        return False   # 没东西可写：保持盘上那份不动
+    from . import store
+    try:
+        store.persist_capability_cache({
+            "schema": _CACHE_SCHEMA,
+            "saved_at": round(time.time(), 1),
+            "bench_ts": round(_bench_last_ok, 1),
+            "bench": {k: round(float(v), 3) for k, v in _bench.items()},
+            "vision_ok": sorted(_vision_ok),
+            "vision_no": sorted(_vision_no),
+        })
+    except Exception:
+        return False
+    _dirty["v"] = False
+    return True
+
+
+def cache_age_hours():
+    """榜分缓存新鲜度（小时）；从没成功收割过 → None（调用方据此决定要不要补数据）"""
+    if not _bench_last_ok:
+        return None
+    return (time.time() - _bench_last_ok) / 3600.0
+
+
+def cache_status() -> dict:
+    """缓存概况（日志用）"""
+    age = cache_age_hours()
+    return {"bench": len(_bench), "vision_ok": len(_vision_ok), "vision_no": len(_vision_no),
+            "age_h": None if age is None else round(age, 1), "dirty": bool(_dirty["v"])}
 
 
 def bench_of(model_id: str):
@@ -170,8 +279,10 @@ _VISION_VERIFIED = {
 
 def update_vision_models(ok, no) -> dict:
     """合并「支持/不支持图像输入」的模型名（归一化），返回计数便于日志"""
-    _vision_ok.update(ok or ())
-    _vision_no.update(no or ())
+    if ok or no:
+        _vision_ok.update(ok or ())
+        _vision_no.update(no or ())
+        _dirty["v"] = True
     return {"ok": len(_vision_ok), "no": len(_vision_no)}
 
 
