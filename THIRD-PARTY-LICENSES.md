@@ -29,7 +29,6 @@
 | pycparser | 3.0 | BSD-3-Clause |
 | pydantic | 2.13.5 | MIT |
 | pydantic_core | 2.46.5 | MIT |
-| pystray | 0.19.5 | LGPLv3 |
 | pythonnet | 3.1.0 | MIT |
 | pywebview | 6.2.1 | BSD 3-Clause License |
 | six | 1.17.0 | MIT |
