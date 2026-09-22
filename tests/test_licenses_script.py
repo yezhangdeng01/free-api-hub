@@ -108,3 +108,63 @@ def test_requires_drops_extras_and_foreign_platforms(monkeypatch):
 def test_annotated_doc_is_not_skipped():
     """`annotated-doc` 名字像内部件，其实是 fastapi 的硬依赖，不能挡掉"""
     assert "annotated-doc" not in gen._SKIP_NORM
+
+
+# ---------------------------------------------------------------- --check（CI 用的清单核查）
+
+def _pkgs(*pairs):
+    return [{"name": n, "version": v, "license": "MIT", "files": [("LICENSE", "MIT")]}
+            for n, v in pairs]
+
+
+def test_table_entries_reads_only_the_dependency_table():
+    """只认「依赖清单」那张表，表头与分隔行不能混进来"""
+    assert gen.table_entries(gen.render(_pkgs(("fastapi", "0.141.1")))) == {"fastapi": "0.141.1"}
+
+
+def test_check_passes_on_its_own_output(tmp_path):
+    """自洽：render 出来的东西，check 得认"""
+    pkgs = _pkgs(("fastapi", "0.141.1"), ("pystray", "0.19.5"))
+    f = tmp_path / "THIRD-PARTY-LICENSES.md"
+    f.write_text(gen.render(pkgs), encoding="utf-8")
+    assert gen.check(f, pkgs, []) == 0
+
+
+def test_check_passes_when_only_versions_differ(tmp_path):
+    """版本号变了不算失败 —— requirements.txt 全是 `>=`，CI 装的总是当时最新版"""
+    f = tmp_path / "L.md"
+    f.write_text(gen.render(_pkgs(("anyio", "4.14.2"))), encoding="utf-8")
+    assert gen.check(f, _pkgs(("anyio", "4.15.1")), []) == 0
+
+
+def test_check_fails_when_listing_misses_a_dependency(tmp_path):
+    """清单漏项要红 —— #2 翻车就是这个形态"""
+    f = tmp_path / "L.md"
+    f.write_text(gen.render(_pkgs(("fastapi", "1"))), encoding="utf-8")
+    assert gen.check(f, _pkgs(("fastapi", "1"), ("pystray", "0.19.5")), []) == 1
+
+
+def test_check_fails_when_listing_keeps_a_removed_dependency(tmp_path):
+    """依赖被移除了、清单没重跑，也要红"""
+    f = tmp_path / "L.md"
+    f.write_text(gen.render(_pkgs(("fastapi", "1"), ("bottle", "0.13.4"))), encoding="utf-8")
+    assert gen.check(f, _pkgs(("fastapi", "1")), []) == 1
+
+
+def test_check_handles_crlf_listing(tmp_path):
+    """仓库里那份是 CRLF（Windows 上生成的），解析不能被行尾绊倒"""
+    pkgs = _pkgs(("fastapi", "0.141.1"))
+    f = tmp_path / "L.md"
+    f.write_bytes(gen.render(pkgs).replace("\n", "\r\n").encode("utf-8"))
+    assert gen.check(f, pkgs, []) == 0
+
+
+def test_check_fails_when_listing_absent(tmp_path):
+    assert gen.check(tmp_path / "nope.md", _pkgs(("x", "1")), []) == 1
+
+
+def test_check_fails_when_environment_incomplete(tmp_path):
+    """环境没装全时算出来的集合不可信，不能当通过"""
+    f = tmp_path / "L.md"
+    f.write_text(gen.render(_pkgs(("fastapi", "1"))), encoding="utf-8")
+    assert gen.check(f, _pkgs(("fastapi", "1")), ["pystray"]) == 1

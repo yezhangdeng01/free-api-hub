@@ -31,3 +31,10 @@ jobs:
 
       - name: 运行测试
         run: python -m pytest tests/ -q
+
+      - name: 校验第三方许可清单与 requirements.txt 同步
+        # 仓库里那份清单是给人 review 的副本（真正进包的那份由 release.yml 在打包时现生成），
+        # 但它要是过期了没人会知道 —— 这里按 requirements.txt 重算一遍集合，对不上就红。
+        # 只比依赖集合、不比版本号：requirements.txt 全是 `>=`，上游一发版版本号就变，
+        # 拿版本号当失败条件会让 CI 周期性变红，而那并不说明清单错了。
+        run: python scripts/gen_third_party_licenses.py --check

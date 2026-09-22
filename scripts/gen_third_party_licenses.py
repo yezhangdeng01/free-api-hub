@@ -17,6 +17,11 @@
 
     python scripts/gen_third_party_licenses.py            # 写入仓库根目录
     python scripts/gen_third_party_licenses.py --out xxx.md
+    python scripts/gen_third_party_licenses.py --check    # 只核对，不写（CI 用）
+
+`--check` 守的是**仓库里那份清单会不会静默过期**：改了 `requirements.txt` 却忘了重跑，
+清单就悄悄对不上了（#2 就是这样漏掉 10 个运行时依赖的）。它只把**依赖集合**的变化判为失败，
+版本号变了只提示 —— 见 `check()` 的注释。
 
 产物是给 **Windows 绿色版**用的，所以清单也该在能装上 Windows 专属依赖的机器上生成
 （`pythonnet` / `clr_loader` 只在 Windows 上装得到）；在别的平台上跑会缺这几项，脚本会提醒。
@@ -239,11 +244,83 @@ def render(pkgs: list[dict], own_license: str = "MIT") -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+# ---------------------------------------------------------------- 清单核查
+
+_TABLE_ROW = re.compile(r"^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$")
+
+
+def table_entries(text: str) -> dict[str, str]:
+    """从清单正文的「依赖清单」表里取 `{归一化包名: 版本}`"""
+    out: dict[str, str] = {}
+    for line in text.replace("\r\n", "\n").splitlines():
+        m = _TABLE_ROW.match(line)
+        if not m:
+            continue
+        name, version = m.group(1).strip(), m.group(2).strip()
+        if name == "库" or set(name) <= {"-"}:
+            continue                    # 表头与分隔行
+        out[_norm(name)] = version
+    return out
+
+
+def check(target: pathlib.Path, pkgs: list[dict], missing: list[str]) -> int:
+    """核对 `target` 与「按当前 requirements.txt 算出来的集合」，返回进程退出码。
+
+    **只把依赖集合的变化判为失败**，版本号不进判定 —— `requirements.txt` 全用 `>=`，
+    CI 每次 `pip install` 装的是当时最新版，上游一发版版本号就变。拿版本号当失败条件，
+    CI 会周期性变红，而那种红并不说明清单错了。集合错了才拦：漏掉 `pystray`（LGPLv3）
+    有实际后果，漏项也正是 #2 翻车的方式。
+    """
+    if missing:
+        print("当前环境没装全，算出来的集合不可信 —— 先 pip install -r requirements.txt：",
+              file=sys.stderr)
+        for m in missing:
+            print(f"    {m}", file=sys.stderr)
+        return 1
+
+    if not target.is_file():
+        print(f"找不到 {target} —— 先在能装上 Windows 专属依赖的机器上跑一次 "
+              f"`python scripts/gen_third_party_licenses.py` 并把它提交进来", file=sys.stderr)
+        return 1
+
+    have = table_entries(target.read_text(encoding="utf-8"))
+    want = {_norm(p["name"]): p["version"] for p in pkgs}
+    added = sorted(set(want) - set(have))       # 现在算得出来、清单里没有
+    gone = sorted(set(have) - set(want))        # 清单里有、现在算不出来
+    moved = sorted(k for k in set(have) & set(want) if have[k] != want[k])
+
+    if not added and not gone:
+        print(f"✓ {target.name} 与当前依赖一致（{len(want)} 项）")
+        if moved:
+            print(f"  ℹ 其中 {len(moved)} 项版本不同（不算失败；打包时会重新生成清单）：")
+            for k in moved[:10]:
+                print(f"      {k} {have[k]} → {want[k]}")
+            if len(moved) > 10:
+                print(f"      …… 另有 {len(moved) - 10} 项")
+        return 0
+
+    print(f"✗ {target.name} 与当前依赖不一致：", file=sys.stderr)
+    if added:
+        print("  当前依赖算得出来、清单里没有（漏项）：", file=sys.stderr)
+        for k in added:
+            print(f"      + {k} {want[k]}", file=sys.stderr)
+    if gone:
+        print("  清单里有、当前依赖算不出来（依赖已移除，或这个环境装漏了）：", file=sys.stderr)
+        for k in gone:
+            print(f"      - {k} {have[k]}", file=sys.stderr)
+    print("  修法：在能装上 Windows 专属依赖的机器上重跑\n"
+          "      python scripts/gen_third_party_licenses.py\n"
+          f"  再把 {target.name} 一起提交。", file=sys.stderr)
+    return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="生成第三方许可证汇总文件")
     ap.add_argument("--out", default="THIRD-PARTY-LICENSES.md", help="输出路径（默认仓库根目录）")
     ap.add_argument("--requirements", default=str(_ROOT / "requirements.txt"),
                     help="依赖清单，集合作根（默认仓库根目录的 requirements.txt）")
+    ap.add_argument("--check", action="store_true",
+                    help="只核对现有清单与当前依赖是否一致（CI 用），不写文件")
     args = ap.parse_args()
 
     req_file = pathlib.Path(args.requirements)
@@ -261,6 +338,10 @@ def main() -> int:
     target = pathlib.Path(args.out)
     if not target.is_absolute():
         target = _ROOT / target
+
+    if args.check:
+        return check(target, pkgs, missing)
+
     target.write_text(render(pkgs), encoding="utf-8")
 
     print(f"已生成 {target}（{len(pkgs)} 个依赖，根来自 {req_file.name}）")
