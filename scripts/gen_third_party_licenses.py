@@ -40,6 +40,25 @@ import sysconfig
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+
+def _force_utf8_stdout() -> None:
+    """把输出流改到 UTF-8。
+
+    Windows 的 GitHub Runner 上 stdout 编码是 cp1252，而本脚本的输出里满是中文（还有 ✓ / ✗ / ⚠），
+    不改就会在**打印结果**这一步抛 UnicodeEncodeError —— 检查逻辑明明通过了，却因为打不出那一行
+    而退出码非 0，看起来像"清单不一致"。本地控制台通常已是 UTF-8，所以这个坑只在 CI 上现形。
+
+    退路用 `errors="replace"`：宁可少几个字符，也不能让脚本崩在打印上。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:               # 不是 TextIOWrapper（被重定向或替换过）
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
 #: 开发/构建工具：项目自己的工具链与打包器，不随包分发，不进清单。
 #: （pytest 连它的传递依赖一起挡在这里 —— 它在 requirements.txt 里，但只在开发时用。
 #: `annotated-doc` 名字看着像内部件，其实是 fastapi ≥0.14x 的硬依赖，**不能**挡。）
@@ -315,6 +334,7 @@ def check(target: pathlib.Path, pkgs: list[dict], missing: list[str]) -> int:
 
 
 def main() -> int:
+    _force_utf8_stdout()
     ap = argparse.ArgumentParser(description="生成第三方许可证汇总文件")
     ap.add_argument("--out", default="THIRD-PARTY-LICENSES.md", help="输出路径（默认仓库根目录）")
     ap.add_argument("--requirements", default=str(_ROOT / "requirements.txt"),

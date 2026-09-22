@@ -11,7 +11,9 @@
 """
 import importlib.metadata
 import importlib.util
+import os
 import pathlib
+import subprocess
 import sys
 
 import pytest
@@ -168,3 +170,18 @@ def test_check_fails_when_environment_incomplete(tmp_path):
     f = tmp_path / "L.md"
     f.write_text(gen.render(_pkgs(("fastapi", "1"))), encoding="utf-8")
     assert gen.check(f, _pkgs(("fastapi", "1")), ["pystray"]) == 1
+
+
+# ---------------------------------------------------------------- 控制台编码
+
+def test_script_prints_under_cp1252_console():
+    """CI 的 Windows 控制台编码是 cp1252，脚本不能崩在打印上。
+
+    曾经崩过：检查逻辑通过了，`print("✓ …")` 却抛 UnicodeEncodeError，
+    退出码非 0，看起来像"清单不一致"。脚本自己把 stdout 改到 UTF-8 才对。
+    """
+    env = dict(os.environ, PYTHONIOENCODING="cp1252")
+    p = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "gen_third_party_licenses.py"), "--help"],
+        capture_output=True, env=env)
+    assert p.returncode == 0, p.stderr.decode("utf-8", "replace")
