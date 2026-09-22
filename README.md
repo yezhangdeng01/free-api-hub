@@ -8,7 +8,7 @@
 
 - **统一网关**：统一API地址 `http://127.0.0.1:8787/v1`，OpenAI 兼容（`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/embeddings`），任何支持自定义 OpenAI 地址的工具都能直连
 - **Responses 协议兼容**：`/v1/responses` 把 Responses 协议（Codex CLI、新版 OpenAI SDK 只认这个端点）翻译成 chat 完成请求，`instructions` / `input` / `tools` / 流式事件流全部对齐；路由、冷却、失败换路、用量统计与 chat 入口共用同一套
-- **Anthropic 协议兼容**：`/v1/messages` 把 Anthropic Messages 协议（Claude Code、Anthropic SDK）翻译成 chat 完成请求，`system` / 块数组 / `tool_use` / `tool_result` / 流式事件流全部对齐；同样复用 chat 入口的渠道路由与记账
+- **Anthropic 协议兼容**：`/v1/messages` 把 Anthropic Messages 协议（Claude Code、Anthropic SDK）翻译成 chat 完成请求，`system` / 块数组 / `tool_use` / `tool_result` / 流式事件流全部对齐；同样复用 chat 入口的渠道路由与记账。`/v1/messages/count_tokens` 也能用（给的是本地估算，见「已知限制」）
 - **智能路由**：四种路由策略（均衡/智能优先/稳定优先/速度优先），按成功率评分 + 延迟 EMA + 能力档位排序，失败自动换路；429/401/5xx 分类冷却（429 尊重 Retry-After，401 自动停用渠道）
 - **模型别名**：把不同平台同一模型归并成组，组内故障切换
 - **模型主动探测**：定期对近期用过的模型发 1-token 探测，提前发现下线模型
@@ -116,6 +116,8 @@ api-hub/
 ├── API Hub.vbs        # 静默启动（无控制台，日常使用双击它）
 ├── run.bat            # 调试模式（首次安装/带控制台）
 ├── tests/             # pytest 单元测试（离线）
+├── scripts/           # 运维脚本（gen_third_party_licenses.py：生成第三方许可汇总）
+├── .github/workflows/ # ci.yml（PR/push 跑测试）、release.yml（打 tag 发 Windows 绿色版）
 ├── config.json        # 配置（密钥为 DPAPI 密文）
 └── data/              # usage.db 用量记录 + api-hub.log 运行日志
 ```
@@ -135,6 +137,10 @@ api-hub/
 - 流式请求的 token 统计依赖上游响应中的 `usage` 字段，部分渠道不返回时记 0
 - **`/v1/responses` 无状态**：不实现 `store` 的服务端会话记忆，`previous_response_id` 会被忽略并记日志
   （客户端每轮回传完整 `input` 就不受影响，Responses 协议本来也是这么用的）
+- **`/v1/messages/count_tokens` 给的是本地估算**：网关下游是 chat completions 兼容渠道，
+  既没有 `count_tokens` 可以透传，也没有上游的分词器。做法是按 `/v1/messages` 同一套翻译
+  得到 chat body，再估它的大小（中文按字、其余按 4 字符约 1 token，图片按固定值）。
+  量级够客户端判断上下文预算；要官方口径的精确值只能直连 Anthropic
 - **`/v1/messages` 不处理思考块**：Anthropic 的 `thinking` / `redacted_thinking` 块要求服务端签名，
   网关给不出合法签名，硬塞假块会被客户端判为协议错误 —— 所以请求里的思考块会被忽略（记日志），
   上游的推理内容也不译成思考块。要思考内容请走 chat 入口（那边是 `reasoning_content`）
@@ -154,5 +160,8 @@ api-hub/
 
 MIT License —— 详见 [LICENSE](LICENSE)。欢迎 issue / PR。
 
-打包分发的绿色版里附带 `THIRD-PARTY-LICENSES.md`（第三方依赖的许可与版权声明汇总，
-由 `scripts/gen_third_party_licenses.py` 生成；依赖升级后重新跑一次再打包）。
+打包分发的绿色版里附带 `THIRD-PARTY-LICENSES.md`（第三方依赖的许可与版权声明汇总）。
+清单集合 = `requirements.txt` 的依赖 + 其传递依赖（构建期工具不计入），由
+`scripts/gen_third_party_licenses.py` 生成；依赖升级后重新跑一次再打包。
+**要在 Windows 上生成** —— `pythonnet` / `clr_loader` 这类只在 Windows 装得到，
+在别的系统上跑出来的清单会缺项。

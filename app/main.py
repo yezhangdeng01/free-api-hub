@@ -415,15 +415,27 @@ async def security_middleware(request: Request, call_next):
     """安全层：Host 校验（防 DNS rebinding）+ 跨域拒绝 + 网关 Token 鉴权"""
     path = request.url.path
     host = request.headers.get("host", "")
+
+    def deny(status: int, message: str):
+        """拒绝请求时的错误体。
+
+        `/v1/messages` 已经专门实现了 Anthropic 形状的错误体，这里就不能再回通用的
+        `{"detail": ...}` —— 只认 Anthropic 协议的客户端在这几条边缘路径上会拿到
+        自己不认识的形状，而我们本来是有能力给对的。
+        """
+        if path.startswith("/v1/messages"):
+            return dialects.messages.error_response(status, message)
+        return JSONResponse({"detail": message}, status)
+
     # 1) Host 必须是本机（防 DNS rebinding 把内网服务映射到公网域名）
     if host and not (host.startswith("127.0.0.1") or host.startswith("localhost") or host.startswith("[::1]")):
         logger.warning("拒绝异常 Host 请求: %s %s", host, path)
-        return JSONResponse({"detail": "服务只允许本机访问"}, 403)
+        return deny(403, "服务只允许本机访问")
     # 2) 带 Origin 头的请求必须是同源（跨域 JS 一律拒绝，不再提供 CORS）
     origin = request.headers.get("origin")
     if origin and not origin.startswith((f"http://{host}", f"https://{host}")):
         logger.warning("拒绝跨域请求: Origin=%s path=%s", origin, path)
-        return JSONResponse({"detail": "拒绝跨域请求"}, 403)
+        return deny(403, "拒绝跨域请求")
     # 3) /v1/* 网关接口需要 Token
     #    两种写法都认：`Authorization: Bearer <token>`（OpenAI 那套，也是本项目界面里给的），
     #    以及 Anthropic 客户端专用的 `x-api-key`（Claude Code / Anthropic SDK 只发这个头）
@@ -434,7 +446,7 @@ async def security_middleware(request: Request, call_next):
             auth = request.headers.get("authorization", "")
             xkey = request.headers.get("x-api-key", "")
             if not token or (auth != f"Bearer {token}" and xkey != token):
-                return JSONResponse({"detail": "缺少或错误的 API Token（见 API Hub 界面顶部）"}, 401)
+                return deny(401, "缺少或错误的 API Token（见 API Hub 界面顶部）")
     return await call_next(request)
 
 
@@ -1008,6 +1020,27 @@ async def messages_api(request: Request):
     except ValueError as e:
         return dialects.messages.error_response(400, str(e))
     return await dialects.messages.convert(await _chat_v1(chat_body, request, cfg), ctx)
+
+
+@app.post("/v1/messages/count_tokens")
+async def messages_count_tokens(request: Request):
+    """Anthropic 的 token 计数端点（Claude Code 用它估算上下文用量）。
+
+    **返回的是本地估算，不是上游的精确计数。** 网关下游是 chat completions 兼容渠道，
+    没有 `count_tokens` 可透传，也没有对应分词器。做法是走 `/v1/messages` **同一套**翻译
+    得到 chat body，再估它的大小 —— 所以结果至少和真正要发出去的内容一致。
+
+    之前这个端点是 404，而 README 也没提，客户端只能撞墙。现在至少给得出量级正确的数。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return dialects.messages.error_response(400, "请求体不是合法 JSON")
+    try:
+        out = dialects.messages.count_input_tokens(body, cfgmod.load_config())
+    except ValueError as e:
+        return dialects.messages.error_response(400, str(e))
+    return JSONResponse(out)
 
 
 @app.post("/api/models/test")

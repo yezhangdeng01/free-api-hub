@@ -1,10 +1,11 @@
 """`/v1/messages`（Anthropic 方言）翻译层测试（离线：不打外网、不占端口）。
 
-分四组：
+分五组：
 1. 请求翻译 —— system / 块数组 / 图片 / tools / tool_choice / max_tokens 必填
 2. 非流式回包 —— chat 响应 → Anthropic message 对象
-3. 流式回包 —— chat SSE → Anthropic 事件流（顺序 + 文本/工具增量拼接）
-4. 端到端 —— TestClient 打 `/v1/messages`，上游用假 httpx client 打桩
+3. token 估算 —— `count_tokens`（本地估算，官方那个端点不要求 max_tokens）
+4. 流式回包 —— chat SSE → Anthropic 事件流（顺序 + 文本/工具增量拼接）
+5. 端到端 —— TestClient 打 `/v1/messages`，上游用假 httpx client 打桩
 
 **最要紧的一条**：`test_tool_use_round_trip_preserves_id` 保证多轮工具调用能闭合
 （请求方向的 `tool_use_id` 与响应方向的 `tool_use.id` 必须是同一个值）。
@@ -161,6 +162,27 @@ def test_build_message_length_maps_to_max_tokens():
     assert out["stop_reason"] == "max_tokens"
 
 
+def test_build_message_prefers_upstream_model_name():
+    """回包 model 报上游实际返回的模型名 —— 与 responses 方言同一个口径。
+
+    请求侧写的是别名（`auto-*` 之类），渠道会换成真名；客户端拿这个字段显示或记账，
+    两个协议入口给出的答案不该不同。
+    """
+    out = M.build_message({
+        "model": "glm-4-flash",
+        "choices": [{"finish_reason": "stop", "message": {"content": "hi"}}],
+    }, {"model": "auto-balanced"})
+    assert out["model"] == "glm-4-flash"
+
+
+def test_build_message_model_falls_back_to_request_side():
+    """上游没报 model 才退回请求侧的值"""
+    out = M.build_message({"choices": [{"finish_reason": "stop",
+                                        "message": {"content": "hi"}}]},
+                          {"model": "auto-balanced"})
+    assert out["model"] == "auto-balanced"
+
+
 def test_build_message_tool_calls_become_tool_use():
     out = M.build_message({
         "choices": [{"finish_reason": "tool_calls", "message": {
@@ -211,7 +233,61 @@ def test_build_message_never_empty_content():
     assert out["content"] == [{"type": "text", "text": ""}]
 
 
-# ---------------------------------------------------------------- 3. 流式回包
+# ---------------------------------------------------------------- 3. token 估算
+
+def test_count_tokens_needs_no_max_tokens():
+    """官方这个端点不要求 max_tokens（只估输入、不生成），缺了也得能出数"""
+    out = M.count_input_tokens({"model": "m",
+                                "messages": [{"role": "user", "content": "你好"}]})
+    assert isinstance(out["input_tokens"], int)
+    assert out["input_tokens"] > 0
+    assert set(out) == {"input_tokens"}, "回包形状要跟官方一致，别塞额外字段"
+
+
+def test_count_tokens_grows_with_content():
+    small = M.count_input_tokens({"model": "m",
+                                 "messages": [{"role": "user", "content": "hi"}]})
+    big = M.count_input_tokens({"model": "m", "messages": [
+        {"role": "user", "content": "hi" * 200}]})
+    assert big["input_tokens"] > small["input_tokens"]
+
+
+def test_count_tokens_cjk_is_not_underestimated():
+    """中文一个字约一个 token。一律按「4 字符 1 token」会把中文上下文低估到四分之一，
+    而低估会让客户端以为还有余量、该压缩时不压缩。"""
+    text = "一二三四五六七八九十"
+    out = M.count_input_tokens({"model": "m",
+                                "messages": [{"role": "user", "content": text}]})
+    assert out["input_tokens"] >= len(text)
+
+
+def test_count_tokens_includes_tools_and_images():
+    base = M.count_input_tokens({"model": "m",
+                                 "messages": [{"role": "user", "content": "x"}]})
+    with_tool = M.count_input_tokens({
+        "model": "m", "messages": [{"role": "user", "content": "x"}],
+        "tools": [{"name": "get_weather", "description": "查天气",
+                   "input_schema": {"type": "object", "properties": {}}}]})
+    assert with_tool["input_tokens"] > base["input_tokens"]
+
+    with_image = M.count_input_tokens({"model": "m", "messages": [
+        {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": "AAA"}}]}]})
+    assert with_image["input_tokens"] >= M._IMAGE_TOKENS, "图片不能按 0 计"
+
+
+def test_count_tokens_still_validates_the_body():
+    """客户端写错了照样是 400（ValueError → Anthropic 错误体）"""
+    with pytest.raises(ValueError):
+        M.count_input_tokens({"messages": [{"role": "user", "content": "hi"}]})
+    with pytest.raises(ValueError):
+        M.count_input_tokens({"model": "m", "messages": []})
+    with pytest.raises(ValueError):
+        M.count_input_tokens("不是对象")
+
+
+# ---------------------------------------------------------------- 4. 流式回包
 
 def _sse_lines(*objs):
     out = []
@@ -419,7 +495,7 @@ def test_stream_upstream_error_emits_error_event():
     assert parsed[-1][1]["error"]["type"] == "api_error"
 
 
-# ---------------------------------------------------------------- 4. 端到端
+# ---------------------------------------------------------------- 5. 端到端
 
 def _wire_upstream(monkeypatch, model="glm-test", chat_data=None, sse=b"", status=200):
     """把 `main` 的共享 httpx client 换成假的，渠道也伪造好。
@@ -514,7 +590,8 @@ def test_e2e_non_stream(client, monkeypatch):
     assert body["content"] == [{"type": "text", "text": "pong"}]
     assert body["stop_reason"] == "end_turn"
     assert body["usage"]["input_tokens"] == 4
-    assert r.headers.get("anthropic-version") == M.ANTHROPIC_VERSION
+    assert r.headers.get("anthropic-version") is None, \
+        "anthropic-version 是**请求**头，官方响应里没有，不该回带"
     # 翻译后的 chat body 真的发出去了
     assert seen and seen[0]["model"] == "glm-test"
     assert seen[0]["messages"][0] == {"role": "system", "content": "简短回答"}
@@ -590,3 +667,57 @@ def test_e2e_tool_use_round_trip_preserves_id(client, monkeypatch):
     assert sent["messages"][1]["tool_calls"][0]["id"] == "toolu_keep_me"
     assert sent["messages"][2] == {"role": "tool", "tool_call_id": "toolu_keep_me",
                                    "content": "晴 18 度"}
+
+
+def test_e2e_count_tokens(client, monkeypatch):
+    """count_tokens：**不发上游请求**，直接给 Anthropic 形状的估算值。
+
+    以前这里是 404 —— Claude Code 这类客户端拿不到数只能瞎猜或用别的方式兜。
+    """
+    seen = _wire_upstream(monkeypatch, chat_data={"choices": []})
+    r = client.post("/v1/messages/count_tokens", headers=H, json={
+        "model": "glm-test",
+        "system": "简短回答",
+        "messages": [{"role": "user", "content": "ping"}],
+    })
+    assert r.status_code == 200, r.text
+    assert isinstance(r.json()["input_tokens"], int)
+    assert r.json()["input_tokens"] > 0
+    assert seen == [], "估算在本地做，不该有上游请求"
+
+
+def test_e2e_count_tokens_bad_body_is_anthropic_error(client, monkeypatch):
+    _wire_upstream(monkeypatch, chat_data={"choices": []})
+    r = client.post("/v1/messages/count_tokens", headers=H,
+                    json={"messages": [{"role": "user", "content": "hi"}]})   # 缺 model
+    assert r.status_code == 400
+    assert r.json()["type"] == "error"
+    assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_e2e_missing_token_is_anthropic_error(client, monkeypatch):
+    """鉴权失败也走 Anthropic 形状 —— 只认这个协议的客户端才解析得了。"""
+    from app import config as cfgmod
+    _wire_upstream(monkeypatch, chat_data={"choices": []})
+    monkeypatch.setattr(cfgmod, "load_config", lambda: {
+        "channels": [], "aliases": {}, "route_strategy": "balanced", "pinned": [],
+        "auth_enabled": True, "api_token": "sekret", "port": 8787})
+    r = client.post("/v1/messages", headers=H, json={
+        "model": "glm-test", "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 401
+    assert r.json()["type"] == "error"
+    assert r.json()["error"]["type"] == "authentication_error"
+
+
+def test_e2e_missing_token_on_chat_keeps_generic_error(client, monkeypatch):
+    """非 Anthropic 端点的错误体保持原样 —— 两种形状别搞混"""
+    from app import config as cfgmod
+    _wire_upstream(monkeypatch, chat_data={"choices": []})
+    monkeypatch.setattr(cfgmod, "load_config", lambda: {
+        "channels": [], "aliases": {}, "route_strategy": "balanced", "pinned": [],
+        "auth_enabled": True, "api_token": "sekret", "port": 8787})
+    r = client.post("/v1/chat/completions", headers=H,
+                    json={"model": "glm-test", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 401
+    assert "detail" in r.json()

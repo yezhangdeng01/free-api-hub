@@ -44,8 +44,6 @@ from .responses import _hub_headers, _json_body, _rid, _text_of_parts, _usage_of
 
 logger = logging.getLogger("api-hub")
 
-ANTHROPIC_VERSION = "2023-06-01"
-
 #: chat 的 finish_reason → Anthropic 的 stop_reason（只做这个方向）
 _STOP_TO_ANTHROPIC = {
     "stop": "end_turn",
@@ -74,11 +72,6 @@ def _stop_reason(finish_reason, has_tools: bool) -> str:
 
 #: Anthropic messages 的角色 → chat 角色
 _ROLE_MAP = {"user": "user", "assistant": "assistant", "system": "system"}
-
-#: chat 不认识、不能原样往上送的 Anthropic 专属字段
-_ANTHROPIC_ONLY = (
-    "anthropic_version", "system", "thinking", "metadata", "max_tokens_to_sample",
-)
 
 
 def _text_of_blocks(blocks) -> str:
@@ -296,8 +289,13 @@ def _messages_from(body_messages, ctx: dict) -> list:
     return out
 
 
-def to_chat(body: dict, cfg: dict | None = None) -> tuple[dict, dict]:
-    """Anthropic 请求体 → `(chat 请求体, 上下文)`；客户端写错了抛 ValueError（→ 400）"""
+def to_chat(body: dict, cfg: dict | None = None, *,
+            require_max_tokens: bool = True) -> tuple[dict, dict]:
+    """Anthropic 请求体 → `(chat 请求体, 上下文)`；客户端写错了抛 ValueError（→ 400）
+
+    `require_max_tokens=False` 是给 `count_tokens` 用的：那个端点官方不要求 `max_tokens`
+    （只估输入、不生成）。其余校验与翻译仍走这同一条路，免得两份逻辑各自漂移。
+    """
     if not isinstance(body, dict):
         raise ValueError("请求体必须是 JSON 对象")
 
@@ -312,7 +310,9 @@ def to_chat(body: dict, cfg: dict | None = None) -> tuple[dict, dict]:
 
     # `max_tokens` 必填（官方也这么要求）。不替它猜：猜小了会把答案截断，而客户端看不到提示。
     max_tokens = body.get("max_tokens")
-    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+    has_max = (isinstance(max_tokens, int) and not isinstance(max_tokens, bool)
+               and max_tokens > 0)
+    if not has_max and require_max_tokens:
         raise ValueError("缺少 max_tokens（Anthropic 协议必填，正整数）")
 
     ctx = {
@@ -324,7 +324,9 @@ def to_chat(body: dict, cfg: dict | None = None) -> tuple[dict, dict]:
         "thinking": body.get("thinking") if isinstance(body.get("thinking"), dict) else None,
     }
 
-    chat: dict = {"model": model, "max_tokens": max_tokens}
+    chat: dict = {"model": model}
+    if has_max:
+        chat["max_tokens"] = max_tokens
 
     system_text = _text_of_blocks(body.get("system"))
     messages = []
@@ -362,6 +364,76 @@ def to_chat(body: dict, cfg: dict | None = None) -> tuple[dict, dict]:
     if ctx["dropped"]:
         logger.info("messages 翻译: model=%s 丢弃=%s", model, sorted(set(ctx["dropped"])))
     return chat, ctx
+
+
+# ---------------------------------------------------------------- token 估算
+
+#: 每条消息的角色与分隔符开销（官方文档给的经验值）
+_MSG_OVERHEAD = 4
+#: 每个 function 定义的骨架开销（name / 参数结构）
+_TOOL_OVERHEAD = 12
+#: 图片按固定值计：看不到分辨率，取官方「约 1092×1092 上限」的量级
+_IMAGE_TOKENS = 1600
+
+
+def _tokens_of_text(s: str) -> int:
+    """按字符估算 token：CJK 一个字符约 1 token，其余按 4 字符约 1 token。
+
+    不追求准确 —— 网关手里没有上游的分词器，也给不出官方那样的精确值。
+    但量级要站得住：客户端拿它判断「上下文还剩多少」，差两三成不影响决策，
+    差一个数量级才会。CJK 单独算是因为中文一个字就接近一个 token，
+    一律按 4 字符 1 token 会把中文上下文低估到四分之一。
+    """
+    if not s:
+        return 0
+    wide = sum(1 for ch in s if ord(ch) >= 0x2E80)   # CJK 部首起：中日韩 + 全角标点
+    return wide + (len(s) - wide + 3) // 4
+
+
+def _count_chat(chat: dict) -> int:
+    """估一个 chat 请求体的输入 token 数（文本 + 图片 + 工具定义）"""
+    total = 0
+    for m in chat.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        total += _MSG_OVERHEAD
+        content = m.get("content")
+        if isinstance(content, str):
+            total += _tokens_of_text(content)
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "image_url":
+                    total += _IMAGE_TOKENS
+                else:
+                    v = part.get("text")
+                    total += _tokens_of_text(v if isinstance(v, str) else "")
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            total += _TOOL_OVERHEAD
+            total += _tokens_of_text(str(fn.get("name") or ""))
+            total += _tokens_of_text(str(fn.get("arguments") or ""))
+    for t in chat.get("tools") or []:
+        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+        total += _TOOL_OVERHEAD
+        total += _tokens_of_text(str(fn.get("name") or ""))
+        total += _tokens_of_text(str(fn.get("description") or ""))
+        total += _tokens_of_text(json.dumps(fn.get("parameters") or {}, ensure_ascii=False))
+    return total
+
+
+def count_input_tokens(body: dict, cfg: dict | None = None) -> dict:
+    """`POST /v1/messages/count_tokens` 的回包：`{"input_tokens": n}`。
+
+    **这是本地估算，不是上游的精确计数** —— 网关面对的是 chat completions 兼容渠道，
+    既没有 `count_tokens` 可以透传，也没有对应的分词器可用。做法是「按同一套翻译逻辑
+    得到 chat body，再估它有多大」，所以它至少和真正发出去的内容一致。
+
+    量级够客户端判断上下文预算即可；要官方口径的精确值只能直连 Anthropic。
+    """
+    chat, _ = to_chat(body, cfg, require_max_tokens=False)
+    return {"input_tokens": _count_chat(chat)}
 
 
 # ---------------------------------------------------------------- 响应翻译
@@ -412,7 +484,9 @@ def build_message(data: dict, ctx: dict) -> dict:
         "id": data.get("id") if isinstance(data.get("id"), str) and data.get("id") else _rid("msg_"),
         "type": "message",
         "role": "assistant",
-        "model": ctx.get("model"),
+        # 优先报上游实际返回的模型名（"auto" 这类别名会被渠道换成真名），
+        # 上游没报才退回请求侧 —— 与 responses 方言同一个口径
+        "model": data.get("model") or ctx.get("model"),
         "content": blocks,
         "stop_reason": stop,
         "stop_sequence": None,
@@ -677,17 +751,14 @@ async def convert(resp, ctx: dict):
     headers = _hub_headers(resp)
     if isinstance(resp, StreamingResponse):
         headers["Cache-Control"] = "no-cache"
-        headers["anthropic-version"] = ANTHROPIC_VERSION
         return StreamingResponse(translate_stream(resp.body_iterator, ctx),
                                  media_type="text/event-stream", headers=headers)
     if getattr(resp, "status_code", 200) >= 400:
         body = _json_body(resp)
         msg = body.get("detail") if isinstance(body.get("detail"), str) else "上游渠道均失败"
         return error_response(int(resp.status_code), msg)
-    out = JSONResponse(build_message(_json_body(resp), ctx), headers=headers)
-    out.headers["anthropic-version"] = ANTHROPIC_VERSION
-    return out
+    return JSONResponse(build_message(_json_body(resp), ctx), headers=headers)
 
 
-__all__ = ["to_chat", "convert", "translate_stream", "build_message", "error_response",
-           "ANTHROPIC_VERSION"]
+__all__ = ["to_chat", "count_input_tokens", "convert", "translate_stream", "build_message",
+           "error_response"]
