@@ -25,6 +25,11 @@ else:
 # Apache-2.0 / MPL-2.0 都要求随包附上许可与版权声明。PyInstaller 只打包模块代码，
 # `*.dist-info/licenses/` 不会自动进来，所以显式带上汇总文件与自己的 LICENSE。
 # 汇总文件由 scripts/gen_third_party_licenses.py 生成（CI 里打包前会跑一次）。
+#
+# ⚠️ dest 写 "." 并**不会**落到包根：PyInstaller 6 的 onedir 把所有 `datas` 一律放进
+# 内容目录 `_internal/`，zip 根只剩 exe 和 `_internal/`（09-22 下载 v1.0.7 实测）。
+# 解压的人从包根看不出来 —— 所以在包根再放一份这件事由 release.yml 的
+# 「许可文件在包根再放一份」那步做；这里这份留着，运行时按相对路径找得到。
 _licenses = [(p, ".") for p in ("LICENSE", "THIRD-PARTY-LICENSES.md") if os.path.exists(p)]
 
 a = Analysis(
