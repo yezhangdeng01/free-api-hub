@@ -6,8 +6,9 @@
 
 ## 功能
 
-- **统一网关**：统一API地址 `http://127.0.0.1:8787/v1`，OpenAI 兼容（`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/embeddings`），任何支持自定义 OpenAI 地址的工具都能直连
+- **统一网关**：统一API地址 `http://127.0.0.1:8787/v1`，OpenAI 兼容（`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/embeddings`），任何支持自定义 OpenAI 地址的工具都能直连
 - **Responses 协议兼容**：`/v1/responses` 把 Responses 协议（Codex CLI、新版 OpenAI SDK 只认这个端点）翻译成 chat 完成请求，`instructions` / `input` / `tools` / 流式事件流全部对齐；路由、冷却、失败换路、用量统计与 chat 入口共用同一套
+- **Anthropic 协议兼容**：`/v1/messages` 把 Anthropic Messages 协议（Claude Code、Anthropic SDK）翻译成 chat 完成请求，`system` / 块数组 / `tool_use` / `tool_result` / 流式事件流全部对齐；同样复用 chat 入口的渠道路由与记账
 - **智能路由**：四种路由策略（均衡/智能优先/稳定优先/速度优先），按成功率评分 + 延迟 EMA + 能力档位排序，失败自动换路；429/401/5xx 分类冷却（429 尊重 Retry-After，401 自动停用渠道）
 - **模型别名**：把不同平台同一模型归并成组，组内故障切换
 - **模型主动探测**：定期对近期用过的模型发 1-token 探测，提前发现下线模型
@@ -50,6 +51,24 @@ curl http://127.0.0.1:8787/v1/responses \
 的 `call_id` 原样保留）、`tools` / `tool_choice`、`text.format`（含 `json_schema`）、`stream` 流式事件流。
 ⚠️ **无状态**：不实现服务端会话记忆，`previous_response_id` 会被忽略（客户端每轮回传完整 `input` 就不受影响）。
 
+### 用 Anthropic 协议的客户端（Claude Code、Anthropic SDK）
+
+把 base URL 指向 `http://127.0.0.1:8787`、API Key 填网关 Token 即可。Anthropic 客户端发的是
+`x-api-key` 头（不是 `Authorization: Bearer`），网关两种都认。
+
+```bash
+curl http://127.0.0.1:8787/v1/messages \
+  -H "x-api-key: <网关 Token>" -H "Content-Type: application/json" \
+  -d '{"model":"auto-balanced","max_tokens":256,"system":"你是助手","messages":[{"role":"user","content":"你好"}]}'
+```
+
+支持 `system`（字符串或块数组）、`messages` 的块数组（`text` / `image` / `tool_result`）、
+`tools` + `tool_choice`（`auto` / `any` / `tool` / `none`）、`stop_sequences`、`temperature` / `top_p` / `top_k`、
+`stream` 流式事件流（`message_start` → `content_block_*` → `message_delta` → `message_stop`），
+多轮工具调用的 `tool_use.id` ↔ `tool_use_id` 原样保留。
+⚠️ **`max_tokens` 必填**（Anthropic 协议如此）：缺了直接 400 —— 不替客户端猜一个值，猜小了会把答案截断而它看不到提示。
+⚠️ **无状态**：不保存任何会话，客户端每轮把完整对话放进 `messages`。
+
 ## 配置
 
 所有配置存在 `config.json`（密钥字段为 DPAPI 密文），界面改不了的可直接编辑后重启。全新部署：首次启动会自动生成默认 `config.json`，也可参考仓库内的 `config.example.json`（两者结构一致，后者为空模板）：
@@ -69,7 +88,7 @@ curl http://127.0.0.1:8787/v1/responses \
 - `route_strategy`：`balanced` / `quality` / `stability` / `speed`
 - `model_tiers`：能力档位正则覆盖，如 `{"qwen.*max": 3, ".*-flash": 1}`
 - `auth_enabled` 设为 `false` 可关闭网关 Token 鉴权（不建议）
-- `/v1/responses` 专用（见下）：
+- `/v1/responses`、`/v1/messages` 专用（见下）：
   - `responses_stream_usage`（默认 `true`）：流式时给上游加 `stream_options.include_usage`，好让
     `response.completed` 带 token 用量。**哪个渠道因此返回 400 就改成 `false`**（只影响用量显示）
   - `responses_reasoning_effort`（默认 `false`）：把 `reasoning.effort` 译成 chat 的 `reasoning_effort`
@@ -81,7 +100,10 @@ curl http://127.0.0.1:8787/v1/responses \
 api-hub/
 ├── app/
 │   ├── main.py        # FastAPI：对外 API + 管理 API + 后台健康检查/探测
-│   ├── responses.py   # /v1/responses 翻译层（Responses 协议 ↔ chat 请求/响应/流式事件）
+│   ├── dialects/      # 下游协议方言注册表（内部形状统一是 chat completions）
+│   │   ├── chat.py       # 恒等映射（本体就是 chat）
+│   │   ├── responses.py  # /v1/responses 翻译层（Responses 协议 ↔ chat 请求/响应/流式事件）
+│   │   └── messages.py   # /v1/messages 翻译层（Anthropic 协议 ↔ chat 请求/响应/流式事件）
 │   ├── gateway.py     # 运行时状态：健康、评分、failover 排序、分类冷却
 │   ├── providers.py   # 各平台模型列表与额度查询
 │   ├── config.py      # 配置读写（加解密）与平台预设
@@ -113,6 +135,9 @@ api-hub/
 - 流式请求的 token 统计依赖上游响应中的 `usage` 字段，部分渠道不返回时记 0
 - **`/v1/responses` 无状态**：不实现 `store` 的服务端会话记忆，`previous_response_id` 会被忽略并记日志
   （客户端每轮回传完整 `input` 就不受影响，Responses 协议本来也是这么用的）
+- **`/v1/messages` 不处理思考块**：Anthropic 的 `thinking` / `redacted_thinking` 块要求服务端签名，
+  网关给不出合法签名，硬塞假块会被客户端判为协议错误 —— 所以请求里的思考块会被忽略（记日志），
+  上游的推理内容也不译成思考块。要思考内容请走 chat 入口（那边是 `reasoning_content`）
 - **`/v1/responses` 的内置托管工具不支持**：`web_search_preview` / `file_search` / `computer_use_preview`
   这类由 OpenAI 服务端执行的工具网关服务不了，翻译时会丢掉（会记进日志）；客户端自定义的 function tool 正常
 - 带 `file_id` 的图片 / 文件（`input_image` / `input_file`）无法解析 —— 网关没有文件存储服务，
