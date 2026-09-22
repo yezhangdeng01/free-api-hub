@@ -1,0 +1,33 @@
+name: ci
+
+# PR 与 push 都跑一遍测试。
+#
+# 加这个是因为仓库原先只有 release.yml，触发条件仅 `push: tags: v*` ——
+# 于是**任何 PR 都没有自动验证**，review 全凭人肉（PR #1 里的「187 passed」就是作者
+# 本地跑出来的数字，无法交叉验证）。而测试是离线的，全部跑完只要几秒。
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # 与发版环境保持一致：pystray / pywebview / pythonnet 都有 Windows 专属依赖，
+    # 换个系统装出来的依赖集都不一样
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 运行测试
+        run: python -m pytest tests/ -q
