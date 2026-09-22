@@ -20,9 +20,11 @@ Anthropic 的响应对象 / SSE 事件流。
 - **`max_tokens` 是必填**（官方也是这样）。缺了直接 400 —— 比替它猜一个值更诚实：
   猜小了会把答案截断，而客户端看不到任何提示。
 - **流式是有状态的**：不像 chat 那样一 chunk 一转发，必须按
-  `message_start → content_block_start → content_block_delta* → content_block_stop* →
-  message_delta → message_stop` 的顺序发；`tool_use` 的 `input_json_delta` 碎片要自己拼。
-  顺序错了官方 SDK 会直接丢事件（这个坑和 responses 面当初"回包缺字段被 SDK 静默丢掉"是同一类）。
+  `message_start → (content_block_start → content_block_delta* → content_block_stop)* →
+  message_delta → message_stop` 的顺序发 —— 每个 content block 自己走完一轮才轮到下一个；
+  `tool_use` 的 `input_json_delta` 碎片要自己拼。
+  （乱序时官方 SDK 并不报错、内容也照样拼得回来，实测 python 1.7 / ts 0.127 都宽容；
+  但这不该成为放松顺序的理由，见 `_StreamState` 的说明。）
 
 **想透传思考（thinking/redacted_thinking 块）先读这段**：Anthropic 的 thinking 块要求
 服务端用私钥签名，客户端会校验 `signature`。我们给不出合法签名，硬塞一个假块会让客户端报错，
@@ -44,16 +46,33 @@ logger = logging.getLogger("api-hub")
 
 ANTHROPIC_VERSION = "2023-06-01"
 
-#: Claude 的 stop_reason → chat 的 finish_reason（我们只做反方向，正向用不到）
+#: chat 的 finish_reason → Anthropic 的 stop_reason（只做这个方向）
 _STOP_TO_ANTHROPIC = {
     "stop": "end_turn",
     "length": "max_tokens",
     "tool_calls": "tool_use",
     "function_call": "tool_use",
     "content_filter": "end_turn",
-    "null": "end_turn",
-    None: "end_turn",
 }
+
+
+def _stop_reason(finish_reason, has_tools: bool) -> str:
+    """chat 的 finish_reason → Anthropic 的 stop_reason。优先级是刻意的：
+
+    1. `length`（被 max_tokens 截断）优先 —— 工具参数很可能只写了一半，不能让客户端照着执行
+    2. 有 `tool_use` 块 → `tool_use`。**finish_reason 缺失、是 None、被渠道写成 "stop"、
+       或者编成一个我们不认识的值，都不该让客户端以为"这一轮正常结束了"** —— 那会让工具
+       静默地不被执行，而这在免额渠道上并不罕见。
+    3. 其余查表，查不到按 `end_turn` 收。
+    """
+    if finish_reason == "length":
+        return "max_tokens"
+    if has_tools:
+        return "tool_use"
+    return _STOP_TO_ANTHROPIC.get(finish_reason, "end_turn")
+
+
+#: Anthropic messages 的角色 → chat 角色
 
 #: Anthropic messages 的角色 → chat 角色
 _ROLE_MAP = {"user": "user", "assistant": "assistant", "system": "system"}
@@ -388,10 +407,7 @@ def build_message(data: dict, ctx: dict) -> dict:
         # 空回复也要给一个块：Anthropic 的 content 不允许为空数组（客户端会当协议错误）
         blocks.append({"type": "text", "text": ""})
 
-    reason = ch.get("finish_reason")
-    stop = _STOP_TO_ANTHROPIC.get(reason)
-    if stop is None:
-        stop = "tool_use" if msg.get("tool_calls") else "end_turn"
+    stop = _stop_reason(ch.get("finish_reason"), bool(msg.get("tool_calls")))
 
     usage = _usage_of(data.get("usage"))
     return {
@@ -457,9 +473,10 @@ def _chat_delta(line: bytes) -> dict:
 class _StreamState:
     """chat SSE → Anthropic 事件流的逐请求状态机。
 
-    顺序是**硬要求**（见模块 docstring）：`message_start` 必须在最前，`content_block_stop`
-    必须在 `message_delta` 之前。理由：Anthropic 的官方 SDK 是**流式解析**的，
-    顺序错了它不会报错，只会把事件丢掉 —— 表现是"客户端收到 200 但一个字都没有"。
+    顺序按官方规定来：`message_start` 在最前，每个 content block 自己 `start → delta* →
+    stop` 走完才开下一个，所有 block 都关完才发 `message_delta` / `message_stop`。
+    （乱序时官方 SDK 其实不报错、内容也拼得回来，所以这不是"会不会崩"的问题，而是
+    "要不要守约"的问题 —— 按规范发，客户端的宽容度就不必被消耗在这种地方。）
 
     - 文本块与工具块是分开的 content block（chat 里它们混在同一个 delta 里）
     - `input_json_delta` 负责把工具参数**分片**发出去，客户端自己拼回 JSON
@@ -471,7 +488,9 @@ class _StreamState:
         self.msg_id = _rid("msg_")
         self.model = ctx.get("model")
         self.block_idx = -1          # 已经开过几个 content block
-        self.text_open = False
+        self.open_idx = None         # 当前**打开着**的 block；同一时刻只能有一个
+        self.open_kind = None        # "text" / "tool"
+        self.open_key = None         # 工具块对应的 chat tool_call index
         self.text_buf = ""
         self.tools: dict = {}        # chat tool_call index → {"idx", "id", "name", "args"}
         self.usage: dict = {}
@@ -485,34 +504,52 @@ class _StreamState:
             "usage": {"input_tokens": 0, "output_tokens": 0},
         }})]
 
-    # ---- 文本块 ----
-    def _open_text(self) -> list:
-        if self.text_open:
+    # ---- block 生命周期 ----
+    # Anthropic 要求**每个 block 自己 start → delta* → stop 走完**，上一个还没 stop 就开
+    # 下一个属于乱序。所以这里统一用「开新块之前先关掉旧块」，顺序就不会散。
+    def _close_open(self) -> list:
+        if self.open_idx is None:
             return []
-        self.block_idx += 1
-        self.text_open = True
-        return [_sse("content_block_start", {
-            "type": "content_block_start", "index": self.block_idx,
-            "content_block": {"type": "text", "text": ""},
-        })]
+        idx = self.open_idx
+        self.open_idx = self.open_kind = self.open_key = None
+        return [_sse("content_block_stop", {"type": "content_block_stop", "index": idx})]
 
+    def _open_block(self, kind: str, content_block: dict, key=None) -> list:
+        """关掉当前块，开一个新块（index 递增），并把它记成「打开着」"""
+        evts = self._close_open()
+        self.block_idx += 1
+        self.open_idx, self.open_kind, self.open_key = self.block_idx, kind, key
+        evts.append(_sse("content_block_start", {
+            "type": "content_block_start", "index": self.block_idx,
+            "content_block": content_block,
+        }))
+        return evts
+
+    # ---- 文本块 ----
     def _text(self, s: str) -> list:
-        evts = self._open_text()
+        # 当前开着的就是文本块 → 接着写；否则（没开 / 开着的是工具块）另起一个
+        evts = [] if self.open_kind == "text" else \
+            self._open_block("text", {"type": "text", "text": ""})
         self.text_buf += s
         evts.append(_sse("content_block_delta", {
-            "type": "content_block_delta", "index": self.block_idx,
+            "type": "content_block_delta", "index": self.open_idx,
             "delta": {"type": "text_delta", "text": s},
         }))
         return evts
 
-    def _close_text(self) -> list:
-        if not self.text_open:
-            return []
-        self.text_open = False
-        return [_sse("content_block_stop", {"type": "content_block_stop", "index": self.block_idx})]
-
     # ---- 工具块 ----
     def _tool(self, tc: dict) -> list:
+        """一个 tool_call 增量 → 事件。
+
+        同一个 `index` 的连续增量写进**同一个** content block（这就是 `input_json_delta`
+        分片的来处）；换到别的 `index` 时先把当前块关掉再开新块 —— 并行工具调用因此被拆成
+        「块 N 整段走完 → 块 N+1 整段」，顺序才合法。
+
+        上游若把不同 index 的参数分片**交错**送过来（先 announce 多个 index，之后轮流补
+        arguments），Anthropic 的块模型表达不了，只能等流结束再发；这里退一步处理：为那个
+        index 另开一块继续写，并记一条 warning。实际上模型是按顺序生成各工具参数的 JSON，
+        不会交错，这条分支是防御性的。
+        """
         key = tc.get("index")
         if not isinstance(key, int) or isinstance(key, bool):
             key = 0
@@ -520,27 +557,31 @@ class _StreamState:
         name = fn.get("name")
         evts: list = []
         st = self.tools.get(key)
+
         if st is None:
-            evts += self._close_text()      # 文本块先关，再开工具块（index 递增）
-            self.block_idx += 1
-            st = {"idx": self.block_idx,
+            st = {"idx": None,
                   "id": tc.get("id") if isinstance(tc.get("id"), str) and tc.get("id")
                   else _rid("toolu_"),
                   "name": name if isinstance(name, str) else "",
                   "args": ""}
             self.tools[key] = st
-            evts.append(_sse("content_block_start", {
-                "type": "content_block_start", "index": st["idx"],
-                "content_block": {"type": "tool_use", "id": st["id"], "name": st["name"], "input": {}},
-            }))
         elif isinstance(name, str) and name and not st["name"]:
             st["name"] = name
+
+        if self.open_kind != "tool" or self.open_key != key:
+            if st["idx"] is not None:
+                logger.warning("messages: 上游把 tool_call[%s] 的分片与别的块交错发来"
+                               "（Anthropic 的块模型表达不了，已另开一块继续写）", key)
+            evts += self._open_block("tool", {
+                "type": "tool_use", "id": st["id"], "name": st["name"], "input": {},
+            }, key=key)
+            st["idx"] = self.open_idx
 
         args = fn.get("arguments")
         if isinstance(args, str) and args:
             st["args"] += args
             evts.append(_sse("content_block_delta", {
-                "type": "content_block_delta", "index": st["idx"],
+                "type": "content_block_delta", "index": self.open_idx,
                 "delta": {"type": "input_json_delta", "partial_json": args},
             }))
         return evts
@@ -573,20 +614,14 @@ class _StreamState:
 
     # ---- 收尾 ----
     def finish(self, err: str | None = None) -> list:
-        evts = self._close_text()
-        for key in sorted(self.tools):
-            evts.append(_sse("content_block_stop",
-                             {"type": "content_block_stop", "index": self.tools[key]["idx"]}))
+        evts = self._close_open()
         if err:
             # 上游中途断了：按 Anthropic 的错误事件收尾（客户端认这个）
             evts.append(_sse("error", {"type": "error",
                                        "error": {"type": "api_error", "message": err[:400]}}))
             return evts
 
-        reason = self.finish_reason
-        stop = _STOP_TO_ANTHROPIC.get(reason)
-        if stop is None:
-            stop = "tool_use" if self.tools else "end_turn"
+        stop = _stop_reason(self.finish_reason, bool(self.tools))
         usage = _usage_of(self.usage)
         evts.append(_sse("message_delta", {
             "type": "message_delta",

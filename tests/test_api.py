@@ -112,6 +112,68 @@ def test_chat_failover_records_superseded_not_failure(client, monkeypatch):
             gateway.channels.pop(c["id"], None)
 
 
+def test_chat_entry_normalizes_model_through_dialect(client, monkeypatch):
+    """chat 入口现在也走一遍 `dialects` 注册表：`model` 归一（去前后空白）后才交给 `_chat_v1`，
+    回包形状不变。以前这个入口是直接调 `_chat_v1`，注册表里的 `chat` 条目没人用。"""
+    from app import gateway, store
+    from app import config as cfgmod
+    from app import main as m
+
+    model = "glm-test"
+    monkeypatch.setattr(cfgmod, "load_config", lambda: {
+        "channels": [{"id": "t_c1", "name": "A", "type": "custom",
+                      "base_url": "http://a.invalid/v1", "api_key": "k", "enabled": True}],
+        "aliases": {}, "route_strategy": "balanced", "pinned": [],
+        "auth_enabled": False, "api_token": "", "port": 8787})
+    cs = gateway.ChannelState()
+    cs.models, cs.valid, cs.latency_ms = [model], True, 10
+    gateway.channels["t_c1"] = cs
+
+    seen = []
+
+    class FakeResp:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return {"choices": [{"finish_reason": "stop",
+                                 "message": {"role": "assistant", "content": "pong"}}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1}}
+
+    class FakeClient:
+        async def post(self, *a, **k):
+            seen.append(k.get("json"))
+            return FakeResp()
+
+    monkeypatch.setattr(m, "shared_client", FakeClient())
+    store.init()
+    try:
+        r = client.post("/v1/chat/completions", headers=H,
+                        json={"model": f"  {model}  ",
+                              "messages": [{"role": "user", "content": "ping"}]})
+        assert r.status_code == 200, r.text
+        assert r.json()["choices"][0]["message"]["content"] == "pong"
+        assert seen and seen[0]["model"] == model        # 归一之后才发上游
+    finally:
+        gateway.channels.pop("t_c1", None)
+
+
+def test_chat_entry_bad_body_is_400_not_500(client, monkeypatch):
+    """请求体不是 JSON 对象、或缺 model，都该是 400。
+
+    旧写法 `_chat_v1(body, request)` 直接对 body 取 `.get`：传一个 JSON 数组进来会
+    AttributeError → 500。现在由 `dialects.chat.to_chat` 统一挡成 400。"""
+    from app import config as cfgmod
+    monkeypatch.setattr(cfgmod, "load_config", lambda: {
+        "channels": [], "aliases": {}, "route_strategy": "balanced", "pinned": [],
+        "auth_enabled": False, "api_token": "", "port": 8787})
+    r = client.post("/v1/chat/completions", headers=H, json=[1, 2])
+    assert r.status_code == 400, r.text
+    r = client.post("/v1/chat/completions", headers=H, json={"messages": []})
+    assert r.status_code == 400, r.text
+    assert "model" in r.json()["detail"]
+
+
 def test_modelscope_quota_429_is_model_level_then_escalates(client, monkeypatch):
     """端到端（`_classify` 那条真实路径）：魔搭额度 429 **先只冷那一个模型**，
     渠道其余模型照常路由；30 分钟内撞到第 4 个不同模型才升级成「整渠道停到明天」。

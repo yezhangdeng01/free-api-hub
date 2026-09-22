@@ -172,6 +172,38 @@ def test_build_message_tool_calls_become_tool_use():
     assert out["content"] == [{"type": "tool_use", "id": "call_1", "name": "f", "input": {"a": 1}}]
 
 
+_TOOL_CALL = {"id": "call_1", "type": "function",
+              "function": {"name": "f", "arguments": "{}"}}
+
+
+@pytest.mark.parametrize("finish_reason,with_tools,expect", [
+    # 回包里有 tool_use 块：finish_reason 缺失 / None / 写成 stop / 编成别的值，
+    # 都不能报 end_turn —— 否则客户端当这一轮正常结束，工具不会被执行
+    ("<MISSING>", True, "tool_use"),
+    (None, True, "tool_use"),
+    ("stop", True, "tool_use"),
+    ("foo", True, "tool_use"),
+    ("tool_calls", True, "tool_use"),
+    # 截断优先：参数可能只写了一半，不能让客户端照着执行
+    ("length", True, "max_tokens"),
+    # 没有工具调用的常规路径不受影响
+    ("stop", False, "end_turn"),
+    ("length", False, "max_tokens"),
+    ("<MISSING>", False, "end_turn"),
+    (None, False, "end_turn"),
+    ("foo", False, "end_turn"),
+    ("tool_calls", False, "tool_use"),
+])
+def test_build_message_stop_reason_precedence(finish_reason, with_tools, expect):
+    ch = {"message": {"role": "assistant", "content": ""}}
+    if with_tools:
+        ch["message"]["tool_calls"] = [dict(_TOOL_CALL)]
+    if finish_reason != "<MISSING>":
+        ch["finish_reason"] = finish_reason
+    out = M.build_message({"choices": [ch]}, {"model": "m"})
+    assert out["stop_reason"] == expect
+
+
 def test_build_message_never_empty_content():
     """空回复也要给一个空 text 块：Anthropic 的 content 不允许空数组"""
     out = M.build_message({"choices": [{"finish_reason": "stop", "message": {"content": None}}]},
@@ -280,6 +312,102 @@ def test_stream_text_then_tool_closes_text_block_first():
     stops = [d["index"] for n, d in parsed if n == "content_block_stop"]
     assert starts == [0, 1]                    # 文本块 0、工具块 1
     assert stops == [0, 1]                     # 先关文本再关工具
+
+
+def _block_blocks(parsed):
+    """把事件流折成 [(index, delta 个数)]，同时断言「一次只开一个块」。
+
+    Anthropic 的硬要求：每个 content block 自己 start → delta* → stop 走完才轮到下一个。
+    顺序错了事件流仍然能被读出来（官方 SDK 宽容），所以只有这里是唯一能把违规钉住的地方。
+    """
+    cur, blocks = None, []
+    for name, d in parsed:
+        if name == "content_block_start":
+            assert cur is None, f"block {d['index']} 开的时候上一个（index={cur}）还没关"
+            cur = d["index"]
+            blocks.append([cur, 0])
+        elif name == "content_block_delta":
+            assert cur == d["index"], f"delta 落在 index={d['index']}，但开着的是 {cur}"
+            blocks[-1][1] += 1
+        elif name == "content_block_stop":
+            assert cur == d["index"], f"stop 的是 index={d['index']}，但开着的是 {cur}"
+            cur = None
+    assert cur is None, "流结束时还有 block 没收尾"
+    return [(i, n) for i, n in blocks]
+
+
+def test_stream_parallel_tool_calls_close_each_block_before_next():
+    """并行工具调用（chat 用 index 0/1 表达）要拆成「块 1 整段 → 块 2 整段」。
+
+    这里是曾经的漏网之鱼：两个工具块的 `content_block_start` 挤在一起，两个 `stop` 统一堆到
+    流末尾。官方 SDK 能容忍，但顺序是错的。
+    """
+    st = M._StreamState({"model": "m"})
+    st.start()
+    frames = asyncio.run(_feed(st, _sse_lines(
+        {"choices": [{"delta": {"content": "先查一下"}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "call_a", "function": {"name": "get_weather",
+                                                      "arguments": '{"city":'}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": '"北京"}'}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 1, "id": "call_b", "function": {"name": "get_time",
+                                                      "arguments": "{}"}}]}}]},
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        "[DONE]",
+    )))
+    frames += st.finish()
+    parsed = _parse(frames)
+    assert _block_blocks(parsed) == [(0, 1), (1, 2), (2, 1)]
+
+    starts = [d for n, d in parsed if n == "content_block_start"]
+    assert [s["content_block"]["type"] for s in starts] == ["text", "tool_use", "tool_use"]
+    assert [s["content_block"]["id"] for s in starts[1:]] == ["call_a", "call_b"]
+
+    frag = [(d["index"], d["delta"]["partial_json"]) for n, d in parsed
+            if n == "content_block_delta" and d["delta"]["type"] == "input_json_delta"]
+    assert frag == [(1, '{"city":'), (1, '"北京"}'), (2, "{}")]
+    assert json.loads("".join(x for i, x in frag if i == 1)) == {"city": "北京"}
+    assert [d["delta"]["stop_reason"] for n, d in parsed if n == "message_delta"] == ["tool_use"]
+
+
+def test_stream_tool_then_text_closes_tool_block_first():
+    """工具块之后又出文本（少数渠道会这样）：必须先把工具块关掉，再开文本块。
+
+    旧写法会把两者都留着，收尾时 stop 顺序变成 [1, 0] —— 与 start 顺序相反。
+    """
+    st = M._StreamState({"model": "m"})
+    st.start()
+    frames = asyncio.run(_feed(st, _sse_lines(
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "function": {"name": "f", "arguments": "{}"}}]}}]},
+        {"choices": [{"delta": {"content": "补充说明"}}]},
+        "[DONE]",
+    )))
+    frames += st.finish()
+    parsed = _parse(frames)
+    assert _block_blocks(parsed) == [(0, 1), (1, 1)]
+    starts = [d for n, d in parsed if n == "content_block_start"]
+    assert [s["content_block"]["type"] for s in starts] == ["tool_use", "text"]
+
+
+def test_stream_missing_finish_reason_with_tools_is_tool_use():
+    """上游没给 finish_reason（免额渠道常见）但回了工具调用 → 必须是 tool_use。
+
+    报成 end_turn 的话，客户端会认为这一轮正常结束，工具永远不会被执行。
+    """
+    st = M._StreamState({"model": "m"})
+    st.start()
+    frames = asyncio.run(_feed(st, _sse_lines(
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "c1", "function": {"name": "f", "arguments": "{}"}}]}}]},
+        "[DONE]",
+    )))
+    frames += st.finish()
+    parsed = _parse(frames)
+    assert st.finish_reason is None
+    assert [d["delta"]["stop_reason"] for n, d in parsed if n == "message_delta"] == ["tool_use"]
 
 
 def test_stream_upstream_error_emits_error_event():

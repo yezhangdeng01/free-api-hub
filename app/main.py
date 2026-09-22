@@ -473,12 +473,22 @@ async def chat_completions(request: Request):
     """OpenAI 兼容 chat 入口：**只负责解析请求体**，逻辑全在 `_chat_v1`。
 
     拆开是因为 `/v1/responses` 也要走这条路（翻译成 chat body 后复用同一套
-    路由 / 冷却 / failover / 会话粘性 / 记账），复制一遍那段循环迟早会两边跑偏。"""
+    路由 / 冷却 / failover / 会话粘性 / 记账），复制一遍那段循环迟早会两边跑偏。
+
+    chat 方言的 `to_chat` 是恒等映射（只做 model 归一 + 浅拷贝），走一遍注册表是为了让
+    「三种入口一个形状」在代码里成立而不是只写在注释里 —— 顺带也是有意义的：`_chat_v1`
+    会就地改写 `body["model"]`（别名切上游模型名），浅拷贝把这份改写挡在调用方手里那份
+    body 之外。"""
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(400, "请求体不是合法 JSON")
-    return await _chat_v1(body, request)
+    cfg = cfgmod.load_config()
+    try:
+        chat_body, ctx = dialects.chat.to_chat(body, cfg)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return await dialects.chat.convert(await _chat_v1(chat_body, request, cfg), ctx)
 
 
 async def _chat_v1(body: dict, request: Request, cfg: dict | None = None):
