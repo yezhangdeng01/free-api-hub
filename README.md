@@ -153,3 +153,6 @@ api-hub/
 ## 许可
 
 MIT License —— 详见 [LICENSE](LICENSE)。欢迎 issue / PR。
+
+打包分发的绿色版里附带 `THIRD-PARTY-LICENSES.md`（第三方依赖的许可与版权声明汇总，
+由 `scripts/gen_third_party_licenses.py` 生成；依赖升级后重新跑一次再打包）。

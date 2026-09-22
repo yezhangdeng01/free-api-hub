@@ -3,6 +3,9 @@
 用法：pyinstaller --noconfirm api-hub.spec
 产物：dist/API Hub/（含 exe + _internal），整个目录压缩即绿色版
 """
+import os
+import sys
+
 from PyInstaller.utils.hooks import collect_submodules, collect_all
 
 # uvicorn 运行时按名称动态加载协议/循环实现，必须整包收集
@@ -10,14 +13,25 @@ hidden = []
 for m in ("uvicorn", "webview", "pystray"):
     hidden += collect_submodules(m)
 
-# pythonnet（pywebview WebView2 后端依赖）：需要把 Python.Runtime.dll 等一起带出
-py_datas, py_bins, py_hidden = collect_all("pythonnet")
+# pythonnet（pywebview 的 WebView2 后端依赖）只在 Windows 上存在：
+# 无条件 collect_all 会让非 Windows 上的打包直接失败（虽然是 Windows 专用产物，
+# 但脚本本身不该挑平台，否则以后想跑个交叉检查都跑不了）。
+if sys.platform == "win32":
+    py_datas, py_bins, py_hidden = collect_all("pythonnet")
+else:
+    py_datas, py_bins, py_hidden = [], [], []
+
+# 许可合规：本项目以二进制形式分发（PyInstaller 包），依赖里的 MIT / BSD-3-Clause /
+# Apache-2.0 / MPL-2.0 都要求随包附上许可与版权声明。PyInstaller 只打包模块代码，
+# `*.dist-info/licenses/` 不会自动进来，所以显式带上汇总文件与自己的 LICENSE。
+# 汇总文件由 scripts/gen_third_party_licenses.py 生成（CI 里打包前会跑一次）。
+_licenses = [(p, ".") for p in ("LICENSE", "THIRD-PARTY-LICENSES.md") if os.path.exists(p)]
 
 a = Analysis(
     ["desktop.py"],
     pathex=[],
     binaries=py_bins,
-    datas=[("frontend", "frontend")] + py_datas,
+    datas=[("frontend", "frontend")] + _licenses + py_datas,
     hiddenimports=hidden + py_hidden,
     hookspath=[],
     hooksconfig={},
