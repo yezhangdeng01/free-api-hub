@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import capability
 from . import config as cfgmod
+from . import dialects
 from . import gateway, providers, store, throttle
 from . import responses as responses_tr
 from .config import PROVIDER_PRESETS
@@ -423,13 +424,16 @@ async def security_middleware(request: Request, call_next):
     if origin and not origin.startswith((f"http://{host}", f"https://{host}")):
         logger.warning("拒绝跨域请求: Origin=%s path=%s", origin, path)
         return JSONResponse({"detail": "拒绝跨域请求"}, 403)
-    # 3) /v1/* 网关接口需要 Bearer Token
+    # 3) /v1/* 网关接口需要 Token
+    #    两种写法都认：`Authorization: Bearer <token>`（OpenAI 那套，也是本项目界面里给的），
+    #    以及 Anthropic 客户端专用的 `x-api-key`（Claude Code / Anthropic SDK 只发这个头）
     if path.startswith("/v1/"):
         cfg = cfgmod.load_config()
         if cfg.get("auth_enabled", True):
             token = cfg.get("api_token", "")
             auth = request.headers.get("authorization", "")
-            if not token or auth != f"Bearer {token}":
+            xkey = request.headers.get("x-api-key", "")
+            if not token or (auth != f"Bearer {token}" and xkey != token):
                 return JSONResponse({"detail": "缺少或错误的 API Token（见 API Hub 界面顶部）"}, 401)
     return await call_next(request)
 
@@ -969,6 +973,31 @@ async def responses_api(request: Request):
         raise HTTPException(400, str(e))
     resp = await _chat_v1(chat_body, request, cfg)
     return await responses_tr.convert(resp, ctx)
+
+
+@app.post("/v1/messages")
+async def messages_api(request: Request):
+    """Anthropic Messages API 兼容层（Claude Code、Anthropic SDK、只认这个协议的 agent）。
+
+    和 `/v1/responses` 同一个套路：只做协议翻译 —— 请求译成 chat/completions 的 body 后交给
+    `_chat_v1`，回包（JSON 或 SSE）再由 `app.dialects.messages` 译回 Anthropic 的形状。
+    所以渠道路由、冷却分类、失败换路、会话粘性、用量记账与 chat 入口**完全同一套**。
+
+    两点与 chat 入口不同：
+    - `max_tokens` **必填**（Anthropic 协议如此），缺了直接 400
+    - 流式事件是**有状态**的（message_start → content_block_* → message_delta → message_stop），
+      顺序错了官方 SDK 会把事件静默丢掉，见 `app/dialects/messages.py` 的说明
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return dialects.messages.error_response(400, "请求体不是合法 JSON")
+    cfg = cfgmod.load_config()
+    try:
+        chat_body, ctx = dialects.messages.to_chat(body, cfg)
+    except ValueError as e:
+        return dialects.messages.error_response(400, str(e))
+    return await dialects.messages.convert(await _chat_v1(chat_body, request, cfg), ctx)
 
 
 @app.post("/api/models/test")

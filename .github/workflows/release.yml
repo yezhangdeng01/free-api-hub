@@ -25,6 +25,9 @@ jobs:
       - name: 运行测试（回归把关）
         run: python -m pytest tests/ -q
 
+      - name: 生成第三方许可清单（随包分发，MIT/BSD/MPL 都要求带上）
+        run: python scripts/gen_third_party_licenses.py
+
       - name: PyInstaller 打包（onedir 绿色目录）
         run: pyinstaller --noconfirm api-hub.spec
 
