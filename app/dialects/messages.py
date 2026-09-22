@@ -73,8 +73,6 @@ def _stop_reason(finish_reason, has_tools: bool) -> str:
 
 
 #: Anthropic messages 的角色 → chat 角色
-
-#: Anthropic messages 的角色 → chat 角色
 _ROLE_MAP = {"user": "user", "assistant": "assistant", "system": "system"}
 
 #: chat 不认识、不能原样往上送的 Anthropic 专属字段
