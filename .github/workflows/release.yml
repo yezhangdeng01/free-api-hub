@@ -13,7 +13,11 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
+      # fetch-depth: 0 是为了下面「准备发布说明」能在没有 release-notes/<tag>.md 时
+      # 退回提交记录 —— 默认只拉 1 个 commit，git describe / git log 的区间都取不到。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -31,17 +35,63 @@ jobs:
       - name: PyInstaller 打包（onedir 绿色目录）
         run: pyinstaller --noconfirm api-hub.spec
 
+      - name: 许可文件在包根再放一份
+        shell: pwsh
+        run: |
+          $pkg = "dist/API Hub"
+          # spec 里 datas 的 dest 写的是 "."，但 PyInstaller 6 的 onedir 会把所有 datas
+          # 收进 _internal/，于是许可文本藏在子目录里 —— 解压的人从包根看不出来。
+          # /v1/messages 那个 PR 之前就是照 spec 注释以为在包根，实测才发现（v1.0.7 的
+          # zip 根只有 API Hub.exe 和 _internal/）。这里在包根再放一份；_internal/ 里那份
+          # 不动（运行时按相对路径找得到）。
+          foreach ($f in @("LICENSE", "THIRD-PARTY-LICENSES.md")) {
+            if (-not (Test-Path $f)) { throw "$f 不存在：它应当在打包前已生成/已入库，缺了就是合规缺口" }
+            Copy-Item $f "$pkg/$f" -Force
+          }
+          Get-ChildItem $pkg -File | Select-Object Name, Length
+
       - name: 压缩为绿色 zip
         shell: pwsh
         run: |
           $ver = $env:GITHUB_REF_NAME
           $stage = "free-api-hub-$ver-win64"
-          # 解压即用：exe 放包根，数据文件同目录自动生成
           Compress-Archive -Path "dist/API Hub/*" -DestinationPath "$stage.zip" -Force
           Get-Item "$stage.zip" | Select-Object Name, Length
+          # 把 zip 根目录的文件打出来当凭证：CI 绿不等于东西真进包了，
+          # 事后翻 Release 才发现许可文件落在子目录里过一次。
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path "$stage.zip").Path)
+          Write-Host "--- zip 根目录文件 ---"
+          $zip.Entries | Where-Object { $_.FullName.IndexOf("/") -lt 0 } |
+            Select-Object -ExpandProperty FullName
+          $zip.Dispose()
+
+      - name: 准备发布说明
+        shell: pwsh
+        run: |
+          $ver = $env:GITHUB_REF_NAME
+          $notes = "release-notes/$ver.md"
+          if (Test-Path $notes) {
+            Copy-Item $notes body.md
+            Write-Host "发布说明取 $notes"
+          } else {
+            # 没有说明文件也不能发一个正文空白的 Release（v1.0.6 / v1.0.7 都空着，
+            # 只能事后一条条补）。退回本次 tag 的提交记录，至少说清这版改了什么。
+            $prev = git describe --tags --abbrev=0 "$ver^" 2>$null
+            if ($LASTEXITCODE -ne 0) { $prev = "" }
+            $range = if ($prev) { "$prev..$ver" } else { $ver }
+            # git log 是多行 → 数组；"$log" 插值会用 $OFS（空格）拼成一行，必须 -join
+            $log = (git log --pretty=format:"- %s" $range) -join "`n"
+            $text = "# $ver`n`n> 仓库里没放 release-notes/$ver.md，以下是本次提交记录。`n`n$log`n"
+            # 显式写无 BOM 的 UTF-8：Set-Content -Encoding utf8 在 5.1 带 BOM、在 7 不带，
+            # 发布正文不该多一个看 shell 心情的零宽字符
+            [System.IO.File]::WriteAllText((Join-Path $PWD.Path "body.md"), $text,
+              (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "发布说明退回提交记录（$range）"
+          }
 
       - name: 发布到 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: free-api-hub-*.zip
-          generate_release_notes: false
+          body_path: body.md
