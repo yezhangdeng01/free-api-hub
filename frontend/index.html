@@ -8,19 +8,30 @@
   :root {
     --bg: #17150f; --panel: #201d16; --panel2: #26221a; --border: #3a352a;
     --text: #e8e2d4; --muted: #9c9280; --accent: #d0a75c; --accent-dim: #8a7345;
-    --ok: #7fae72; --bad: #c96a5a; --warn: #cfa35a; --mono: "Cascadia Mono", Consolas, monospace;
+    --ok: #7fae72; --bad: #c96a5a; --warn: #cfa35a; --tok: #6ea6ab;
+    --mono: "Cascadia Mono", Consolas, monospace;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: var(--bg); color: var(--text); font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif; font-size: 14px; }
   header { display: flex; align-items: center; gap: 16px; padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--panel); }
   header h1 { font-size: 17px; font-weight: 600; letter-spacing: .5px; }
   header h1 span { color: var(--accent); }
+  /* 统计页专用控件（时间范围 + 刷新日志）：2026-10-02 先从统计页里单独占的一行移到顶部标题行，
+     同日再按用户要求移进**页签行**（模型/渠道/统计 那一行）的最右侧。
+     margin-left:auto 负责把它推到最右；仍然只在统计页显示（切走就藏，免得在别的页面点它没反应）。
+     ⚠️ 它现在住在 <nav> 里，所以下面页签的样式必须写成 `nav > button` 直接子选择器 ——
+        若写成 `nav button`，会把「↻ 请求日志」也吃成页签样式，JS 里的页签 onclick 也会绑到它身上。 */
+  .hdr-ctrl { display: none; margin-left: auto; align-items: center; gap: 10px; }
+  .hdr-ctrl.on { display: flex; }
+  .hdr-ctrl select { width: 132px; }
   .chip { font-family: var(--mono); font-size: 12px; color: var(--muted); background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; user-select: none; }
   .chip:hover { color: var(--accent); border-color: var(--accent-dim); }
   nav { display: flex; gap: 4px; padding: 0 24px; background: var(--panel); border-bottom: 1px solid var(--border); }
-  nav button { background: none; border: none; color: var(--muted); font-size: 14px; padding: 11px 18px; cursor: pointer; border-bottom: 2px solid transparent; }
-  nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
-  nav button:hover { color: var(--text); }
+  /* ⚠️ 必须是 `nav > button`：页签行右侧还挂着统计页控件（含一个 <button>），
+     用后代选择器会把那个按钮也变成页签样式。 */
+  nav > button { background: none; border: none; color: var(--muted); font-size: 14px; padding: 11px 18px; cursor: pointer; border-bottom: 2px solid transparent; }
+  nav > button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  nav > button:hover { color: var(--text); }
   /* 1300：模型页工具条不压缩需要 1181px（搜索框 230 + 计数 + 3 个状态开关 + 5 个排序 chip
      + 分页），而 1180 的 main 只给工具条 1098px —— 差的 83px 会被 flex 摊到子项上，
      把「● 可用 / ● 受限 / ● 不可用」这组挤成两行。整页加宽到 1300 后留 ~80px 余量。 */
@@ -64,6 +75,12 @@
   .light-dot.ok { background: var(--ok); box-shadow: 0 0 5px var(--ok); }
   .light-dot.limited { background: var(--warn); box-shadow: 0 0 5px var(--warn); }
   .light-dot.down { background: var(--bad); }
+  .light-dot.unlinked { background: var(--muted); }   /* 未接入：不是"坏"，是"本机没渠道能提供"——用中性灰，别用红 */
+  /* 「测试中」的行内指示：圆点呼吸 + 行底色轻微提亮。
+     存在的意义 = 不靠会消失的浮层也能看出「这次点击被受理了、还在测」。 */
+  @keyframes dot-breathe { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+  .light-dot.testing { background: var(--warn); box-shadow: 0 0 5px var(--warn); animation: dot-breathe 1.1s ease-in-out infinite; }
+  tr.row-testing > td { background: rgba(224,177,63,.06); }
   .tag-chip {
     display: inline-block; padding: 1px 6px; border-radius: 9px;
     font-size: 11px; background: var(--panel2); border: 1px solid var(--border);
@@ -71,6 +88,41 @@
   }
   .tag-chip.ok { color: var(--ok); border-color: var(--accent-dim); }
   .tag-chip.bad { color: var(--bad); border-color: var(--bad); }
+  .tag-chip.testing { color: var(--warn); border-color: var(--warn); }
+  /* ---- 免费模型雷达横幅（2026-10-07）----
+     模型页顶部那条「OpenRouter 新增 N 个免费模型」的提醒条。**不常驻**：只在有未确认的
+     新面孔时出现，点 ✕ 收起（见 renderFreeBanner）。视觉上刻意与模型表格区分：左边一道
+     主色竖条 + 略深的底。
+     ⚠️ 配色只用现有变量（--accent/--ok/--warn/--bad），别写死色值 —— 这份主题是纸墨暗色，
+        写死浅色会在暗底上发灰。 */
+  .freebar { border-left: 3px solid var(--accent); padding: 8px 14px; background: var(--panel); }
+  .freebar-head { display: flex; align-items: center; gap: 8px; white-space: nowrap; overflow: hidden; }
+  /* 窄窗口时先牺牲副文案（截断成省略号），别让「新增 N 个」和三个按钮被挤出视野 */
+  .freebar-head #free-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .freebar-head b { font-size: 13px; }
+  .freebar-head #free-new-n { color: var(--accent); font-size: 14.5px; }
+  .fb-actions { margin-left: auto; display: flex; gap: 6px; flex: none; }
+  #free-view { color: var(--accent); border-color: var(--accent-dim); }
+  #free-dismiss { color: var(--muted); padding: 3px 9px; }
+  #free-dismiss:hover { color: var(--text); border-color: var(--text); }
+  /* 「模型」页签上的未读小红点：有未确认的新面孔时亮起。
+     横幅只在模型页可见，人待在别的页时全靠这颗点提醒（点页签切过去就能看到横幅）。 */
+  nav > button .tab-dot { display: none; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent); margin-left: 6px; vertical-align: 2px; }
+  nav > button.has-dot .tab-dot { display: inline-block; }
+  /* 「查看」跳到模型表时，让带「新」标的行闪三下 —— 一眼看出是哪几行，不用逐行找。
+     ⚠️ 峰值色用 `--border`（#3a352a）而不是 `--accent-dim`：行里有金边的「🎁 免费 / 新」
+        标，底色一旦偏金，闪的那两秒这些标就糊在背景里看不清了。深一档的底色才两全。 */
+  @keyframes flashNewRow { 0%, 100% { background: transparent; } 50% { background: var(--border); } }
+  tr.flash-new > td { animation: flashNewRow 0.6s ease-in-out 3; }
+  /* 「免费模型」并进模型表后，行内这几颗标沿用原来的类（2026-10-07 二改：清单不再另列） */
+  .fb-new { color: var(--accent); border-color: var(--accent-dim); font-weight: 600; }
+  .fb-free { color: var(--accent); border-color: var(--accent-dim); }
+  .fb-kind-anon { color: var(--warn); border-color: var(--warn); }
+  .fb-kind-router { color: var(--ok); border-color: var(--accent-dim); }
+  .fb-unlinked { color: var(--muted); border-style: dashed; }
+  tr.unlinked > td { opacity: .72; }        /* 未接入整行淡一点：能看见，但不抢视线 */
+  tr.unlinked:hover > td { opacity: 1; }
   /* 档位 chip：可点（弹手动档位面板）。手动指定过的用主色 + 小圆点标出来 */
   .tier-btn { cursor: pointer; font-family: inherit; font-size: 11px; line-height: 1.5; }
   .tier-btn:hover { color: var(--accent); border-color: var(--accent); }
@@ -105,15 +157,27 @@
   .form-grid { display: grid; grid-template-columns: 150px 1fr 1fr 1fr auto; gap: 10px; align-items: end; }
   .form-grid label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
   .check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); padding-bottom: 8px; }
-  #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--accent-dim); color: var(--accent); border-radius: 8px; padding: 9px 20px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 99; }
+  /* 轻提示。三条都是 2026-09-26 用户反馈后加的：
+     ① `max-width` + `white-space:pre-wrap` + `word-break`：测试结果可以很长（逐条渠道列原因），
+        旧版是单行不限宽，超出视口左右**被裁掉**，看起来就像「没弹出来」；
+     ② `.anchored`：贴在第 N 行的「测试」按钮旁边弹出（坐标由 JS 算，跟着滚动走）。
+        固定在底部居中时，模型页一屏几十行、按钮在屏幕中间，提示却跑到最下面 —— 用户原话
+        「不明显，有时候看不到就没了」；
+     ③ 可点击关闭：`pointer-events:auto` 只给 anchored，底部那条不挡别的按钮。 */
+  #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); max-width: min(640px, calc(100vw - 32px)); box-sizing: border-box; white-space: pre-wrap; word-break: break-word; line-height: 1.55; text-align: left; background: var(--panel2); border: 1px solid var(--accent-dim); color: var(--accent); border-radius: 8px; padding: 10px 14px; font-size: 13px; box-shadow: 0 6px 22px rgba(0,0,0,.45); opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 99; }
   #toast.show { opacity: 1; }
+  #toast.anchored { bottom: auto; transform: none; pointer-events: auto; cursor: pointer; }
+  #toast.ok  { border-color: var(--ok);  color: var(--ok); }
+  #toast.err { border-color: var(--bad); color: var(--bad); }
   /* 工具条：宁可整组换行，也不要把组内 chip 挤成两行。
      默认 flex 是 nowrap + 允许 shrink —— 空间不够时它不去换行，而是把每个子项压窄，
      压到「● 可用 74 ● 受限 35 ● 不可用 555」这种多元素组内部折行，看着像 UI 错位。
      所以：① wrap（不够就整组下移一行）；② .grp 不参与压缩（flex:0 0 auto + nowrap）。 */
   .toolbar { display: flex; flex-wrap: wrap; gap: 8px 12px; margin-bottom: 12px; align-items: center; }
   .toolbar input { width: 230px; flex: 0 0 auto; }
-  .toolbar .grp { display: flex; gap: 6px; align-items: center; flex: 0 0 auto; white-space: nowrap; }
+  /* 一组 chip（口径、粒度…）：现在统计页的卡片标题行里也在用，所以提到全局。
+     flex:0 0 auto + nowrap = 整组不参与压缩，宁可整组换行也不被压扁。 */
+  .grp { display: flex; gap: 6px; align-items: center; flex: 0 0 auto; white-space: nowrap; }
   .toolbar .muted, .toolbar .small { white-space: nowrap; }
   .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
   .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
@@ -123,13 +187,192 @@
   .cols2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   pre { background: #12100c; border: 1px solid var(--border); border-radius: 8px; padding: 14px; font-family: var(--mono); font-size: 12.5px; overflow-x: auto; color: #cfc7b4; line-height: 1.6; }
   pre .k { color: var(--accent); }
-  .chart { display: flex; align-items: flex-end; gap: 6px; height: 140px; padding: 10px 4px 0; }
-  .bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 5px; min-width: 0; }
-  .bar { width: 100%; max-width: 42px; background: linear-gradient(180deg, var(--accent), var(--accent-dim)); border-radius: 3px 3px 0 0; min-height: 12px; position: relative; }
-  .bar.err { background: linear-gradient(180deg, var(--bad), #7a4038); }
-  .bar-val { position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); font-size: 11px; color: var(--foreground); white-space: nowrap; margin-bottom: 3px; }
+  /* ── 每日请求量（2026-10-02 二改：固定柱宽 + 横向滚动 + 成功/失败分层）────────────
+     ① 固定柱宽 / 横向滚动：.chart 自己用 `width: max-content` 撑开（**不是** 100%），柱距锁定
+        28px，装不下时由 .chart-scroll 出横向滚动条。
+        ⚠️ 这里必须给 max-content：若 .chart 保持 100% 宽，flex 子项溢出的是 .chart **内部**，
+           父级不会产生滚动条（经典坑，滚动条永远不出现）。
+        `min-width: 100%` 是另一半：柱子少时容器被撑满 → flex-grow 把柱子放大铺开，
+        右边不会留一片空白。
+     ② 分层：柱体是 flex 列，自下而上 = 成功(--ok 绿) / 客户端中断(--muted 灰) / 失败(--bad 红)，
+        每层高度按**计数**同比换算成 px（JS 给，见 paintStats）。不再「当天有失败就整根涂红」——
+        那样只要每天都有零星的失败，满屏都是红的，反而看不出哪天真的糟。
+     ③ 2026-10-10 三改：单柱拆双柱 —— 同一天 = 左请求（分层计数）+ 右 Tokens（单色体量），
+        两组各自按区间峰值归一化缩放（峰值另留 15% 余量防破框）；四改把请求峰值压到 tokens
+        峰值的六成、柱顶数字拆两行着色（口径见 paintStats）。 */
+  .chart-scroll { overflow-x: auto; overflow-y: hidden; padding: 4px 0 6px; }
+  .chart { display: flex; align-items: flex-end; gap: 8px; height: 140px; width: max-content; min-width: 100%; }
+  /* ⚠️ max-width 只能加在 .bar 上，**不能**加在 .bar-wrap 上 —— 2026-10-02 踩过：
+     给 wrap 封顶后，柱子少时 flex-grow 撑到上限就停，剩下的空间没人吃，全堆在右侧
+     （实测 7 天视图：8 根柱子只占 91~563px，右边空 745px）。wrap 负责撑满 + 均分、
+     bar 负责「有上限的胖」，两层各管一件事。 */
+  .bar-wrap { flex: 1 0 36px; display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0; }
+  /* ⚠️ 2026-10-02 修：min-height 从 12px 降到 3px，且高度由 JS 直接给 px（见 paintStats）。
+     原来写 `height: X%` 是**无效**的 —— .chart 是 align-items:flex-end，.bar-wrap 高度由内容
+     撑开（auto），百分比高度解析不了 → 所有柱子恒等于 min-height。实测：8 根柱子像素高全是 12px
+     （尽管 style 里写着 12%~69.9%），等于图根本没有表达数据。改成 px 后才真正生效。
+     2026-10-02 二改：柱体内部再分三层，overflow:hidden 让分段跟着圆角裁齐。 */
+  .bar { width: 100%; max-width: 52px; min-height: 3px; display: flex; flex-direction: column;
+         border-radius: 3px 3px 0 0; overflow: hidden; }
+  /* 2026-10-10 三改：双柱结构。pair 负责居中 + 封顶（继承上面「max-width 加在内容层」的教训），
+     内部两根 .bar 固定 12px 不随 flex-grow 变宽 —— 组内柱距 2px 必须明显小于组间 8px，
+     同一天的两根柱才不会被读成两天。六改加 position:relative：柱顶数字以 pair 定位（见下）。 */
+  .bar-pair { position: relative; display: flex; align-items: flex-end; justify-content: center;
+              gap: 2px; width: 100%; max-width: 52px; }
+  .bar-col  { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0; }
+  .bar-col .bar { width: 12px; max-width: none; }
+  .bar-tok  { background: var(--tok); }   /* Tokens 柱：单色体量，不参与 成功/失败 分层 */
+  /* 2026-10-10 五/六改：数字**贴各自柱顶**（rv 悬于请求柱顶上方、tv 悬于 Tokens 柱顶上方），
+     bottom 由 JS 按柱高现算（见 paintStats）——柱矮数字低、柱高数字高，归属一眼可辨。
+     此前两版被用户否决：合并一行「581·5559万」会误读；固定两行则请求数字总压在 token
+     数字上方、悬在半空，看起来仍像 token 柱的标签。
+     水平：柱心恒在 pair 中心 ±7px（与 pair 宽度无关），calc 精确命中（探针实测 0px）。 */
+  .bar-pair > .bar-val { position: absolute; white-space: nowrap; z-index: 1; }
+  /* 七改：rv 改**右缘锚定**（右边缘钉在 pair 中心左 2px ≈ 自己柱的右缘）——
+     此前按柱心居中，宽数字的右半伸到右边更高的 token 柱底下，看着像被柱子吃掉/串柱；
+     右锚后无论数字多宽都只往左侧空档伸，绝不越过两柱中缝。tv 维持柱心居中。 */
+  .bar-pair > .rv { left: calc(50% - 2px); transform: translateX(-100%); }
+  .bar-pair > .tv { left: calc(50% + 7px); transform: translateX(-50%); }
+  .bar-val.rv { color: var(--ok); }
+  .bar-val.tv { color: var(--tok); }
+  .seg { display: block; width: 100%; }
+  .seg.err    { flex: 0 0 auto; min-height: 2px; background: var(--bad); }
+  .seg.cancel { flex: 0 0 auto; min-height: 2px; background: var(--muted); }
+  .seg.ok     { flex: 1 1 auto; background: linear-gradient(180deg, var(--ok), #5f8a55); }
+  /* 柱顶数字：**放在柱子外面**（普通流，不进 .bar）。放进 .bar 会被上面那条 overflow:hidden 裁掉。 */
+  .bar-val { font-size: 11px; line-height: 1; color: var(--text); white-space: nowrap; }
   .bar-lbl { font-size: 10.5px; color: var(--muted); white-space: nowrap; }
+  /* 柱子多时柱顶数字会互相蹭上 → 隐藏，数字仍在 hover tooltip 里。
+     日期标签的抽稀在 JS 里按**实际柱距**算（不是按根数拍脑袋）。
+     2026-10-10 六改：柱距下限提到 36px（见 .bar-wrap / paintStats slot）后，实际柱距恒 ≥44px
+     （36 实宽 + 8 间隙），两组数字（最宽 ≈42px）放得下 ⇒ dense 不再触发、数字常显；
+     这条 dense 规则保留作保险（若未来把柱距下限调回，隐藏逻辑自动复活）。 */
+  .chart.dense .bar-val { display: none; }
+  /* 图例：解释柱体三种颜色的含义（数字是当前区间的合计） */
+  .chart-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 10px; padding-top: 9px;
+                  border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+  .chart-legend .lg { display: flex; align-items: center; gap: 6px; }
+  .chart-legend i { flex: 0 0 auto; display: block; width: 10px; height: 10px; border-radius: 2px; }
+  .lg-ok { background: var(--ok); } .lg-bad { background: var(--bad); } .lg-cancel { background: var(--muted); }
+  .lg-tok { background: var(--tok); }
+  /* ── 统计页图表（2026-10-02 加：渠道=环形图，模型=横向排行条）─────────────
+     ⚠️ 两条铁律，别改回去：
+       ① **这块里任何元素都不许加 transition / animation**。统计页每 5s 静默刷新
+          （startLogPolling → loadStats(true)），重绘会反复触发动画 → 整块一直在闪。
+       ② 两张图都必须参与 `_statSig` 签名比对后再写 DOM，理由同上。 */
+  .stat-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+  .stat-head h2 { margin-bottom: 0; }
+  /* 渠道卡内部：左环形固定宽 + 右表格吃掉剩余；太窄时自动换行而不是压扁 */
+  .stat-split { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+  .donut-box { flex: 0 0 auto; }
+  .donut-box svg { display: block; }
+  .tbl-box { flex: 1 1 300px; min-width: 0; }
+  /* 渠道表：列窄，单元格 padding 收到 6px 才装得下「4,163万」这种串；数字一律不换行 */
+  .tbl-box td, .tbl-box th { padding: 9px 6px; }
+  .tbl-box td.num { text-align: right; white-space: nowrap; }
+  .cols2.start { align-items: start; }   /* 否则两卡会被等高拉伸，右边展开时左边留一大片空白 */
+  /* 表格里的配色块：颜色 === 环形图同一片 → 图和表能对上暗号 */
+  .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; vertical-align: 1px; }
+  td.on { color: var(--accent); font-weight: 600; }        /* 当前口径那一列 */
+  /* 延迟分级：绿 ≤10s / 黄 10–30s / 红 >30s（同一个阈值，圆点和文字共用） */
+  .dot.fast { background: var(--ok); }
+  .dot.mid  { background: var(--warn); }
+  .dot.slow { background: var(--bad); }
+  .lat-fast { color: var(--ok); }
+  .lat-mid  { color: var(--warn); }
+  .lat-slow { color: var(--bad); }
+  /* 横向排行条 */
+  .rk { display: flex; align-items: center; gap: 8px; padding: 3px 4px; border-radius: 5px; }
+  .rk:hover { background: rgba(208,167,92,.08); }
+  .rk.top .rk-bar { background: linear-gradient(90deg, var(--warn), var(--accent)); }
+  .rk.zero .rk-bar { background: linear-gradient(90deg, #7a4038, var(--bad)); }
+  /* 圆点单独占一格（固定 14px），这样「其他 N 个」那行没有点也不会跟上面的名字错位。
+     名字列 178px / 11.5px 是为了让「stealth/space-bunny-alpha」这类完整显示，别缩短。 */
+  .rk-dot { flex: 0 0 14px; text-align: center; }
+  .rk-dot .dot { margin-right: 0; }
+  .rk-name { flex: 0 0 178px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+             font-family: var(--mono); font-size: 11.5px; }
+  .rk-track { flex: 1 1 auto; min-width: 30px; height: 15px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
+  .rk-bar { display: block; height: 100%; min-width: 2px; border-radius: 3px;
+            background: linear-gradient(90deg, var(--accent-dim), var(--accent)); }
+  .rk-bar.other { background: var(--border); }
+  .rk-n { flex: 0 0 52px; text-align: right; font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+  .rk-p { flex: 0 0 44px; text-align: right; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .rk-foot { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border);
+             display: flex; align-items: center; justify-content: space-between; gap: 10px;
+             font-size: 12px; color: var(--muted); }
   .empty { color: var(--muted); text-align: center; padding: 28px 0; font-size: 13px; }
+
+  /* ── 最近请求：下边框可拖拽把手（上下拖动改变可见行数）2026-10-02 ──────────
+     ⚠️ 把手（#log-grip）与高度都必须挂在 .log-scroll（#log-rows 的父级静态节点）上，
+        绝不能放进 #log-rows —— 日志每 3s 静默重建它的 innerHTML，放里面会被冲掉。
+     ⚠️ sticky 表头只作用于 .log-scroll 内的表：全局 thead 加 sticky 会让页面上
+        所有表格的表头在页面滚动时粘住视口，那是另一回事（不要那么改）。 */
+  .log-scroll { overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+  .log-scroll thead th { position: sticky; top: 0; z-index: 1; background: var(--panel); }
+  .log-scroll::-webkit-scrollbar { width: 9px; }
+  .log-scroll::-webkit-scrollbar-track { background: transparent; }
+  .log-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+  .log-scroll::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+  /* ── 通用「下边框拖拽把手」2026-10-02 ─────────────────────────────────
+     两处共用同一套视觉：① 最近请求（.grip-bar#log-grip，上下拖改可见行数）
+                              ② 按渠道 / 按模型（.grip-bar.col-grip，拖任一个 → 两卡同时改高，
+                                 所以永远等高；这就是「保持两卡高度一致」的实现方式）
+     ⚠️ 把手必须挂在一个**静态容器**里，绝不能放进会被定时刷新重建的节点
+        （#log-rows / #stat-channel / #stat-model 的 innerHTML 都会被重写）。 */
+  .grip-bar { position: relative; height: 16px; margin-top: 8px; cursor: ns-resize;
+              display: flex; align-items: center; justify-content: center; user-select: none; }
+  .grip-bar::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; height: 1px;
+                      transform: translateY(-50%); background: var(--border); }
+  .grip-bar::after { content: ""; position: relative; width: 52px; height: 5px; border-radius: 3px;
+                     background: var(--panel2); border: 1px solid var(--border);
+                     transition: width .12s, background .12s, border-color .12s; }
+  .grip-bar:hover::after, .grip-bar.dragging::after { background: var(--accent); border-color: var(--accent); width: 68px; }
+  .grip-bar .grip-n { position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+                      font-family: var(--mono); font-size: 11px; color: var(--muted);
+                      opacity: 0; transition: opacity .12s; pointer-events: none; }
+  .grip-bar:hover .grip-n, .grip-bar.dragging .grip-n { opacity: 1; color: var(--accent); }
+  body.col-resizing { user-select: none; cursor: ns-resize; }
+
+  /* ── 渠道排序：拖拽把手 + 序号 + 上移/下移按钮 2026-10-02 ──────────────
+     顺序 = config.json 里 channels 数组的顺序（/api/overview 原样输出）。
+     拖动实现是「交换法」：被拖的卡跟着指针，越过谁的中线就插到谁前/后 ——
+     不搬 DOM 到 body 下（那样会被移出 .tab 作用域，切页签就飘着不走）。
+     ⚠️ .dragging 必须带 pointer-events:none：否则 elementFromPoint 每次命中的
+        都是被拖的那张卡自己，永远换不了位。 */
+  .drag-handle { cursor: grab; user-select: none; touch-action: none;
+                 color: var(--muted); font-size: 15px; line-height: 1;
+                 padding: 2px 5px; border: 1px solid transparent; border-radius: 5px; }
+  .drag-handle:hover { color: var(--accent); border-color: var(--border); background: var(--panel2); }
+  .drag-handle:active { cursor: grabbing; }
+  body.ch-dragging, body.ch-dragging * { cursor: grabbing !important; user-select: none; }
+  .card.dragging { opacity: .55; border-color: var(--accent-dim); border-style: dashed; pointer-events: none; }
+  .ch-ord { font-family: var(--mono); font-size: 11px; color: var(--muted); min-width: 20px; }
+  .btn:disabled { opacity: .3; cursor: not-allowed; }
+  .btn:disabled:hover { border-color: var(--border); color: var(--text); }
+
+  /* ── 渠道 / 模型两卡：等高 + 内容区可滚动 2026-10-02 ──────────────────
+     加 .hfit 后两卡变成 flex 列：标题行固定，内容区吃掉剩余高度超出则滚动，
+     底部再放一条把手。JS 拖动时给两张卡设**同一个** px 高度 → 天然等高。
+     默认不设高度（把手显示「自动」），保持原有的自适应排布；拖一下才固化。 */
+  .cols2.hfit { margin-bottom: 0; }                       /* 让把手贴住卡片下边（卡片自带 margin-bottom 会把它推开） */
+  .cols2.hfit > .card { display: flex; flex-direction: column; min-height: 0; margin-bottom: 0; }
+  .cols2.hfit > .card > .stat-head { flex: 0 0 auto; }
+  .cols2.hfit > .card > .grip-bar { flex: 0 0 auto; }
+  /* 内容区：渠道卡是 .stat-split（环 + 表），模型卡是 #stat-model（排行条）。
+     两者都是静态节点（被重建的是它们**内部**的 #stat-channel / #stat-model… 注意 #stat-model 自身
+     只换 innerHTML，所以给它设 overflow 是安全的）。 */
+  .cols2.hfit > .card > .stat-split,
+  .cols2.hfit > .card > #stat-model { flex: 1 1 auto; min-height: 0; overflow-y: auto;
+                                      overscroll-behavior: contain; scrollbar-gutter: stable; }
+  .cols2.hfit > .card > .stat-split::-webkit-scrollbar,
+  .cols2.hfit > .card > #stat-model::-webkit-scrollbar { width: 9px; }
+  .cols2.hfit > .card > .stat-split::-webkit-scrollbar-track,
+  .cols2.hfit > .card > #stat-model::-webkit-scrollbar-track { background: transparent; }
+  .cols2.hfit > .card > .stat-split::-webkit-scrollbar-thumb,
+  .cols2.hfit > .card > #stat-model::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+  .cols2.hfit > .card > .stat-split::-webkit-scrollbar-thumb:hover,
+  .cols2.hfit > .card > #stat-model::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
 </style>
 </head>
 <body>
@@ -139,15 +382,50 @@
   <div class="chip" id="gw-token" title="点击复制网关 Token（在第三方工具里当 API Key 用）" style="display:none">Token…</div>
 </header>
 <nav>
-  <button data-tab="models" class="active">模型</button>
+  <button data-tab="models" class="active">模型<span class="tab-dot" id="tab-models-dot"></span></button>
   <button data-tab="channels">渠道</button>
   <button data-tab="stats">统计</button>
   <button data-tab="playground">测试台</button>
   <button data-tab="guide">网关用法</button>
+  <!-- 统计页的两个控件：2026-10-02 先放到顶部标题行，同日按用户要求移进**页签行最右**。
+       仍只在统计页显示 —— 否则在模型页点「请求日志」会去更新一张看不见的表。 -->
+  <div class="hdr-ctrl" id="hdr-stats-ctrl">
+    <select id="stat-days" title="统计时间范围（全量累计 = 从这个库有记录的第一天算到现在）">
+      <option value="1">最近 24 小时</option>
+      <option value="7" selected>最近 7 天</option>
+      <option value="30">最近 30 天</option>
+      <option value="90">最近 90 天</option>
+      <option value="0">全量累计</option>
+    </select>
+    <button class="btn" id="logs-refresh">↻ 请求日志</button>
+  </div>
 </nav>
 <main>
   <!-- 模型 -->
   <section class="tab active" id="tab-models">
+    <!-- 免费模型雷达（2026-10-07）：OpenRouter 全站目录里 pricing 全 0 的模型。
+         **这是一条「有新增」的提醒，不常驻**（2026-10-07 三改，用户拍板）：
+         只有当「本机第一次见到、还没确认过」的免费模型出现时才露头，点 ✕ 收起；
+         没有新面孔时整条藏起来 —— 它是提醒，不是目录广告。
+         清单**不在这里另列**（同日二改）：本机配了 OpenRouter 渠道时，那批免费模型本来就在
+         下面这张表里（渠道扫描对 OpenRouter 只保留免费的，两边同一套判据），现统一并进模型表，
+         行上标「🎁 免费 / 匿名测试 / 免费路由器」与金色「新」，用同一套排序。
+         本机没渠道能提供的免费模型（未接入）也进表，归入单独一档，默认不显示，由
+         「未接入」开关控制 —— 免得零渠道用户一进来被十几行「不能用」的模型刷屏。 -->
+    <div class="card freebar" id="free-bar" style="display:none">
+      <div class="freebar-head">
+        <b>🎁 OpenRouter 新增 <span id="free-new-n">0</span> 个免费模型</b>
+        <span class="muted small" id="free-meta"></span>
+        <span class="fb-actions">
+          <button class="btn mini" id="free-view"
+                  title="跳到下方模型列表，把新增的这几个高亮出来">查看</button>
+          <button class="btn mini" id="free-refresh"
+                  title="立刻去 OpenRouter 公开端点拉一次最新目录（免密钥、不耗任何额度）">↻</button>
+          <button class="btn mini" id="free-dismiss"
+                  title="知道了：收起这条提醒，等下一批新面孔出现时再冒出来">✕</button>
+        </span>
+      </div>
+    </div>
     <div class="card">
       <div class="toolbar">
         <input type="text" id="model-search" placeholder="搜索模型…  支持 provider:xxx / v: / t:3">
@@ -157,6 +435,7 @@
           <button class="chip-btn ok-dot" id="show-ok-btn" title="显示免费可调模型（绿点）">● 可用</button>
           <button class="chip-btn warn-dot" id="show-limited-btn" title="暂时限流/冷却中的免费模型（黄点）">● 受限</button>
           <button class="chip-btn bad-dot" id="show-down-btn" title="硬不可用模型（红点）：余额/权限/已下线等，等不来自愈；点这行右侧「测试」可强制真测一次">● 不可用</button>
+          <button class="chip-btn" id="show-unlinked-btn" style="display:none" title="显示 OpenRouter 免费目录里本机还没接入的模型（灰点）：去「渠道」页加一个 OpenRouter 即可用">● 未接入</button>
         </span>
         <span class="vdiv"></span>
         <span class="grp" id="sort-chips">
@@ -198,7 +477,17 @@
         <div><label>API Key</label><input type="password" id="ch-key" placeholder="sk-…"></div>
         <div class="check"><input type="checkbox" id="ch-enabled" checked><span>启用</span></div>
       </div>
+      <!-- 额外模型（2026-10-07 加）：上游 GET /models 不列、但确实能调的模型。
+           平时**不用填**：「自动补全免费模型」默认开着，会从公开模型目录（models.dev）
+           取该平台标价 0 的模型、探活通过后自动并进来（见 app/modelcat.py）。
+           这一格留给两种情况：想指定目录里没有的模型、或关掉自动补全后自己点名。
+           按用户要求，和保存按钮同排、排在保存前面。 -->
       <div style="margin-top:12px; display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+        <input type="text" id="ch-extra" style="flex:2 1 240px; min-width:200px"
+               title="上游列表里没有、但实际能调的模型。填错不会有副作用：测试/扫描时会如实报错。"
+               placeholder="额外模型（可选 · 逗号分隔，如 glm-4-flash）">
+        <label class="check" style="padding-bottom:0; white-space:nowrap"
+               title="从公开模型目录找出该平台标价 0 的模型，探活确认后再自动加进这个渠道。上游 /models 不列免费模型的平台（如智谱）靠它自动补齐；关掉后仍可用左边的输入框手填。"><input type="checkbox" id="ch-auto" checked><span>自动补全免费模型</span></label>
         <a id="ch-keylink" href="#" target="_blank" class="btn"
            style="text-decoration:none; color:var(--accent); border-color:var(--accent-dim)">🔗 获取 API Key ↗</a>
         <button class="btn" id="ch-test" title="用当前表单的平台/URL/Key 测试连接，不保存">测试连接</button>
@@ -263,28 +552,92 @@
 
   <!-- 统计 -->
   <section class="tab" id="tab-stats">
-    <div class="toolbar">
-      <select id="stat-days" style="width:120px">
-        <option value="1">最近 24 小时</option>
-        <option value="7" selected>最近 7 天</option>
-        <option value="30">最近 30 天</option>
-        <option value="90">最近 90 天</option>
-      </select>
-      <button class="btn" id="logs-refresh">↻ 请求日志</button>
-    </div>
+    <!-- 「时间范围」下拉 + 「请求日志」按钮 2026-10-02 已移到顶部标题行右侧（#hdr-stats-ctrl），
+         这里不再单独占一行。 -->
     <div class="stat-grid" id="stat-cards"></div>
-    <div class="card"><h2>每日请求量</h2><div class="chart" id="chart"></div></div>
+    <!-- 每日请求量：2026-10-08 按用户要求移到「最近请求」上方（先看趋势再看明细）。
+         2026-10-02 二改保留：① 柱子固定宽度 + 装不下时横向滚动（不再靠聚合把柱子压扁）；
+                              ② 卡片右上加 日/周/月 粒度 chip（不点则按区间自动）；
+                              ③ 柱体按成功/失败/中断分色，另加图例。 -->
+    <div class="card">
+      <div class="stat-head">
+        <h2>每日请求量</h2>
+        <span class="grp" id="chart-grain" title="柱子的时间粒度：不点则按区间自动（≤45 天逐日 · >45 天按周 · >240 天按月），点一下就锁定">
+          <button class="chip-btn" data-g="day">日</button>
+          <button class="chip-btn" data-g="week">周</button>
+          <button class="chip-btn" data-g="month">月</button>
+        </span>
+      </div>
+      <div class="chart-scroll" id="chart-scroll"><div class="chart" id="chart"></div></div>
+      <div id="chart-legend"></div>
+    </div>
     <div class="card">
       <h2>最近请求</h2>
-      <table>
-        <thead><tr><th style="width:150px">时间</th><th>请求模型</th><th>上游模型</th><th style="width:130px">渠道</th><th style="width:90px">延迟</th><th style="width:110px" title="上游返回的真实 token 数。客户端提前断开时上游的 usage 收尾块收不到 → 改显示模型已输出的字符数（带「字」）">Tokens</th><th style="width:70px">状态</th></tr></thead>
-        <tbody id="log-rows"></tbody>
-      </table>
+      <!-- .log-scroll 是 #log-rows 的父级静态节点：高度设在这里，日志 3s 刷新只重建 tbody，
+           容器（和它的高度）不受影响。把手同理。 -->
+      <div class="log-scroll" id="log-scroll">
+        <table>
+          <thead><tr><th style="width:150px">时间</th><th>请求模型</th><th>上游模型</th><th style="width:130px">渠道</th><th style="width:90px">延迟</th><th style="width:110px" title="上游返回的真实 token 数。客户端提前断开时上游的 usage 收尾块收不到 → 改显示模型已输出的字符数（带「字」）">Tokens</th><th style="width:70px">状态</th></tr></thead>
+          <tbody id="log-rows"></tbody>
+        </table>
+      </div>
+      <!-- 下边框拖动把手：上下拖 → 改变上面列表可见行数；双击恢复默认行数 -->
+      <div class="grip-bar" id="log-grip" title="上下拖动改变显示行数 · 双击恢复默认">
+        <i class="grip-n" id="log-rows-n">12 行</i>
+      </div>
       <div class="empty" id="log-empty" style="display:none">还没有请求记录</div>
     </div>
-    <div class="cols2">
-      <div class="card"><h2>按模型</h2><table><tbody id="stat-model"></tbody></table></div>
-      <div class="card"><h2>按渠道</h2><table><tbody id="stat-channel"></tbody></table></div>
+    <!-- 按模型 / 按渠道：2026-10-02 由纯表格改成图表。
+         模型 = 20 项且极端长尾（前 2 名占 71%），饼图会糊成一圈 → 用横向排行条（Top8 + 其他）；
+         渠道 = 6 项部分-整体，且换口径排名会互换 → 用环形图，配「请求数 / Tokens」切换。
+         两张图的百分比分母都取 totals，不是 by_model/by_channel 求和（by_model 有 LIMIT 20）。 -->
+    <!-- .hfit：两卡等高 + 内容区可滚动 + 各自下边框一条把手（2026-10-02）。
+         拖任意一条把手 → 两卡被设成**同一个** px 高度，所以高度永远一致；双击任一条恢复自适应。 -->
+    <div class="cols2 start hfit">
+      <div class="card">
+        <div class="stat-head">
+          <h2>按渠道</h2>
+          <span class="grp" data-metric="channel">
+            <button class="chip-btn active" data-m="requests">请求数</button>
+            <button class="chip-btn" data-m="tokens">Tokens</button>
+          </span>
+        </div>
+        <div class="stat-split">
+          <div class="donut-box" id="stat-channel-donut"></div>
+          <div class="tbl-box">
+            <table>
+              <thead><tr>
+                <th>渠道</th>
+                <th style="width:56px;text-align:right">请求</th>
+                <th style="width:70px;text-align:right">Tokens</th>
+                <th style="width:52px;text-align:right">占比</th>
+                <th style="width:54px;text-align:right">延迟</th>
+              </tr></thead>
+              <tbody id="stat-channel"></tbody>
+            </table>
+          </div>
+        </div>
+        <!-- 下边框把手：拖它 → 两卡同时改高（所以永远等高）；双击恢复自适应 -->
+        <div class="grip-bar col-grip" data-cols-grip
+             title="上下拖动同时改变两张卡片的高度（拖哪一条都一样，两卡永远等高）· 双击恢复自适应">
+          <i class="grip-n" data-cols-grip-n>自动</i>
+        </div>
+      </div>
+      <div class="card">
+        <div class="stat-head">
+          <h2>按模型</h2>
+          <span class="grp" data-metric="model">
+            <button class="chip-btn active" data-m="requests">请求数</button>
+            <button class="chip-btn" data-m="tokens">Tokens</button>
+          </span>
+        </div>
+        <div id="stat-model"></div>
+        <!-- 下边框把手：拖它 → 两卡同时改高（所以永远等高）；双击恢复自适应 -->
+        <div class="grip-bar col-grip" data-cols-grip
+             title="上下拖动同时改变两张卡片的高度（拖哪一条都一样，两卡永远等高）· 双击恢复自适应">
+          <i class="grip-n" data-cols-grip-n>自动</i>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -367,7 +720,172 @@ function setView(v){
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 let overview = null, editingId = null;
 
-function toast(msg){ const t = $("#toast"); t.textContent = msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1800); }
+// ---- 轻提示（toast）----
+// `toast(msg)` 仍是底部居中（全局提示用）；`toast(msg, {anchor: btn, ms, kind})` 贴按钮弹出。
+// 2026-09-26 修掉的三处「看不到就没了」：
+//   ① **定时器互相踩**：旧版每次都无条件 `setTimeout(…, 1800)`，连发两条时第一条的定时器
+//      会把第二条提前关掉。现在保存句柄、新的先清旧的。
+//   ② 长消息被裁：见 #toast 的 max-width + pre-wrap。
+//   ③ 只在底部：`{anchor: btn}` 锚到刚点的那个按钮，并按需上下翻转/左右收边，别出视口。
+// 2026-09-26 第三轮：**模型「测试」不再走 toast**（结果只写行内，见 `_rowTestBusy` / `_rowTestDone`）。
+// 保留 toast 的是「全局性、行内没有落点」的那些：复制、保存、扫描完成汇总、批量完成汇总。
+// 2026-09-26 第三轮：模型「测试」结果已改为只写行内、不再弹浮层，所以这里不再需要
+// 按模型名重新找按钮（`_findTestBtn` / `_toastAnchorModel` 已删）。剩下用锚定的地方
+// 都是「工具栏/渠道卡片上的按钮」（批量测试、扫描完成），它们不随模型表重建。
+let _toastTimer = null, _toastAnchor = null, _toastBound = false;
+function _toastPlace(){
+  const t = $("#toast");
+  if (!t.classList.contains("show")) return;
+  // 锚点被重建掉（元素已从文档里移除）→ 这个浮层的位置已无依据，直接收起，
+  // 免得停在上一次算出的位置、看着像在指别的东西。
+  if (_toastAnchor && !_toastAnchor.isConnected){ _toastHide(); return; }
+  if (!_toastAnchor) return;
+  const r = _toastAnchor.getBoundingClientRect();
+  const b = t.getBoundingClientRect();
+  let top, left;
+  // 优先放在按钮**左侧**：浮层不遮「测试」列，用户可以马上再点下一行的测试
+  //（「测试」在最右列，浮层放下面会压住下面两三行的按钮，9 秒里挡住操作）。
+  // 左边放不下（窄窗口）才退到按钮下方，下方也放不下就翻到上方。
+  if (r.left - b.width - 10 >= 12){
+    left = r.left - b.width - 10;
+    top = Math.max(8, Math.min(r.top, innerHeight - b.height - 8));
+  } else {
+    top = r.bottom + 8;
+    if (top + b.height > innerHeight - 8) top = Math.max(8, r.top - b.height - 8);
+    left = Math.max(12, Math.min(r.left, innerWidth - b.width - 12));
+  }
+  t.style.top = top + "px";
+  t.style.left = left + "px";
+}
+function _toastUnbind(){
+  if (!_toastBound) return;
+  removeEventListener("scroll", _toastPlace, true);   // capture：连内层滚动容器一起跟
+  removeEventListener("resize", _toastPlace);
+  _toastBound = false;
+}
+function toast(msg, opts){
+  const o = (typeof opts === "number") ? {ms: opts} : (opts || {});
+  const t = $("#toast");
+  if (_toastTimer) { clearTimeout(_toastTimer); _toastTimer = null; }
+  t.textContent = msg;
+  t.className = "show" + (o.kind ? " " + o.kind : "");
+  if (o.anchor){
+    _toastAnchor = o.anchor;
+    t.classList.add("anchored");
+    t.style.top = "-9999px"; t.style.left = "-9999px";  // 先量尺寸再定位，避免闪一下错位
+    _toastPlace();
+    if (!_toastBound){
+      addEventListener("scroll", _toastPlace, true);
+      addEventListener("resize", _toastPlace);
+      _toastBound = true;
+    }
+  } else {
+    _toastAnchor = null;
+    _toastUnbind();
+    t.style.top = ""; t.style.left = "";
+  }
+  _toastTimer = setTimeout(_toastHide, o.ms || 2600);
+}
+function _toastHide(){
+  const t = $("#toast");
+  t.classList.remove("show");
+  if (_toastTimer) { clearTimeout(_toastTimer); _toastTimer = null; }
+  _toastUnbind();
+  _toastAnchor = null;
+}
+$("#toast").onclick = _toastHide;   // 点一下立刻关（长提示不用等它自己走）
+
+// ---- 行内测试状态（2026-09-26 第二轮；同日第三轮：内存为真、DOM 只是投影）----
+// 原则：**会消失的东西不该是唯一证据**。行内状态现在是主证据（浮层已按用户要求撤掉）。
+// 三态：测试中（圆点呼吸 + 秒表）→ 实测可用 / 实测不可用（带原因与时刻，悬停可见）。
+//
+// ⚠ 为什么状态存在 Map 里而不是直接写在 DOM 上（第三轮修的 bug）：
+//   整张表会被 `loadOverview()` 整表重建，而且第 1618 行有个 **30 秒一次的静默刷新**。
+//   旧版把「测试中」只写在 DOM 上：重建后圆点回到服务端颜色（`testing` 类没了），
+//   但每秒一次的 tick 仍在往新 chip 里写秒表 → 界面出现「还在读秒、圆点却不呼吸」的错位。
+//   现在状态在内存、由 `_rowRepaint()` 统一重放，重建后立刻补一次，最多错 1 秒。
+const _rowTestingAt = new Map();   // model -> 开始时刻（测试进行中）
+const _rowResult = new Map();      // model -> {ok, detail, at}（最近一次实测结论）
+const _ROW_RESULT_TTL = 90000;     // 实测结论在行内保留 90 秒：够看，也不会长期压住服务端真值
+let _rowPump = null;               // 唯一的秒表 interval（测试全部结束后自己停）
+
+function _rowEl(model){
+  // 用 dataset 精确比对，而不是拼属性选择器：`data-row-model` 里的值经过 esc()
+  // （`&`→`&amp;`、`"`→`&quot;`），用原始 id 去 `querySelector` 会匹配不到；
+  // 要拼选择器就得再套一层 CSS.escape，且两套转义规则容易对不上。
+  // 一页最多几十行，线性找一次可忽略（计时器每秒一次也一样）。
+  const want = String(model);
+  for (const tr of document.querySelectorAll("#model-rows tr[data-row-model]")){
+    if (tr.dataset.rowModel === want) return tr;
+  }
+  return null;
+}
+function _rowParts(model){
+  const tr = _rowEl(model);
+  return tr ? {tr, dot: tr.querySelector(".light-dot"), chip: tr.querySelector(".st-chip")} : null;
+}
+// 把「测试中」画到某一行（幂等：可反复调用，DOM 重建后重放也安全）
+function _rowPaintTesting(model, t0){
+  const p = _rowParts(model); if (!p) return;   // 行不在当前页：静默跳过，翻回来时自会补上
+  p.tr.classList.add("row-testing");
+  if (p.dot){
+    p.dot.classList.remove("ok", "limited", "down");
+    p.dot.classList.add("testing");
+    p.dot.title = "正在实测…";
+  }
+  if (p.chip){
+    const s = Math.max(0, Math.round((Date.now() - t0) / 1000));
+    p.chip.innerHTML = `<span class="tag-chip testing">测试中 · ${s}s</span>`;
+  }
+}
+// 把「实测结论」画到某一行（同样幂等）
+function _rowPaintResult(model, r){
+  const p = _rowParts(model); if (!p) return;
+  p.tr.classList.remove("row-testing");
+  const label = r.ok ? "实测可用" : "实测不可用";
+  const tip = r.detail || label;
+  if (p.dot){
+    p.dot.classList.remove("ok", "limited", "down", "testing");
+    p.dot.classList.add(r.ok ? "ok" : "down");
+    p.dot.title = tip;
+  }
+  // 用 .tag-chip.ok / .bad 这两个类，别再拼内联 style —— 之前那种
+  // `'tag-chip" style="…'` 的写法少一个字符就把整个 <span> 属性串写坏，且没人会发现。
+  if (p.chip)
+    p.chip.innerHTML = `<span class="tag-chip ${r.ok ? "ok" : "bad"}" title="${esc(tip)}">${label}</span>`;
+}
+// 重放：内存 → DOM。renderModels() 重建完表会立刻调一次（补上重建丢掉的行内状态）。
+function _rowRepaint(){
+  const now = Date.now();
+  for (const [m, r] of _rowResult) if (now - r.at > _ROW_RESULT_TTL) _rowResult.delete(m);
+  for (const [m, t0] of _rowTestingAt) _rowPaintTesting(m, t0);          // 测试中优先，盖住旧结论
+  for (const [m, r] of _rowResult) if (!_rowTestingAt.has(m)) _rowPaintResult(m, r);
+}
+function _rowPumpStart(){
+  if (_rowPump) return;
+  _rowPump = setInterval(() => {
+    if (!_rowTestingAt.size){                 // 全测完了：停表，顺手清一次过期结论
+      clearInterval(_rowPump); _rowPump = null; _rowRepaint(); return;
+    }
+    _rowRepaint();
+  }, 1000);
+}
+function _rowTestBusy(model){
+  _rowResult.delete(model);                   // 新一轮开始：上一次的结论作废
+  _rowTestingAt.set(model, Date.now());
+  _rowPaintTesting(model, _rowTestingAt.get(model));
+  _rowPumpStart();
+}
+function _rowTestStop(model){
+  _rowTestingAt.delete(model);
+  if (!_rowTestingAt.size && _rowPump){ clearInterval(_rowPump); _rowPump = null; }
+}
+function _rowTestDone(model, ok, detail){
+  _rowTestStop(model);
+  const r = {ok: !!ok, detail: detail || "", at: Date.now()};
+  _rowResult.set(model, r);
+  _rowPaintResult(model, r);
+}
 function copyText(s){ navigator.clipboard.writeText(s).then(()=>toast("已复制： "+s)).catch(()=>toast("复制失败")); }
 function fmtNum(n){ return Number(n||0).toLocaleString(); }
 function fmtLatency(ms){ return ms==null ? "—" : (ms>=1000 ? (ms/1000).toFixed(1)+"s" : ms+"ms"); }
@@ -383,19 +901,34 @@ function fmtQuota(q){
 }
 
 // ---- 标签页 ----
-document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
-  document.querySelectorAll("nav button").forEach(x=>x.classList.remove("active"));
+// ⚠️ `nav > button`：页签行右侧还挂着统计页的两个控件（其中「↻ 请求日志」也是 <button>），
+//    用后代选择器会把它一起绑上页签逻辑 —— 点一下就会去找不存在的 #tab-undefined。
+document.querySelectorAll("nav > button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("nav > button").forEach(x=>x.classList.remove("active"));
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
   b.classList.add("active"); $("#tab-"+b.dataset.tab).classList.add("active");
-  if (b.dataset.tab === "stats") { loadStats(); loadLogs(false); startLogPolling(); }
+  // 统计页的时间范围 / 请求日志控件挂在标题行右侧，**只在统计页出现**（切走就藏，
+  // 免得在模型页点「请求日志」更新一张看不见的表）。
+  const isStats = b.dataset.tab === "stats";
+  const hc = $("#hdr-stats-ctrl");
+  if (hc) hc.classList.toggle("on", isStats);
+  if (isStats) { loadStats(); loadLogs(false); startLogPolling(); }
   else { stopLogPolling(); }
 });
 $("#gw-url").onclick = () => copyText(overview?.gateway?.base_url || "");
 
 async function api(path, body, method){
-  const opt = body !== undefined
-    ? {method: method || "POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)}
-    : {};
+  // ⚠️ 2026-10-02 修：method 必须**独立生效**，不能只在有 body 时才读。
+  //    原写法 body === undefined 时直接 `opt = {}` → method 参数被整个丢掉 → fetch 默认发 GET。
+  //    后果：两处 `api(path, undefined, "DELETE")` 实际发出 GET，被 FastAPI 回 405
+  //    （`/api/channels/{cid}` 只注册了 PUT/DELETE，没有 GET）→ 「渠道删除」「别名删除」
+  //    两个按钮点了都没反应。现在显式推导默认方法，两种调用都正确。
+  const m = method || (body !== undefined ? "POST" : "GET");
+  const opt = { method: m };
+  if (body !== undefined) {
+    opt.headers = {"Content-Type":"application/json"};
+    opt.body = JSON.stringify(body);
+  }
   opt.cache = "no-store";   // 统计数据类接口不吃 HTTP 缓存，否则刷新也拿旧值
   const r = await fetch(path, opt);
   if (!r.ok) throw new Error((await r.json().catch(()=>({detail:r.statusText}))).detail || r.statusText);
@@ -414,6 +947,7 @@ async function loadOverview(){
   } else { $("#gw-token").style.display = "none"; }
   renderGuide();
   renderModels(); renderChannels(); renderAliases(); renderSettings();
+  renderFreeBanner();      // 免费模型雷达（OpenRouter 目录情报，跟上方模型表不是一回事）
   migratePins();
 }
 
@@ -453,12 +987,14 @@ function renderGuide(){
 
 // ---- 模型（分页；排序与状态逻辑见下方 MODEL_STATE 区块） ----
 const PAGE = {size: 100, n: 0};
+let _lastFilteredTotal = 0;   // 当前筛选后的条数（renderModels 里更新，「下一页」据此判断）
 // ---- 模型：状态/收藏/搜索语法/排序 ----
 // showDown 默认关：红点模型（硬不可用）平时不混进列表，要诊断再打开。
 // 为什么需要这个开关：`down` 没有出口，而唯一能救回它的入口（模型页「测试」）以前
 // 因为模型不渲染而根本点不到 → 2026-09-21 起后端允许手动测试穿透 channel_down，
 // 前端补上这一屏，两边合起来才是「点一下就救回来」。
-const MODEL_STATE = {sort: "balanced", showOk: true, showLimited: true, showDown: false};
+const MODEL_STATE = {sort: "balanced", showOk: true, showLimited: true, showDown: false,
+                     showUnlinked: false};   // 未接入（OpenRouter 目录里有、本机没渠道提供）：与 down 同档，默认关
 // 收藏持久化在后端 config.json，不依赖浏览器 localStorage。
 // 两套收藏（2026-09-20 起）：「视觉」视图有自己的 `pinned_vision`，只管这一屏的排序
 // 与 `auto-vision` 的实际切换顺序；其余视图用主收藏 `pinned`。同一个模型要两边各收一次。
@@ -500,10 +1036,13 @@ function syncChips(){
   $("#show-ok-btn").classList.toggle("active", MODEL_STATE.showOk);
   $("#show-limited-btn").classList.toggle("active", MODEL_STATE.showLimited);
   $("#show-down-btn").classList.toggle("active", MODEL_STATE.showDown);
+  const ub = $("#show-unlinked-btn");
+  if (ub) ub.classList.toggle("active", MODEL_STATE.showUnlinked);
 }
 $("#show-ok-btn").onclick = () => { MODEL_STATE.showOk = !MODEL_STATE.showOk; syncChips(); renderModels(); };
 $("#show-limited-btn").onclick = () => { MODEL_STATE.showLimited = !MODEL_STATE.showLimited; syncChips(); renderModels(); };
 $("#show-down-btn").onclick = () => { MODEL_STATE.showDown = !MODEL_STATE.showDown; syncChips(); renderModels(); };
+$("#show-unlinked-btn").onclick = () => { MODEL_STATE.showUnlinked = !MODEL_STATE.showUnlinked; syncChips(); renderModels(); };
 // 「视觉」也在这一排：整排 chip 都是**视图**（只决定列表排序），不写回 route_strategy——
 // 路由策略在 Agent 端填模型名选（auto / auto-quality / …），这里点了只是「换一种看法」。
 document.querySelectorAll("#sort-chips .chip-btn").forEach(b =>
@@ -595,10 +1134,16 @@ function modelSort(a, b){
   if (pa !== pb) return pa ? -1 : 1;
   // ⚠️ down 也要在表里：现在的渲染链路会先把 down 过滤掉（见 `all` 的定义），所以
   // 正常走不到这里；但一旦哪天不过滤了，undefined - 0 = NaN 会让 sort 顺序静默错乱。
-  const rank = {ok: 0, limited: 1, down: 2};
+  const rank = {ok: 0, limited: 1, down: 2, unlinked: 3};
   const sa = a.status || "ok", sb = b.status || "ok";
-  const ra = rank[sa] ?? 2, rb = rank[sb] ?? 2;      // 未知状态一律垫底，不再返回 NaN
+  const ra = rank[sa] ?? 3, rb = rank[sb] ?? 3;      // 未知状态一律垫底，不再返回 NaN
   if (ra !== rb) return ra - rb;
+  // 未接入的行没有渠道（channels 空）→ compScore 恒为 0，会退化成按名字排。这几个都是同 rank
+  // （unlinked 垫底），所以单独按 AA 榜分降序 —— 用户先想试的是强的那几个，不是名字靠前的。
+  if (a.unlinked && b.unlinked){
+    const dAA = (b.aa || 0) - (a.aa || 0);
+    return dAA || a.id.localeCompare(b.id);
+  }
   const d = compScore(b) - compScore(a);
   if (d) return d;
   return _versionCmp(a.id, b.id) || a.id.localeCompare(b.id);
@@ -784,9 +1329,173 @@ function flashTierChip(id){
   setTimeout(() => el.classList.remove("flash"), 1200);
 }
 $("#model-rows").addEventListener("click", e => {
-  const btn = e.target.closest(".tier-btn");
-  if (btn) openTierMenu(btn, btn.dataset.model);
+  // ⚠️ 一律走 dataset 取值，**不要**把值拼进 `onclick="fn('${...}')"`：
+  //    模型 id 是 provider 返回的，可能含 `'` `"` `/` `.` `:` 等字符；
+  //    而 esc() 只转义 & < > " —— **不转义单引号**，一个 `'` 就能把内联属性撑破成语法错，
+  //    按钮点下去静默失效（2026-10-02 修）。dataset 读出来的是 HTML 解码后的原值，安全。
+  const tier = e.target.closest(".tier-btn");
+  if (tier){ openTierMenu(tier, tier.dataset.model); return; }
+  const pin = e.target.closest("[data-pin]");
+  if (pin){ togglePin(pin.dataset.pin); return; }
+  const cp = e.target.closest("[data-copy]");
+  if (cp){ copyText(cp.dataset.copy); return; }
+  const tb = e.target.closest(".test-btn");
+  if (tb && !tb.disabled){ testModel(tb.dataset.model, tb); return; }
 });
+
+// ══ 免费模型雷达（OpenRouter 目录里 pricing 全 0 的模型）2026-10-07 ═══════════════
+// 后端 `freemodels.view()` 给的是一份**情报**（OpenRouter 目录里哪些是免费的），跟本机配了
+// 哪些渠道无关。2026-10-07 二改：清单**不再**在顶部另列一份，改为并进下方模型表（行上标
+// 「🎁 免费 / 新 / 未接入」）—— 本机配了 OpenRouter 时那批模型本来就在表里，另列即重复。
+// 2026-10-07 三改（用户拍板）：顶部那条**不常驻**，只当「有新增」的提醒 ——
+//   有「本机第一次见到、还没点过 ✕」的免费模型 → 露头，并且**一直留着**（提醒不该一闪而过，
+//   人可能不在模型页）；点 ✕ 收起，等下一批新面孔再冒出来；没有新面孔时整条藏起来。
+//   因为只在模型页可见，人在别的页时靠**页签上的未读小点**提醒（`nav > button.has-dot`）。
+// 确认状态必须靠 localStorage 记账：`loadOverview()` 每 30 秒静默跑一次（脚本末尾），
+// 不记账的话同一批新模型会每半分钟把横幅重新弹出来。
+// 原先那条 toast 已删 —— 横幅现在只在「真有新增」时出现且会一直留到你确认，
+// 两个渠道说同一件事只是噪音（2026-10-07 用户要求「精简」）。
+const FREE_ACK_KEY = "apihub.freeAck";     // 已确认（点过 ✕，或首次运行时静默记账）的模型 id
+let _freeAck = null, _freeAckInit = false;
+
+function _freeAckGet(){
+  if (_freeAck) return _freeAck;
+  let raw = null;
+  try { raw = localStorage.getItem(FREE_ACK_KEY); } catch(e){}
+  try { _freeAck = new Set(raw ? JSON.parse(raw) : []); } catch(e){ _freeAck = new Set(); }
+  // raw === null = 本机从没跑过这个功能（新装 / 刚升级上来）→ 调用方据此**静默记账不提示**。
+  // 否则第一次打开会一口气弹「30 个新面孔」—— 用户根本没有上一份名单可比，纯噪音。
+  _freeAckInit = raw !== null;
+  return _freeAck;
+}
+function _freeAckNow(ids){
+  const s = _freeAckGet();
+  ids.forEach(i => s.add(i));
+  try { localStorage.setItem(FREE_ACK_KEY, JSON.stringify([...s])); } catch(e){}
+}
+function _freeCtx(n){                       // 上下文档位（数字 → 128k / 1.5M）
+  if (!n) return "";
+  if (n >= 1000000) return (n / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
+  if (n >= 1000) return Math.round(n / 1000) + "k";
+  return String(n);
+}
+function _freeAgoH(h){ return h == null ? "—" : (h < 24 ? Math.round(h) + " 小时" : Math.round(h / 24) + " 天"); }
+function _freeAgoTs(ts){                    // 「首次见到」列：越新越有价值，所以用相对时间
+  if (!ts) return "—";
+  const h = Date.now() / 1000 - ts;
+  if (h < 3600) return "刚刚";
+  if (h < 86400) return Math.round(h / 3600) + " 小时前";
+  if (h < 86400 * 60) return Math.round(h / 86400) + " 天前";
+  return fmtTime(ts);
+}
+// 免费模型清单已并进下方模型表（2026-10-07 二改）—— 顶部只剩提示条，清单相关的
+// 渲染搬到了模型表的行里（`_freeKindChip` 画那颗标，`_unlinkedRow` 画未接入的只读行）。
+function _freeKindChip(f){
+  // 「免费」的三种长相，措辞沿用原来顶部清单里的说法
+  if (!f) return "";
+  if (f.kind === "anon")
+    return '<span class="tag-chip fb-kind-anon" title="pricing 为 0 却不带 :free 后缀的匿名预览模型 —— 一般是新模型发布前的灰度测试版，最值得优先试，但也最容易突然下线">🎁 匿名测试</span>';
+  if (f.kind === "router")
+    return '<span class="tag-chip fb-kind-router" title="openrouter/free：官方免费模型路由器，由它自己挑一个当前可用的免费模型来回答">🎁 免费路由器</span>';
+  return '<span class="tag-chip fb-free" title="OpenRouter 全站目录里 pricing 全 0 的免费模型（带 :free 后缀，按天限次，通常每天 50 次）">🎁 免费</span>';
+}
+// 「未接入」行：OpenRouter 免费目录里有、本机却没有渠道能提供它 → 不能测、不能调、不能收藏。
+// 只展示情报（id 可复制、类型、AA 分、上下文、视觉、首见时间），整行淡显（CSS `tr.unlinked`）。
+function _unlinkedRow(m, i){
+  const f = m._free || {};
+  const chips = [_freeKindChip(f)];
+  if (f.bench != null) chips.push(`<span class="tag-chip" title="Artificial Analysis 智能指数（越高越强）">AA ${f.bench}</span>`);
+  if (f.vision) chips.push('<span class="tag-chip ok" title="支持图像输入（能看图）">👁</span>');
+  if (m.context) chips.push(`<span class="tag-chip" title="最大上下文 ${f.context} tokens">${m.context}</span>`);
+  if (f.is_new) chips.push(`<span class="tag-chip fb-new" title="本机第一次见到：${_freeAgoTs(f.first_seen)}">新</span>`);
+  return `<tr data-row-model="${esc(m.id)}" class="unlinked">
+    <td class="muted small" style="width:44px">${PAGE.n*PAGE.size+i+1}</td>
+    <td>
+      <span class="light-dot unlinked" title="本机还没有能提供它的渠道"></span>
+      <b style="font-size:14px" class="mono click-copy" data-copy="${esc(m.id)}" title="点击复制">${esc(m.id)}</b>
+      <span class="st-chip"><span class="tag-chip fb-unlinked" title="本机没配 OpenRouter 渠道（或该渠道没拉到它）：模型表里不能测也不能调 —— 去「渠道」页加一个 OpenRouter 即可">未接入</span></span>
+    </td>
+    <td><div class="small" style="display:flex; gap:5px; flex-wrap:wrap">${chips.join("")}</div></td>
+    <td style="text-align:center" class="muted">—</td>
+    <td style="white-space:nowrap"><button class="btn test-btn" disabled title="本机没有能提供它的渠道">测试</button></td>
+  </tr>`;
+}
+
+function renderFreeBanner(){
+  const bar = $("#free-bar");
+  if (!bar) return;                                   // 元素缺失（老缓存页面）时静默跳过
+  const dot = $("#tab-models-dot");
+  const hide = () => {                                // 藏横幅 + 熄掉页签上的未读点
+    bar.style.display = "none";
+    if (dot) dot.parentElement.classList.remove("has-dot");
+  };
+  const fm = overview && overview.free_models;
+  // 没数据（含「0 个免费模型」）→ 藏起来。这条横幅不是目录广告，没内容就不该占地方。
+  if (!fm || !fm.total){ hide(); return; }
+  const freshIds = (fm.items || []).filter(r => r.is_new).map(r => r.id);
+  const ack = _freeAckGet();
+  if (!_freeAckInit){
+    // 首次运行（本机从没跑过这个功能）：没有上一份名单可比，「新增 N 个」对用户是假消息
+    // → 静默记账，不打扰；之后每一批新面孔才会真的提醒。
+    _freeAckNow(freshIds);
+    hide();
+    return;
+  }
+  const unacked = freshIds.filter(id => !ack.has(id));
+  // 没有未确认的新面孔 → 藏起来。**这条横幅不常驻**：它是「有新增」的提醒，不是目录广告。
+  // 点过 ✕ 后一直安静，等下一批新面孔再冒出来；老面孔超过「新面孔窗口」也会自动不再是新增。
+  if (!unacked.length){ hide(); return; }
+  bar.style.display = "";
+  if (dot) dot.parentElement.classList.add("has-dot");   // 人在别的页时靠这颗小点提醒
+  $("#free-new-n").textContent = unacked.length;
+  // 一行到底：新增数已在主文案里，这里只补「全量 + 新鲜度」——不再重复报三分类计数
+  //（分类在模型表每行的「🎁 免费 / 匿名测试 / 免费路由器」标上都能看到，顶部再报一遍是废话）。
+  const when = (fm.age_hours != null && fm.age_hours < 1)
+    ? "刚刚更新" : _freeAgoH(fm.age_hours) + "前更新";
+  $("#free-meta").textContent = `· 目录里共 ${fm.total} 个 · ${when}`;
+  bar.title = `本机第一次见到距今 ${fm.new_days || 7} 天内的免费模型算「新增」。`
+    + `点「查看」跳到下面模型列表看是哪几个；点 ✕ 收起提醒。`;
+}
+// 「查看」：跳到下面模型表，把带金色「新」标的行闪出来。
+// 为什么不能只滚动过去：新面孔可能被搜索词或状态开关挡在当前结果之外（用户正在搜别的），
+// 那滚过去也是一片空白 —— 所以先把这两个会挡住它的筛选放开，再回第一页（新面孔档位高、
+// 本来就排在前面）。闪两下是必需的：几百行里靠肉眼找「新」标找不着。
+$("#free-view").onclick = () => {
+  const box = $("#model-search");
+  if (box && box.value) box.value = "";
+  MODEL_STATE.showOk = true; MODEL_STATE.showLimited = true;   // 新面孔基本落在这两档
+  syncChips();
+  PAGE.n = 0;
+  renderModels();
+  const box2 = $("#model-rows");
+  if (box2 && box2.closest(".card")) box2.closest(".card").scrollIntoView({ behavior: "smooth", block: "start" });
+  document.querySelectorAll("#model-rows tr .fb-new").forEach(el => {
+    const tr = el.closest("tr");
+    if (!tr) return;
+    tr.classList.remove("flash-new");
+    void tr.offsetWidth;      // 强制重排：连着点两次也要重播动画（否则第二次没反应）
+    tr.classList.add("flash-new");
+    setTimeout(() => tr.classList.remove("flash-new"), 2000);
+  });
+};
+// 「✕」知道了：把当前这批新面孔记成已确认 → 横幅立刻收起（不必等下一次 30 秒轮询）。
+// 记账的是「当前所有 is_new 的 id」而不是仅未确认那几个 —— 同一批只该打扰一次。
+$("#free-dismiss").onclick = () => {
+  const fm = overview && overview.free_models;
+  _freeAckNow(((fm && fm.items) || []).filter(r => r.is_new).map(r => r.id));
+  renderFreeBanner();
+};
+$("#free-refresh").onclick = async () => {
+  const btn = $("#free-refresh");
+  btn.disabled = true; btn.textContent = "…";
+  try {
+    const r = await api("/api/free-models/refresh", {});
+    toast("已更新：OpenRouter 免费模型 " + r.total + " 个"
+          + (r.new_count ? "，其中 " + r.new_count + " 个是新面孔" : ""), { ms: 5000 });
+    await loadOverview();
+  } catch(e){ toast("刷新失败：" + e.message); }
+  finally { btn.disabled = false; btn.textContent = "↻"; }
+};
 
 function renderModels(){
   syncSearchHint();
@@ -801,23 +1510,44 @@ function renderModels(){
     id: a.name, available: a.available, isAlias: true,
     status: a.available ? "ok" : "limited",
     tier: 2, channel_count: a.targets.length, channels: [], targets: a.targets }));
+  // ---- 免费模型雷达并表（2026-10-07 二改，用户拍板）----
+  // 雷达清单（overview.free_models.items）= OpenRouter 全站目录里 pricing 全 0 的模型。
+  // 本机配了 OpenRouter 渠道时，渠道扫描对它**只保留免费的**（两边同一套判据），这批模型
+  // 本来就在 overview.models 里 —— 以前顶部横幅另列一份清单，等于同一批模型显示两遍。
+  // 现在：命中模型表的 → 挂 `_free` 明细（行上标「🎁免费 / 新」）；本机没渠道能提供的
+  //       （未接入）→ 单独造一条归 "unlinked" 档，默认不显示，由「未接入」开关控制。
+  const fm = overview && overview.free_models;
+  const freeLeft = new Map(((fm && fm.items) || []).map(r => [r.id, r]));
+  const models = (overview?.models || []).map(m => {
+    const f = freeLeft.get(m.id);
+    if (f){ freeLeft.delete(m.id); m._free = f; }   // 幂等：同一 overview 上重入也只是重挂同一引用
+    return m;
+  });
+  const ghosts = [...freeLeft.values()].map(r => ({
+    id: r.id, name: r.name, status: "unlinked", unlinked: true, isAlias: false,
+    channels: [], vision: !!r.vision, context: _freeCtx(r.context),
+    tier: null, aa: r.bench, _free: r,
+  }));
   // 不再在这里把 down 过滤掉——改由下面的「不可用」开关控制（默认关，视图象原来一样）。
   // 保留在 all 里是为了：① 红点那一屏能列出来并点「测试」；② 计数/空态文案能报出真实数量。
-  const all = [...aliases, ...(overview?.models || [])];
+  const all = [...aliases, ...models, ...ghosts];
   // 视觉分组：只列能看图的模型（别名不算）
   const inGroup = m => MODEL_STATE.sort !== "vision" || !!m.vision;
   // 先算可见计数（未按 ok/受限 开关收窄，供 chip 文案与空态提示）
   const okN = all.filter(m => m.status === "ok" && inGroup(m) && kwMatch(m, tokens)).length;
   const limN = all.filter(m => m.status === "limited" && inGroup(m) && kwMatch(m, tokens)).length;
   const downN = all.filter(m => m.status === "down" && inGroup(m) && kwMatch(m, tokens)).length;
+  const unN = all.filter(m => m.unlinked && inGroup(m) && kwMatch(m, tokens)).length;
   const filtered = all
     .filter(inGroup)
     .filter(m => kwMatch(m, tokens))
     .filter(m => (m.status === "ok" && MODEL_STATE.showOk)
               || (m.status === "limited" && MODEL_STATE.showLimited)
-              || (m.status === "down" && MODEL_STATE.showDown))
+              || (m.status === "down" && MODEL_STATE.showDown)
+              || (m.unlinked && MODEL_STATE.showUnlinked))
     .sort(modelSort);
   const total = filtered.length;
+  _lastFilteredTotal = total;   // 「下一页」按钮据此判断（原来用 overview 全量长度，筛过之后还能翻到空页）
   const maxPage = Math.max(0, Math.ceil(total / PAGE.size) - 1);
   if (PAGE.n > maxPage) PAGE.n = maxPage;
   const rows = filtered.slice(PAGE.n * PAGE.size, (PAGE.n + 1) * PAGE.size);
@@ -829,15 +1559,27 @@ function renderModels(){
   $("#show-limited-btn").title = `显示/隐藏暂时受限的免费模型（限流/冷却中，当前视图 ${limN} 个）`;
   $("#show-down-btn").title = `显示/隐藏硬不可用模型（当前视图 ${downN} 个）：余额/权限/已下线等，等不来自愈。`
     + `误判的可点「测试」强制真测一次救回；真用不了的点了还是同一句错。`;
+  // 「未接入」开关：只有真有未接入的免费模型时才露出来（免得零渠道用户看见一个恒为 0 的按钮）
+  const ub = $("#show-unlinked-btn");
+  if (ub){
+    ub.style.display = unN ? "" : "none";
+    ub.textContent = `● 未接入 ${unN}`;
+    ub.title = `显示/隐藏 OpenRouter 免费目录里本机还没接入的模型（当前视图 ${unN} 个）：`
+      + `本机没有渠道能提供它们，不能测也不能调 —— 去「渠道」页加一个 OpenRouter 即可用。`;
+    ub.classList.toggle("active", MODEL_STATE.showUnlinked);
+  }
   $("#model-count").textContent = `共 ${okN + limN} 个`;
   $("#model-empty").style.display = total ? "none" : "block";
-  $("#model-empty").textContent = !okN && !limN && !downN
+  $("#model-empty").textContent = (!okN && !limN && !downN && !unN)
     ? "还没有模型。请到「渠道」页添加渠道，保存后会自动测试连接；再点「扫描全部模型」确认哪些真能免费调用。"
     : (MODEL_STATE.showOk && !MODEL_STATE.showLimited && limN
         ? `另有 ${limN} 个模型暂时受限（限流/冷却中），点上方「受限」查看。`
-        : "当前筛选下没有符合条件的模型，试试调整上方的「可用/受限/不可用」开关或搜索词。");
+        : (unN && !MODEL_STATE.showUnlinked
+            ? `另有 ${unN} 个 OpenRouter 免费模型本机还没接入，点上方「未接入」查看。`
+            : "当前筛选下没有符合条件的模型，试试调整上方的「可用/受限/不可用/未接入」开关或搜索词。"));
   $("#pg-info").textContent = total ? `${PAGE.n*PAGE.size+1}-${PAGE.n*PAGE.size+rows.length} / ${total}` : "";
   $("#model-rows").innerHTML = rows.map((m, i) => {
+    if (m.unlinked) return _unlinkedRow(m, i);   // 未接入：本机没渠道能提供 → 只读情报行
     const lat = bestLat(m);
     const st = m.status === "ok" ? "ok" : (m.status === "down" ? "down" : "limited");
     const stLabel = st === "ok" ? "免费可调"
@@ -858,6 +1600,13 @@ function renderModels(){
           : "");
     // 特点 chips（档位与 AA 分合成一个 chip：一行里少占 ~50px，术语在 hover 里解释）
     const chips = [];
+    // 雷达命中的 OpenRouter 免费模型：标出「免费/匿名测试/免费路由器」+「新」
+    // （原来这两样只出现在顶部横幅的清单里，2026-10-07 二改后随清单一起并进本表）
+    if (m._free){
+      chips.push(_freeKindChip(m._free));
+      if (m._free.is_new) chips.push(
+        `<span class="tag-chip fb-new" title="本机第一次见到：${_freeAgoTs(m._free.first_seen)}（距今不到 ${(fm && fm.new_days) || 7} 天）">新</span>`);
+    }
     chips.push(tierChip(m));
     chips.push(isFinite(lat) ? `<span class="tag-chip" title="响应延迟（流式请求为首字节时间 TTFT）">${fmtLatency(lat)}</span>` : `<span class="tag-chip">—</span>`);
     if (m.vision) chips.push('<span class="tag-chip ok" title="支持图像输入（能看图）">👁</span>');
@@ -883,19 +1632,19 @@ function renderModels(){
     const pinTitle = pinScope() === "vision"
       ? "视觉专属收藏（★=已收藏）：只影响这一屏排序与 auto-vision 的切换顺序，与其它视图的收藏互不影响"
       : "收藏置顶（★=已收藏）：影响均衡/智能/稳定/速度四个视图与对应 auto 策略";
-    const pinBtn = `<button class="btn${isPinned(m.id)?' pinned':''}" style="padding:4px 8px" title="${pinTitle}" onclick="togglePin('${esc(m.id)}')">${isPinned(m.id)?'★':'☆'}</button>`;
+    const pinBtn = `<button class="btn${isPinned(m.id)?' pinned':''}" style="padding:4px 8px" title="${pinTitle}" data-pin="${esc(m.id)}">${isPinned(m.id)?'★':'☆'}</button>`;
     const oneline = (m.channels||[]).length <= 4;
-    return `<tr>
+    return `<tr data-row-model="${esc(m.id)}">
       <td class="muted small" style="width:44px">${PAGE.n*PAGE.size+i+1}</td>
       <td>
         <span class="light-dot ${st}" title="${esc(stTitle)}"></span>
-        <b style="font-size:14px" class="mono click-copy" onclick="copyText('${esc(m.id)}')" title="点击复制">${esc(m.id)}</b>
-        ${m.isAlias?' <span class="badge">别名</span>':''}${stChip}
+        <b style="font-size:14px" class="mono click-copy" data-copy="${esc(m.id)}" title="点击复制">${esc(m.id)}</b>
+        ${m.isAlias?' <span class="badge">别名</span>':''}<span class="st-chip">${stChip}</span>
       </td>
       <td><div class="small" style="display:flex; gap:5px; flex-wrap:wrap">${chips.join("")}${oneline ? (chChips ? '<span class="tag-sep"></span>' + chChips : "") : ""}</div>
           ${(!oneline && chChips) ? '<div class="small" style="display:flex; gap:5px; flex-wrap:wrap; margin-top:6px">'+chChips+'</div>' : ''}</td>
       <td style="text-align:center">${pinBtn}</td>
-      <td style="white-space:nowrap"><button class="btn" onclick="testModel('${esc(m.id)}', this)" ${m.isAlias?'disabled':''}>测试</button></td>
+      <td style="white-space:nowrap"><button class="btn test-btn" data-model="${esc(m.id)}" ${m.isAlias?'disabled':''}>测试</button></td>
     </tr>`;
   }).join("");
   // 测试台模型下拉：只列「当前可调」模型，按当前视图顺序（同列表口径）
@@ -904,54 +1653,92 @@ function renderModels(){
     .map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`);
   $("#pg-model").innerHTML = opts.join("") || '<option value="">（暂无可用模型）</option>';
   if (cur && opts.find(o => o.includes(`value="${esc(cur)}"`))) $("#pg-model").value = cur;
+  // 表刚被整表重建（含第 1618 行那个 30 秒静默刷新）→ 立刻把行内状态补回去。
+  // 少了这一句就会出现「还在读秒、圆点却不呼吸」（用户 15:1x 报的那个 bug）。
+  _rowRepaint();
 }
 $("#model-search").oninput = renderModels;
 $("#pg-prev").onclick = () => { if (PAGE.n > 0){ PAGE.n--; renderModels(); } };
-$("#pg-next").onclick = () => { const total = (overview?.models||[]).length + (overview?.aliases||[]).length;
-  if ((PAGE.n+1) * PAGE.size < total){ PAGE.n++; renderModels(); } };
+// 「下一页」按**当前筛选后**的条数判断（原来用 overview 全量长度，筛过之后还能翻到空页）
+$("#pg-next").onclick = () => { if ((PAGE.n+1) * PAGE.size < _lastFilteredTotal){ PAGE.n++; renderModels(); } };
 
 // ---- 单模型测试（按钮） ----
+// 结果**只写进那一行**（2026-09-26 第三轮，用户：「既然行内已经显示状态了，悬浮的那个就不用留了」）。
+//   点击瞬间 → 该行圆点转黄并呼吸、状态 chip 走秒表（`测试中 · Ns`）；
+//   结果到了 → 圆点绿/红，chip 落成「实测可用 / 实测不可用」，悬停给渠道、延迟（或失败原因）与时刻。
+// 比浮层可靠的三点：① 原地反馈，视线不用挪；② 不会消失（保留 90 秒，见 _ROW_RESULT_TTL）；
+// ③ 「测试」按钮就在那一行，反馈与操作天然一一对应，不存在「弹到别处没看见」。
+// 因此这里**一次 toast 都不弹**：连「已受理」也不需要 —— 行内秒表就是受理回执。
 async function testModel(model, btn){
   if (btn) { btn.disabled = true; btn.textContent = "..."; }
+  _rowTestBusy(model);   // 行内立刻进入「测试中」，带秒表
+  let detail = "";
   try {
     const r = await api("/api/models/test", {model});
-    const note = r.note ? `\n${r.note}` : "";
-    // 渠道名：后端按「未记硬失败的渠道优先、逐个试、第一个成功即返回」的顺序走，
-    // 成功时显示的就是真正被打到的那条。
+    // 悬停给全量细节（行内只有几个字，塞不下）：结论 + 时刻 + 渠道 + 延迟/原因
+    const at = new Date().toLocaleTimeString("zh-CN", {hour12:false});
+    detail = r.available
+      ? `实测可用 · ${at}${r.channel ? " · " + r.channel : ""} · ${fmtLatency(r.latency_ms || 0)}`
+      : `实测不可用 · ${at}${r.channel ? " · 最后试到 " + r.channel : ""}：${(r.error || "原因未知").slice(0, 300)}`;
     // 失败时（2026-09-21 起口径：试完所有渠道才定论）后端附 `attempts` —— 逐条列出来，
     // 只报最后一条会让人以为「只试了一条」，而口径是「所有渠道都失败才算不可用」。
     const tries = r.attempts || [];
-    const more = tries.length > 1
-      ? "\n已试 " + tries.length + " 条渠道：" + tries.map(
-          t => `${t.channel || "?"}（${(t.error || "").slice(0, 60)}）`).join("；")
-      : "";
-    toast(r.available ? `✔ ${model} 可用 · ${r.channel||""} ${fmtLatency(r.latency_ms||0)}${note}`
-                       : `✘ ${model} 不可用${r.channel?`（最后试到 ${r.channel}）`:""}：${(r.error||"").slice(0,120)}${more}${note}`);
-    await loadOverview();
-  } catch(e){ toast("测试失败："+e.message); }
-  finally { if (btn) { btn.disabled = false; btn.textContent = "测试"; } }
+    if (tries.length > 1){
+      detail += "\n已试 " + tries.length + " 条渠道：" + tries.map(
+        t => `${t.channel || "?"}（${(t.error || "").slice(0, 60)}）`).join("；");
+    }
+    if (r.note) detail += "\n" + r.note;
+    _rowTestDone(model, !!r.available, detail);
+  } catch(e){
+    detail = `测试失败 · ${new Date().toLocaleTimeString("zh-CN", {hour12:false})}：${e.message}`;
+    _rowTestDone(model, false, detail);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "测试"; }
+  }
+  // 刷列表：成功 = 服务端真值重建整表（行内结论由 `_rowRepaint()` 补回去，还在）；
+  // 失败 = 保留行内结论，并在**行内**标注「这一屏的其它数字可能是旧的」——
+  // 已经不弹浮层了，这句提醒必须有落点，否则整页看起来都像最新的。
+  try { await loadOverview(); }
+  catch(e){
+    const p = _rowParts(model);
+    if (p && p.chip)
+      p.chip.innerHTML += ' <span class="tag-chip bad" title="列表刷新失败：本行是刚才的实测结果，但页面其它状态可能不是最新的">⚠ 列表未刷新</span>';
+  }
 }
 // 批量：对当前显示页里未测试的模型各发一次
 $("#pg-test-all").onclick = async () => {
   const targets = (overview?.models||[]).filter(m => !m.tested && m.any_channel_available);
   if (!targets.length) { toast("没有未测试的模型"); return; }
   if (!confirm(`将对 ${targets.length} 个未测试模型各发一次探测（会消耗少量额度），继续？`)) return;
-  const btn = $("#pg-test-all"); btn.disabled = true; btn.textContent = "测试中…";
+  const btn = $("#pg-test-all"); btn.disabled = true;
+  // 进度写进按钮本身（「测试中 · 3/12」）：批量跑几十秒到几分钟，光看按钮变灰不知道走到哪了。
+  const setProg = (done, total) => { btn.textContent = `测试中 · ${done}/${total}`; };
+  setProg(0, targets.length);
   let ok = 0, fail = 0, done = 0;
   const worker = async () => {
     while (done < targets.length){
       const m = targets[done++];
+      setProg(done - 1, targets.length);
+      _rowTestBusy(m.id);   // 行内同步转「测试中」（不在当前页的行会安全跳过）
       try {
         const r = await api("/api/models/test", {model: m.id});
         if (r.available) ok++; else fail++;
-      } catch { fail++; }
+        _rowTestDone(m.id, !!r.available,
+          r.available ? `实测可用${r.channel ? " · " + r.channel : ""}`
+                      : `实测不可用：${(r.error || "原因未知").slice(0, 200)}`);
+      } catch (e) {
+        fail++;
+        _rowTestDone(m.id, false, `测试失败：${e.message}`);
+      }
+      setProg(done, targets.length);
       await new Promise(r => setTimeout(r, 200));  // 串行限速，避免集中撞限流
     }
   };
-  await worker();  // 单 worker 串行（原 3 路并发会集中打爆限流）
-  btn.disabled = false; btn.textContent = "测试未测";
-  toast(`完成：可用 ${ok} 个，不可用 ${fail} 个`);
-  await loadOverview();
+  try { await worker(); }               // 单 worker 串行（原 3 路并发会集中打爆限流）
+  finally { btn.disabled = false; btn.textContent = "测试未测"; }
+  toast(`完成：可用 ${ok} 个，不可用 ${fail} 个`, {anchor: btn, ms: 6000,
+        kind: fail ? "err" : "ok"});
+  try { await loadOverview(); } catch(e){ /* 保持行内结论 */ }
 };
 
 // ---- 设置 ----
@@ -1066,7 +1853,8 @@ async function scanChannel(cid){
   renderScanLine(cid);
   const btn2 = $("#scan-btn-"+cid);  // 期间 DOM 可能已重渲染，重新拿一次
   if (btn2) { btn2.disabled = false; btn2.textContent = "扫描全部模型"; }
-  toast(`扫描完成：可用 ${scanState[cid].ok} / ${N}（结果保留在渠道卡片上）`);
+  toast(`扫描完成：可用 ${scanState[cid].ok} / ${N}（结果保留在渠道卡片上）`,
+        {anchor: btn2, ms: 7000, kind: scanState[cid].ok ? "ok" : "err"});
   await loadOverview();
 }
 
@@ -1088,7 +1876,7 @@ function renderAliases(){
       <td class="mono">${esc(a.name)}</td>
       <td class="muted small">${esc(a.targets.join("、"))}</td>
       <td style="width:80px"><span class="dot ${a.available?'on':'off'}"></span>${a.available?'可用':'不可用'}</td>
-      <td style="width:70px"><button class="btn danger" onclick="delAlias('${esc(a.name)}')">删除</button></td>
+      <td style="width:70px"><button class="btn danger" data-alias-del="${esc(a.name)}">删除</button></td>
     </tr>`).join("") : '<tr><td class="empty">暂无别名。不同平台的同一模型可以用别名归并成组。</td></tr>';
 }
 async function delAlias(name){
@@ -1096,6 +1884,12 @@ async function delAlias(name){
   try { await api("/api/aliases/"+encodeURIComponent(name), undefined, "DELETE"); await loadOverview(); toast("已删除"); }
   catch(e){ toast(e.message); }
 }
+// 别名也是**用户自己输入的**，同样不能拼进 onclick（esc 不转义单引号，一个 `Tom's-glm` 就废）。
+// 委托挂在 #alias-rows（静态 tbody，只换 innerHTML，不随渲染消失）。
+$("#alias-rows").addEventListener("click", e => {
+  const b = e.target.closest("[data-alias-del]");
+  if (b) delAlias(b.dataset.aliasDel);
+});
 
 // ---- 渠道 ----
 function initChannelForm(){
@@ -1149,25 +1943,46 @@ const KEY_URLS = {
   agnes:"https://agnes-ai.com/doc/quickstart",
   custom:""};
 
+// 渠道排序的拖拽状态（定义在 renderChannels 之前：let 有 TDZ，放到后面会在首次渲染时炸）
+let _chDnd = null, _chDndPending = false;
+
 function renderChannels(){
   const list = overview?.channels || [];
-  $("#channel-list").innerHTML = list.map(ch => {
+  if (_chDnd) { _chDndPending = true; return; }   // 拖动中不让 30s 轮询重建卡片（松手后再补刷）
+  $("#channel-list").innerHTML = list.map((ch, i) => {
     let st, color = "var(--muted)";
     const cooled = ch.cool_until && ch.cool_until > Date.now()/1000;
     if (!ch.enabled) st = '已停用';
-    else if (cooled) { st = '限流熔断中（账号级限流）'; color = "var(--warn)"; }
+    // 冷却原因由后端给（"魔粒余额不足" / "渠道级 429 熔断（N 个模型同窗口受限）"…）。
+    // 以前写死「账号级限流」，用户看不出是**额度真没了**还是**同时撞了限速**——两者的
+    // 应对完全不同（一个去领魔粒/等明天，一个等十分钟就好）。缺原因时退回通用说法。
+    else if (cooled) { st = `冷却中（${esc(ch.cool_reason || "账号级限流")}）`; color = "var(--warn)"; }
     else if (ch.valid === true) { st = '连接正常'; color = "var(--ok)"; }
     else if (ch.valid === false) { st = '连接失败'; color = "var(--bad)"; }
     else st = '未检测';
     const stCls = cooled ? "off" : (ch.valid===true ? "on" : (ch.valid===false ? "off" : "unknown"));
     const quota = ch.enabled ? fmtQuota(ch.quota) : '<span class="muted small">—</span>';
-    return `<div class="card">
+    // 额外模型的两条来源（手填 + 自动补全探活通过的），都用中性色 —— 它们不是错误。
+    // 只有上游压根没给 /models 时才附带说明 list_error，免得用户以为扫描坏了。
+    const _em = ch.extra_models || [], _aa = ch.auto_added || [];
+    const extraLine = (_em.length || _aa.length || ch.list_error)
+      ? `<div class="small muted" style="margin-bottom:6px">`
+        + (_em.length ? `手填模型 ${_em.length} 个：<span class="mono">${esc(_em.join(", "))}</span>` : "")
+        + (_aa.length ? `${_em.length ? "　" : ""}自动补全 ${_aa.length} 个：<span class="mono">${esc(_aa.join(", "))}</span>` : "")
+        + (ch.list_error ? `　（上游未提供模型列表：${esc(String(ch.list_error).slice(0,80))}）` : "")
+        + `</div>`
+      : "";
+    return `<div class="card" data-cid="${ch.id}">
       <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap">
+        <span class="drag-handle" data-ch-handle title="按住拖动，调整渠道顺序">⠿</span>
+        <span class="ch-ord" title="当前顺序：数字越小越靠前">${i+1}</span>
         <strong>${esc(ch.name)}</strong>
         <span class="badge">${PRESETS[ch.type]||ch.type}</span>
         <span class="small" style="color:${color}; display:flex; align-items:center"><span class="dot ${stCls}"></span>${st}</span>
         <span class="muted small">${fmtLatency(ch.latency_ms)} · ${ch.models_count} 个模型（已测 ${(overview?.models||[]).filter(m=>(m.channels||[]).some(c=>c.channel_id===ch.id)&&m.tested).length} · 可用 ${ch.models_available_count ?? 0}）· 检查于 ${fmtTime(ch.last_check)}</span>
-        <span style="margin-left:auto; display:flex; gap:8px">
+        <span style="margin-left:auto; display:flex; gap:8px; align-items:center">
+          <button class="btn mini" data-ch-move="-1" data-cid="${ch.id}" title="上移一位"${i===0?" disabled":""}>↑</button>
+          <button class="btn mini" data-ch-move="1" data-cid="${ch.id}" title="下移一位"${i===list.length-1?" disabled":""}>↓</button>
           <button class="btn" onclick="testCh('${ch.id}')">测试</button>
           <button class="btn" onclick="scanChannel('${ch.id}')" id="scan-btn-${ch.id}">扫描全部模型</button>
           <button class="btn" onclick="quotaCh('${ch.id}')">刷新额度</button>
@@ -1177,6 +1992,7 @@ function renderChannels(){
         </span>
       </div>
       <div class="mono small muted" style="margin-bottom:6px">${esc(ch.base_url)} · Key: ${esc(ch.key_masked)}</div>
+      ${extraLine}
       <div class="small scan-prog" id="scanprog-${ch.id}" style="display:none; margin-bottom:6px"></div>
       ${ch.error ? `<div class="small" style="color:var(--bad); margin-bottom:6px">${esc(ch.error)}</div>` : ""}
       ${ch.quota_error ? `<div class="small" style="color:var(--warn); margin-bottom:6px">额度: ${esc(ch.quota_error)}</div>` : ""}
@@ -1195,6 +2011,11 @@ function formBody(){
   const b = { type: $("#ch-type").value, name: $("#ch-name").value,
     base_url: $("#ch-base").value, api_key: $("#ch-key").value, enabled: $("#ch-enabled").checked };
   if (editingId && !b.api_key) delete b.api_key;  // 编辑留空=不修改
+  // 额外模型：始终发送（空串 = 清空）。后端按中英文逗号/分号/空白切分去重，
+  // 所以这里原样送用户输入即可，不用在前端猜分隔符。
+  b.extra_models = $("#ch-extra").value.trim();
+  // 自动补全开关（默认交给后端取 true，这里始终显式发送，用户关掉才能生效）
+  b.auto_models = $("#ch-auto").checked;
   return b;
 }
 $("#ch-save").onclick = async () => {
@@ -1240,12 +2061,18 @@ $("#ch-test").onclick = async () => {
 $("#ch-cancel").onclick = resetForm;
 function resetForm(){ editingId = null; $("#ch-form-title").textContent="添加渠道";
   $("#ch-name").value=""; $("#ch-key").value=""; $("#ch-base").value=DEFAULT_BASE[$("#ch-type").value]||"";
-  $("#ch-enabled").checked=true; $("#ch-cancel").style.display="none"; setChResult(""); }
+  $("#ch-enabled").checked=true; $("#ch-extra").value=""; $("#ch-auto").checked=true;
+  $("#ch-key").placeholder = "sk-…";
+  $("#ch-cancel").style.display="none"; setChResult(""); }
 function editCh(id){
   const ch = (overview?.channels||[]).find(c=>c.id===id); if(!ch) return;
   editingId = id; $("#ch-form-title").textContent = "编辑渠道";
   $("#ch-type").value = ch.type; $("#ch-name").value = ch.name;
   $("#ch-base").value = ch.base_url; $("#ch-key").value = ""; $("#ch-key").placeholder = "留空则不修改";
+  // 额外模型回填（后端存的是数组，表单是单行文本）；
+  // 自动补全开关：老配置没有这个字段 = 默认开（后端也是 `ch.get("auto_models", True)`）
+  $("#ch-extra").value = (ch.extra_models||[]).join(", ");
+  $("#ch-auto").checked = ch.auto_models !== false;
   $("#ch-enabled").checked = ch.enabled; $("#ch-cancel").style.display="inline-block";
   window.scrollTo({top:0, behavior:"smooth"});
 }
@@ -1256,10 +2083,406 @@ async function toggleCh(id, enabled){ try{ await api("/api/channels/"+id, {enabl
 async function delCh(id){ if(!confirm("确定删除该渠道？")) return;
   try{ await api("/api/channels/"+id, undefined, "DELETE"); await loadOverview(); toast("已删除"); }catch(e){toast(e.message);} }
 
+// ── 渠道排序：拖动把手 + 上移/下移按钮 2026-10-02 ────────────────────────
+// 顺序**就是** config.json 里 channels 数组的顺序（/api/overview 原样输出），
+// 改完 POST /api/channels/reorder 落盘，刷新/重启都保持。
+//
+// ⚠️ 别把它当成「强制路由优先级」：真正选路是按综合分排（速度/稳定/能力，见
+//    gateway.candidates_for），渠道顺序只在**综合分并列**时决定谁先被试
+//    （Python sort 是稳定排序）。它管的是「看的时候谁在上面」+ 同分时的次序。
+// ⚠️ 排序接口只接受「现有渠道的一一重排」：多发、少发、重复 ID 都会被 400 拒绝，
+//    防止一次手滑的拖动静默丢掉一个渠道。
+function _chIdsFromDom(){
+  return [...document.querySelectorAll("#channel-list .card[data-cid]")].map(c => c.dataset.cid);
+}
+// 拖拽只是 insertBefore 搬 DOM 节点，序号文本和 ↑/↓ 的禁用态是渲染时写死的 ——
+// 不就地重算，松手后会出现「排到最后一张、序号还写着 1」这种界面与实际打架的情况
+// （2026-10-02 真机验证抓到的）。这里只改文本/属性，不重建卡片（拖拽中重建会把
+// 正在拖的那张卡从光标底下抽走）。走「上移/下移按钮」的路径不需要它 —— 那条路是
+// 全量 renderChannels()。
+function _reindexChannels(){
+  const cards = [...document.querySelectorAll("#channel-list .card[data-cid]")];
+  cards.forEach((c, i) => {
+    const o = c.querySelector(".ch-ord"); if (o) o.textContent = i + 1;
+    const up = c.querySelector('[data-ch-move="-1"]'), dn = c.querySelector('[data-ch-move="1"]');
+    if (up) up.disabled = (i === 0);
+    if (dn) dn.disabled = (i === cards.length - 1);
+  });
+}
+async function saveChannelOrder(ids, prev){
+  try { await api("/api/channels/reorder", {ids}, "POST"); toast("渠道顺序已保存"); }
+  catch(e){
+    // 失败就退回改动前的顺序（别留一个「界面变了、磁盘没变」的假象）
+    if (prev) { overview.channels = prev; renderChannels(); }
+    const m = String((e && e.message) || e || "");
+    // 后端路由是**进程启动时注册一次**的：改了 app/main.py 却没重启服务时，新接口在
+    // 旧进程里压根不存在 —— 请求会落到 /api/channels/{cid}（只注册了 PUT/DELETE）上，
+    // 回 405 Method Not Allowed（或 404）。这跟自己点错无关，所以别甩原始英文报错，
+    // 直接给出能照做的解法。
+    // ⚠️ 2026-10-02 实际踩到：前端是服务端现读磁盘的，刷新就出新 UI（拖动把手、↑↓
+    //    按钮都看得见），后端却还是几小时前启动的旧路由表 → 看得见、存不下。
+    if (/Method Not Allowed|Not Found/i.test(m)) {
+      toast("后端还是旧版本，没有这条接口：右键任务栏托盘的 API Hub 图标 →「重启服务」，再试一次", 12000);
+    } else {
+      toast("顺序保存失败：" + m);
+    }
+  }
+}
+function moveChannel(cid, dir){
+  const list = overview?.channels || [];
+  const i = list.findIndex(c => c.id === cid), j = i + dir;
+  if (i < 0 || j < 0 || j >= list.length) return;   // 首位上移 / 末位下移：静默忽略
+  const prev = list.slice(), next = list.slice();
+  next.splice(j, 0, next.splice(i, 1)[0]);
+  overview.channels = next;
+  renderChannels();                                  // 乐观更新：先动界面，再落盘
+  saveChannelOrder(next.map(c => c.id), prev);
+}
+
+(function initChannelDnD(){
+  const wrap = document.querySelector("#channel-list");
+  if (!wrap) return;
+  let card = null, prevOrder = null, startY = 0, moved = false;
+
+  wrap.addEventListener("pointerdown", e => {
+    const h = e.target.closest("[data-ch-handle]");
+    if (!h) return;
+    card = h.closest(".card[data-cid]");
+    if (!card) return;
+    e.preventDefault();                              // 别让浏览器起原生拖拽/选文本
+    _chDnd = { cid: card.dataset.cid };
+    prevOrder = (overview?.channels || []).slice();
+    startY = e.clientY; moved = false;
+    document.body.classList.add("ch-dragging");
+    card.classList.add("dragging");
+  });
+
+  window.addEventListener("pointermove", e => {
+    if (!_chDnd || !card) return;
+    if (!moved && Math.abs(e.clientY - startY) < 4) return;   // 4px 死区：防手抖把顺序拖乱
+    moved = true;
+    // 拖到视口上下边缘 → 自动滚页。渠道通常十几个，卡片总高远超一屏，
+    // 没有这个就只能拖到屏幕边缘干瞪眼（2026-10-02 加）。
+    if (e.clientY < 90) window.scrollBy(0, -14);
+    else if (e.clientY > window.innerHeight - 90) window.scrollBy(0, 14);
+    // 被拖的卡带 pointer-events:none，所以这里命中的一定是它下面真正的卡
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const tgt = el && el.closest ? el.closest("#channel-list .card[data-cid]") : null;
+    if (!tgt || tgt === card) return;
+    const r = tgt.getBoundingClientRect();
+    const after = e.clientY > r.top + r.height / 2;   // 越过中线才换位，避免抖动
+    tgt.parentNode.insertBefore(card, after ? tgt.nextSibling : tgt);
+    _reindexChannels();                               // 序号 / ↑↓ 禁用态跟着 DOM 立刻重算
+  });
+
+  function end(){
+    if (!_chDnd) return;
+    document.body.classList.remove("ch-dragging");
+    if (card) card.classList.remove("dragging");
+    const domIds = _chIdsFromDom();
+    const curIds = (overview?.channels || []).map(c => c.id);
+    card = null; _chDnd = null;
+    if (moved && domIds.join() !== curIds.join()) {
+      const byId = new Map((overview.channels || []).map(c => [c.id, c]));
+      overview.channels = domIds.map(id => byId.get(id)).filter(Boolean);
+      saveChannelOrder(domIds, prevOrder);
+    }
+    // 拖动期间被跳过的轮询刷新，这里补一次（否则界面数据要等下一个 30s 周期）
+    if (_chDndPending) { _chDndPending = false; loadOverview().catch(()=>{}); }
+  }
+  window.addEventListener("pointerup", end);
+  window.addEventListener("pointercancel", end);
+
+  // 上移 / 下移按钮（事件委托；不用内联 onclick —— 内联属性里的引号转义踩过坑）
+  wrap.addEventListener("click", e => {
+    const b = e.target.closest("[data-ch-move]");
+    if (!b || b.disabled) return;
+    moveChannel(b.dataset.cid, Number(b.dataset.chMove));
+  });
+})();
+
 // ---- 统计 ----
 // 静默刷新时按块比对签名，只有内容真变了才重绘，避免每几秒重建 DOM 造成闪烁
-const _statSig = { cards: "", chart: "", model: "", channel: "" };
+const _statSig = { cards: "", chart: "", legend: "", model: "", channel: "", donut: "" };
 let _statSeq = 0;   // 请求序号：慢响应回来时若已有更新的请求，丢弃本次结果
+let _lastSummary = null;   // 最近一次 /api/usage 响应：切口径 / 展开时就地重画，不再打一次网络
+// 每日请求量的时间粒度：null = 按区间自动（≤45 天逐日 / >45 天按周 / >240 天按月），
+// 用户在卡片右上点了 日/周/月 就锁定为那个值（不持久化，刷新回自动）。
+let _chartGrain = null;
+
+// ── 统计图表（2026-10-02 加：渠道 = 环形图，模型 = 横向排行条）──────────────
+// 三条设计约束，别改回去：
+//   ① 渠道配色按**渠道名**缓存（_chColor），不按数组下标发色。切到 Tokens 口径时排序会变，
+//      按下标发色会让同一个渠道换颜色，环形图和表格色块就对不上暗号了。
+//   ② 这两张图必须走 _statSig 签名比对再写 DOM；且本块 CSS 不许有 transition ——
+//      统计页每 5s 静默刷新（startLogPolling），否则整块一直在闪。
+//   ③ 百分比分母一律取 totals，**不能**对 by_model / by_channel 求和 —— by_model 是 LIMIT 20，
+//      求和会静默少算（长尾被截掉），数看着对、其实是错的。
+const CH_COLORS = ["#EF9F27", "#378ADD", "#1D9E75", "#7F77DD", "#D85A30", "#D4537E", "#639922", "#B4B2A9"];
+const _chColor = new Map();
+function chColor(name){
+  let c = _chColor.get(name);
+  if (!c){
+    const i = _chColor.size;   // 首次出现顺序 = 默认口径（requests 降序）→ 大渠道拿到前面的醒目色
+    c = i < CH_COLORS.length ? CH_COLORS[i] : `hsl(${(i * 47) % 360} 42% 52%)`;
+    _chColor.set(name, c);
+  }
+  return c;
+}
+const _statMetric = { channel: "requests", model: "requests" };   // 口径切换（不持久化，刷新回默认）
+let _statModelAll = false;                                        // 模型卡：false = Top8 + 其他
+
+function fmtCompact(n){
+  n = Number(n) || 0;
+  // 不带空格、且 ≥100 万时不再留小数 —— 渠道表 Tokens 列只有 ~56px 可用宽，
+  // 「1,649.2 万」会被挤成两行（2026-10-02 截图实测）。精确值都在行 hover 里。
+  if (n >= 1e8) return (n / 1e8).toFixed(2).replace(/\.?0+$/, "") + "亿";
+  if (n >= 1e4) return (n / 1e4 >= 100 ? Math.round(n / 1e4) : (n / 1e4).toFixed(1)) + "万";
+  return fmtNum(n);
+}
+// token 专用的「万」口径（2026-10-10 用户定）：统计页所有 token 数字（柱顶 / tooltip / 图例 /
+// 总 Tokens 卡）一律以万为单位、带 1 位小数 —— 单位统一才好比，全量数位反而没法互相参照。
+// 只用于统计页 token；渠道表 / 日志表仍用 fmtCompact / fmtNum（各自语境已定型，不跟这波改）。
+function fmtWan(n){
+  return (Number(n || 0) / 1e4).toFixed(1).replace(/\.0$/, "") + "万";
+}
+function fmtPct(v, total){ return (total ? v * 100 / total : 0).toFixed(1) + "%"; }
+// 延迟分级（阈值与圆点一致）：绿 ≤10s / 黄 10–30s / 红 >30s。表格里用文字版，排行条里用圆点版。
+function latText(ms){
+  if (!ms) return '<span class="muted">—</span>';
+  const cls = ms > 30000 ? "lat-slow" : ms > 10000 ? "lat-mid" : "lat-fast";
+  return `<span class="${cls}">${fmtLatency(Math.round(ms))}</span>`;
+}
+// 延迟分级圆点。tokens 恒为 0 的一律判红：有调用记录却一个字没产出，比「慢」更该被看见。
+function latDot(ms, zero){
+  if (zero) return `<span class="dot slow" title="有调用记录，但 token 恒为 0 —— 基本是没产出"></span>`;
+  if (!ms)  return `<span class="dot unknown" title="没有成功样本，测不出延迟"></span>`;
+  const cls = ms > 30000 ? "slow" : ms > 10000 ? "mid" : "fast";
+  return `<span class="dot ${cls}" title="平均延迟 ${fmtLatency(Math.round(ms))}"></span>`;
+}
+// 环形图：纯 SVG + stroke-dasharray，零依赖。
+// ⚠️ 前端是单文件离线应用（全篇没有 <script src>），**不要引 Chart.js / ECharts 之类的 CDN**。
+function donutSVG(items, total, centerTop, centerSub){
+  const S = 180, SW = 26, R = (S - SW) / 2 - 2, CX = S / 2, CY = S / 2;
+  const C = 2 * Math.PI * R, t = Math.max(1, total), GAP = 2.5;
+  let acc = 0, segs = "";
+  for (const it of items){
+    const len = it.value * C / t;
+    if (len < 0.6) continue;   // 极小的片（如「阿里百炼 1 次」）不画，画了也只有一根肉眼看不见的毛刺
+    const seg = Math.max(0.6, len - GAP);   // 留 GAP 的缝，片与片之间才不会粘成一整块
+    segs += `<circle cx="${CX}" cy="${CY}" r="${R}" fill="none" stroke="${it.color}" stroke-width="${SW}"`
+          + ` stroke-dasharray="${seg.toFixed(2)} ${(C - seg).toFixed(2)}" stroke-dashoffset="${(-acc).toFixed(2)}">`
+          + `<title>${esc(it.name)}｜${fmtNum(it.value)}（${fmtPct(it.value, t)}）</title></circle>`;
+    acc += len;
+  }
+  return `<svg viewBox="0 0 ${S} ${S}" width="${S}" height="${S}" role="img" aria-label="渠道占比环形图">`
+       + `<g transform="rotate(-90 ${CX} ${CY})">${segs}</g>`
+       + `<text x="${CX}" y="${CY - 3}" text-anchor="middle" font-size="19" font-weight="600" fill="var(--text)">${centerTop}</text>`
+       + `<text x="${CX}" y="${CY + 16}" text-anchor="middle" font-size="11.5" fill="var(--muted)">${centerSub}</text>`
+       + `</svg>`;
+}
+
+// 渠道：环形图 + 紧凑表格（表格每行带色块，色块颜色 === 环形图同一片 → 图和表能对上）
+// 排序、占比、环形的片序都跟当前口径走，所以切口径时「谁第一」会当场换人。
+function renderChannel(s){
+  const t = s.totals || {}, m = _statMetric.channel, isTok = m === "tokens";
+  const total = isTok ? (t.tokens || 0) : (t.requests || 0);
+  const list = (s.by_channel || []).slice().sort((a, b) => (b[m] || 0) - (a[m] || 0));
+  if (!list.length) return { donut: "", tbl: '<tr><td colspan="5" class="empty">暂无数据</td></tr>' };
+  const donut = donutSVG(
+    list.map(r => ({ name: r.name, value: r[m] || 0, color: chColor(r.name) })),
+    total, isTok ? fmtCompact(total) : fmtNum(total), isTok ? "tokens" : "次请求");
+  const tbl = list.map(r => `<tr title="请求 ${fmtNum(r.requests)} 次 · Tokens ${fmtNum(r.tokens)}${r.errors ? " · 失败 " + fmtNum(r.errors) + " 次" : ""}">
+      <td class="mono"><span class="sw" style="background:${chColor(r.name)}"></span>${esc(r.name)}</td>
+      <td class="num ${isTok ? "muted small" : "on"}">${fmtNum(r.requests)}</td>
+      <td class="num ${isTok ? "on" : "muted small"}" title="${fmtNum(r.tokens)}">${fmtCompact(r.tokens)}</td>
+      <td class="num muted small">${fmtPct(r[m] || 0, total)}</td>
+      <td class="num muted small">${latText(r.avg_latency)}</td>
+    </tr>`).join("");
+  return { donut, tbl };
+}
+
+// 模型：横向排行条。20 项 + 极端长尾（前 2 名占 71%），饼图会糊成一圈缝衣线 → 用排行条。
+// 默认只画 Top 8 + 「其他」折叠行，点展开看全部。
+function renderModel(s){
+  const t = s.totals || {}, m = _statMetric.model, isTok = m === "tokens";
+  const total = isTok ? (t.tokens || 0) : (t.requests || 0);
+  const all = (s.by_model || []).slice().sort((a, b) => (b[m] || 0) - (a[m] || 0));
+  if (!all.length) return { rank: '<div class="empty">暂无数据</div>', foot: "" };
+  const max = Math.max(1, ...all.map(r => r[m] || 0));
+  const shown = _statModelAll ? all : all.slice(0, 8);
+  const rest  = _statModelAll ? [] : all.slice(8);
+  const line = (name, v, pct, cls, dot, tip) =>
+    `<div class="rk ${cls}" title="${esc(tip)}">
+       <span class="rk-dot">${dot}</span><span class="rk-name">${esc(name)}</span>
+       <span class="rk-track"><i class="rk-bar${cls.indexOf("other") >= 0 ? " other" : ""}" style="width:${(v * 100 / max).toFixed(2)}%"></i></span>
+       <span class="rk-n">${fmtNum(v)}</span><span class="rk-p">${pct}</span></div>`;
+  let rank = shown.map((r, i) => {
+    const v = r[m] || 0, zero = !r.tokens, lat = Math.round(r.avg_latency || 0);
+    const tip = `${r.model}\n请求 ${fmtNum(r.requests)} 次 · Tokens ${fmtNum(r.tokens)}\n平均延迟 ${lat ? fmtLatency(lat) : "—"}`
+              + (r.errors ? `\n失败 ${fmtNum(r.errors)} 次` : "")
+              + (zero ? "\ntoken 恒为 0（有调用但没产出）" : "");
+    return line(r.model, v, fmtPct(v, total), `${i < 2 ? "top" : ""}${zero ? " zero" : ""}`, latDot(lat, zero), tip);
+  }).join("");
+  if (rest.length){
+    const rv = rest.reduce((a, b) => a + (b[m] || 0), 0);
+    rank += line(`其他 ${rest.length} 个模型`, rv, fmtPct(rv, total), "other", "",
+      `其余 ${rest.length} 个模型合计：请求 ${fmtNum(rest.reduce((a, b) => a + b.requests, 0))} 次 ·`
+      + ` Tokens ${fmtNum(rest.reduce((a, b) => a + b.tokens, 0))}`);
+  }
+  const top2  = all.slice(0, 2).reduce((a, b) => a + (b[m] || 0), 0);
+  const zeros = all.filter(r => !r.tokens);
+  const foot = `<div class="rk-foot"><span>前 2 名 = <b style="color:var(--accent)">${fmtPct(top2, total).replace(/\.0%$/, "%")}</b>`
+             + (zeros.length ? ` · 长尾 ${zeros.length} 个模型 ${fmtNum(zeros.reduce((a, b) => a + b.requests, 0))} 次调用产出 0 token` : "")
+             + `</span><button class="chip-btn" id="md-expand">${_statModelAll ? "只看前 8" : `展开全部 ${all.length} 个`}</button></div>`;
+  return { rank, foot };
+}
+
+// 口径 chip / 展开按钮用事件委托挂在 document 上 —— #stat-model 的 innerHTML 每次重绘都会重建，
+// 直接给按钮绑 onclick 会在下一次静默刷新之后失效。
+document.addEventListener("click", e => {
+  const btn = e.target.closest(".chip-btn[data-m]");
+  if (btn){
+    const grp = btn.closest("[data-metric]");
+    if (grp){
+      const which = grp.dataset.metric;
+      if (_statMetric[which] !== btn.dataset.m){
+        _statMetric[which] = btn.dataset.m;
+        grp.querySelectorAll(".chip-btn").forEach(b => b.classList.toggle("active", b === btn));
+        _statSig.channel = _statSig.model = _statSig.donut = "";   // 强制重画（内容本就变了，这里只是兜底）
+        paintStats(_lastSummary);
+      }
+      return;
+    }
+  }
+  if (e.target.closest("#md-expand")){ _statModelAll = !_statModelAll; paintStats(_lastSummary); }
+});
+
+// 「每日请求量」的时间粒度 chip（日/周/月）。chip 本身是静态 HTML，但沿用同一套事件委托，
+// 和上面口径 chip 保持一致；点了就地重画（_lastSummary 已有数据，不再打一次网络）。
+document.addEventListener("click", e => {
+  const btn = e.target.closest(".chip-btn[data-g]");
+  if (!btn) return;
+  const g = btn.dataset.g;
+  if (_chartGrain === g) return;          // 已经是锁定状态就不再折腾
+  _chartGrain = g;                        // null（自动）→ 具体粒度 也会走到这里，即「锁定」
+  btn.closest(".grp").querySelectorAll(".chip-btn").forEach(b => b.classList.toggle("active", b === btn));
+  paintStats(_lastSummary);
+});
+// 自动粒度也要让对应 chip 亮起来，否则用户不知道现在看的是「日」还是「周」。
+function syncGrainChips(grain){
+  const grp = $("#chart-grain");
+  if (!grp) return;
+  grp.querySelectorAll(".chip-btn").forEach(b => b.classList.toggle("active", b.dataset.g === grain));
+}
+
+// 柱顶数字自动避让（2026-10-10 七改引入 / 八改两轮重写）。
+// 数字贴各自柱顶后，相邻柱高相近时数字会横向相撞（实际柱距 ≥44px < 最宽数字 ≈55px，纯 CSS 无解）
+// → 渲染后统一解排一遍。**铁律：凡 x 相交（视觉上会对比）的标签对，「柱序 = 数字序」恒成立**
+// ——柱矮的数字不得高于柱高的。七改只保证「相撞的对」有序，被抬过的数字跟旁边不相撞但
+// x 相交的标签仍会形成倒挂（用户抓到的「矮的比高的更高」），八改把约束扩到全部 x 相交对。
+// 算法：按柱锚 bottom（data-b）**从低到高**落位，矮柱数字先贴柱不动；后来者对每个 x 相交的
+// 已落位者：自己柱更高 → 抬到对方顶上 2px；自己柱更矮/等高却被别的链抬过了头 → 水平让位。
+// 抬升封顶 112px（再高顶出图区），到顶仍无解 → tryShiftX 在 ±20px 内找 x 空档（x 分离即无约束）。
+// 基准存 data-b / dataset.dx，y 反推、dx 归零后重算 → 函数可重入，不怕签名缓存跳过 DOM 重建。
+function _declutterLabels(){
+  const box = $("#chart");
+  if (!box || box.classList.contains("dense")) return;
+  const br = box.getBoundingClientRect();
+  const items = [...box.querySelectorAll(".bar-pair > .bar-val")].map(el => {
+    const r = el.getBoundingClientRect();
+    const b = parseFloat(el.dataset.b || el.style.bottom) || 0;
+    const prevDx = parseFloat(el.dataset.dx || 0);   // 上轮烘进 left 的偏移，量 x 时扣除归零
+    return { el, b, h: r.height || 11, w: r.width,
+             x: r.left - br.left - prevDx, lift: 0, dx: 0, fb: b };
+  }).sort((a, z) => (a.b - z.b) || (a.x - z.x));   // 八改核心：矮者先落位；同高左先（右边让左边）
+  const placed = [];
+  // 水平让位：垂直方向无解（封顶/序冲突）→ ±20px 内左右平移，挪到与所有 x 相交者都不冲突。
+  // 20px ≈ 半个槽位，再远数字就明显离开自己的柱了；颜色 + 近柱位置兜底归属。
+  const tryShiftX = (it) => {
+    const fb = it.b + it.lift;
+    let best = null;
+    for (let dx = -20; dx <= 20; dx += 2) {
+      if (!dx) continue;
+      const nx = it.x + dx, nr = nx + it.w;
+      const ok = placed.every(p => {
+        if (nr <= p.x + 1 || p.x + p.w <= nx + 1) return true;   // x 分离 → 无约束
+        return it.b >= p.b ? fb >= p.fb + p.h + 2 : fb + it.h <= p.fb - 2;
+      });
+      if (ok && (best === null || Math.abs(dx) < Math.abs(best))) best = dx;
+    }
+    if (best === null) return false;
+    it.x += best; it.dx += best;
+    return true;
+  };
+  for (const it of items) {
+    for (let guard = 0; guard < 6; guard++) {      // 级联：抬完可能又顶到更高的，最多 6 轮
+      let need = 0, stuck = false;
+      const fb = it.b + it.lift;
+      for (const p of placed) {
+        if (it.x + it.w <= p.x + 1 || p.x + p.w <= it.x + 1) continue;   // x 不相交 → 无约束
+        if (it.b >= p.b) {                       // 自己柱更高：数字底必须在 p 数字顶上 2px
+          need = Math.max(need, (p.fb + p.h + 2) - fb);
+        } else if (fb + it.h > p.fb - 2) {       // 自己柱更矮却被抬过头：垂直方向无解
+          stuck = true; break;
+        }
+      }
+      if (!stuck && need <= 0) break;
+      const capLift = Math.max(0, 112 - it.b);
+      if (!stuck && it.lift < capLift) { it.lift = Math.min(it.lift + need, capLift); continue; }
+      if (tryShiftX(it)) break;                  // 封顶/序冲突：改试水平让位
+      break;                                     // 挪不开：残留一处（极端连日等高才发生）
+    }
+    it.fb = it.b + it.lift;
+    if (it.lift || it.dx) {
+      it.el.style.bottom = Math.round(it.fb) + "px";
+      // left 烘进 dx（rv 基准 -2px / tv 基准 +7px，与 CSS 类一致）；重跑时整体重算，覆盖无损
+      const base = it.el.classList.contains("rv") ? "-2px" : "7px";
+      const dx = Math.round(it.dx);
+      it.el.style.left = dx >= 0 ? `calc(50% + ${base} + ${dx}px)`
+                                 : `calc(50% + ${base} - ${-dx}px)`;
+      it.el.dataset.dx = dx;
+    }
+    placed.push(it);
+  }
+}
+
+function _dailyTip(d){
+  return `${d.date}：${d.requests} 次请求，${fmtWan(d.tokens)} tokens，${d.errors} 次失败`
+    + (d.cancelled ? `，${d.cancelled} 次客户端中断` : "")
+    + (d.superseded ? `（其中 ${d.superseded} 次已换路）` : "");
+}
+
+// 把逐日数据聚合到「周」或「月」——「全量累计」时逐日柱会有几百根，糊成一团没法看。
+// 周：以**周一**为一周之始；月：自然月。label 取区间起点，tooltip 里点明这是「合计」及覆盖范围，
+// 免得把「一周 300 次」误读成「某天 300 次」。
+function _aggDaily(daily, grain){
+  const keyOf = ds => {
+    if (grain === "month") return ds.slice(0, 7);            // YYYY-MM
+    const p = ds.split("-").map(Number);
+    const dt = new Date(p[0], p[1] - 1, p[2]);
+    dt.setDate(dt.getDate() - ((dt.getDay() + 6) % 7));      // 回退到本周一（getDay: 周日=0）
+    return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,"0")}-${String(dt.getDate()).padStart(2,"0")}`;
+  };
+  const m = new Map();
+  for (const d of daily){
+    const k = keyOf(d.date || "");
+    if (!m.has(k)) m.set(k, { from: k, requests: 0, tokens: 0, errors: 0, cancelled: 0, superseded: 0, n: 0 });
+    const o = m.get(k);
+    o.requests += d.requests || 0; o.tokens += d.tokens || 0; o.errors += d.errors || 0;
+    o.cancelled += d.cancelled || 0; o.superseded += d.superseded || 0; o.n++;
+  }
+  return [...m.values()].sort((a, b) => a.from < b.from ? -1 : 1).map(o => ({
+    lbl: grain === "week" ? o.from.slice(5) : o.from,
+    // ⚠️ cancelled 必须带出来：柱子要按 成功/中断/失败 三层上色，漏了它就少一层。
+    //    tokens 同理：2026-10-10 起双柱，token 柱要用它定高。
+    requests: o.requests, errors: o.errors, cancelled: o.cancelled, tokens: o.tokens,
+    tip: (grain === "week" ? `本周（自 ${o.from} 起，含 ${o.n} 天）合计` : `${o.from} 当月合计`)
+       + `：${o.requests} 次请求，${fmtWan(o.tokens)} tokens，${o.errors} 次失败`
+       + (o.cancelled ? `，${o.cancelled} 次客户端中断` : "")
+       + (o.superseded ? `（其中 ${o.superseded} 次已换路）` : "")
+  }));
+}
 
 async function loadStats(silent){
   const days = $("#stat-days").value;
@@ -1272,6 +2495,14 @@ async function loadStats(silent){
     return;
   }
   if (seq !== _statSeq) return;
+  paintStats(s);
+}
+
+// 画统计页。从 loadStats 里抽出来，是为了「切口径 / 展开全部」能用缓存的 _lastSummary 就地重画，
+// 不用为一个纯前端交互再打一次 /api/usage。
+function paintStats(s){
+  if (!s) return;
+  _lastSummary = s;
   const t = s.totals || {};
   // 统计口径 = 按「模型×尝试」：这一跳失败就是失败（含后面换了渠道的那几次）。
   //   cancelled  = 客户端主动中断（用户点停止/客户端超时），上游其实正常 → 不算失败
@@ -1285,29 +2516,100 @@ async function loadStats(silent){
             + (superseded?`<span title="这些失败里有几次后面又换到了别的候选渠道（明细里带小字「已换路」）；失败归属不变，仍计在失败数里">（其中 ${fmtNum(superseded)} 次已换路）</span>`:"");
   const cards = `
     <div class="stat"><div class="num">${fmtNum(t.requests)}</div><div class="lbl">总请求数</div></div>
-    <div class="stat"><div class="num">${fmtNum(t.tokens)}</div><div class="lbl">总 Tokens</div></div>
+    <div class="stat"><div class="num">${fmtWan(t.tokens)}</div><div class="lbl">总 Tokens</div></div>
     <div class="stat"><div class="num" style="color:${t.errors?'var(--bad)':'inherit'}">${fmtNum(t.errors)}</div><div class="lbl">失败请求${sub}</div></div>
     <div class="stat"><div class="num">${rate}</div><div class="lbl">成功率</div></div>`;
   if (cards !== _statSig.cards) { _statSig.cards = cards; $("#stat-cards").innerHTML = cards; }
-  // 柱状图
+  // 柱状图。粒度：_chartGrain 有值就用它（用户在卡片右上点了 日/周/月），否则按区间自动：
+  //    ≤45 天逐日、>45 天按周、>240 天按月。合计值与覆盖范围都写进 tooltip，不会把「一周 300 次」看错成一天。
+  //    ⚠️ 自动聚合不再是「防糊」的唯一手段 —— 现在柱子固定宽 + 横向滚动兜底，逐日再多也不会挤扁。
   const daily = s.daily || [];
-  const max = Math.max(1, ...daily.map(d=>d.requests));
-  const chart = daily.length ? daily.map(d => `
-    <div class="bar-wrap" title="${d.date}：${d.requests} 次请求，${fmtNum(d.tokens)} tokens，${d.errors} 次失败${d.cancelled?`，${d.cancelled} 次客户端中断`:''}${d.superseded?`（其中 ${d.superseded} 次已换路）`:''}">
-      <div class="bar ${d.errors?'err':''}" style="height:${Math.max(12, d.requests*100/max)}%">
-        <span class="bar-val">${d.requests}</span>
+  const grain = _chartGrain || (daily.length > 240 ? "month" : daily.length > 45 ? "week" : "day");
+  syncGrainChips(grain);
+  const bars = grain === "day" ? daily.map(d => ({
+      lbl: (d.date || "").slice(5), requests: d.requests, errors: d.errors,
+      cancelled: d.cancelled || 0, tokens: d.tokens || 0, tip: _dailyTip(d)
+    })) : _aggDaily(daily, grain);
+  // ⚠️ 高度必须给 px，不能给 %：.bar-wrap 的高度是 auto（.chart 是 flex-end，不拉伸子项），
+  //    百分比高度在这种父级下解析失败 → 所有柱子都会塌成 min-height，图看起来"在动"其实全是等高。
+  //    BAR_MAX 96 = chart 140 − 日期 13 − wrap gap 4 − 柱顶数字悬浮 ≈14 − 余量 13。
+  //    （六改后数字贴柱顶、绝对定位悬浮在 pair 上方，不占布局高度；token 峰值实占 ≈83，因 15% 余量。）
+  const BAR_MAX = 96;
+  // 2026-10-10 三改：单柱拆双柱（左请求 / 右 Tokens）。两组**各自归一化**——请求按请求峰值、
+  //    token 按 token 峰值（两者量级差 3~4 个数量级，共享比例时请求柱永远矮成一条线）。
+  //    这张图没有 y 轴，读数靠柱顶数字 + tooltip，各归各的才成立；等高 ≠ 等量，全量看图例。
+  //    四改（用户实测「请求柱比 token 柱还高，不符合直觉」）：请求峰值压到 token 峰值的**六成**
+  //    （SCALE_R ≈ 50px vs SCALE_T ≈ 83px）——体量大的系列理应视觉占主导，请求柱只表达
+  //    「逐日相对走势」，不再跟 token 柱争高度；系列内三段比例不变。
+  //    九改（用户：仍有几天请求柱高过 token 柱）：六成只压住了**峰值日**，压不住「请求多而
+  //    token 少」的日子 → **逐日封顶**：每天请求系列的比例 r 取「全局比例」与
+  //    「(token柱高 − 3px) / 请求数」的较小者，保证 h ≤ th−3 < th 恒成立；封顶日的
+  //    失败/中断两段按同一 r 缩（同比例），压不进时按占比挤掉（<6px 的柱看不出分层，
+  //    明细在 tooltip 里不丢）。全局六成保留：决定非封顶日的整体走势形态。
+  const maxR = Math.max(1, ...bars.map(d=>d.requests));
+  const maxT = Math.max(1, ...bars.map(d=>d.tokens || 0));
+  const SCALE_T = BAR_MAX / 1.15;          // tokens 峰值 ≈83px（15% 余量防破框）
+  const SCALE_R = BAR_MAX * 0.6 / 1.15;    // 请求峰值 ≈50px（全局压低，见上）
+  // 日期标签抽稀：按**实际柱距**算（不是按根数拍脑袋）。
+  // 2026-10-10 六改：slot 下限 28→36（与 .bar-wrap flex-basis 同步），实际柱距恒 ≥44px，
+  // 两组数字（最宽 ≈42px）放得下 ⇒ step 恒为 1、数字**常显**（此前 30 天视图数字全藏，
+  // 用户不满）；柱子多时整图出横向滚动条 —— 图本就有滚动机制，宽一点换数字常显，值。
+  const availW = ($("#chart-scroll") || {}).clientWidth || 1218;
+  const slot = Math.max(36, (availW - (bars.length - 1) * 8) / Math.max(1, bars.length));
+  const step = Math.max(1, Math.ceil(44 / (slot + 8)));
+  const chart = bars.length ? bars.map((d, i) => {
+    // token 柱先算（请求柱的逐日封顶要拿它当顶）。min 5px：给请求柱留出「低于它」的空间。
+    const th = Math.max(5, Math.round((d.tokens || 0) * SCALE_T / maxT));
+    // 请求系列比例：全局六成 与「(th−3)/请求数」取小 → h ≤ th−3，请求柱恒低于 token 柱（九改）。
+    // 封顶日等价于整柱压到 th−3；非封顶日维持全局六成形态。系列内三段仍同比例。
+    const r  = Math.min(SCALE_R / maxR, (th - 3) / (d.requests || 1));
+    let  eh  = d.errors    ? Math.max(2, Math.round(d.errors    * r)) : 0;
+    let  ch  = d.cancelled ? Math.max(2, Math.round(d.cancelled * r)) : 0;
+    const h  = Math.max(3, Math.round(d.requests * r));
+    // 分层两段压不进（h 太小）时按占比挤掉：tiny 柱看不出分层，数字进 tooltip。
+    if (eh + ch > h - 2) { const f = (h - 2) / (eh + ch); eh = Math.floor(eh * f); ch = Math.floor(ch * f); }
+    // 数字贴各自柱顶：rv 底 = 请求柱顶+3，tv 底 = token柱顶+3（八改去掉旧的「tv 至少抬到
+    // 请求柱顶+13」特判——token 柱矮时它把矮柱数字强抬到高柱数字上方，正是「矮的比高的
+    // 更高」的倒挂源之一；两数字太近时由 _declutterLabels 统一让**柱高者**上抬，序恒不倒）。
+    return `
+    <div class="bar-wrap" title="${d.tip}">
+      <div class="bar-pair">
+        <span class="bar-val rv" data-b="${h + 3}" style="bottom:${h + 3}px">${fmtCompact(d.requests)}</span>
+        <div class="bar-col">
+          <div class="bar" style="height:${h}px">
+            ${eh ? `<i class="seg err" style="height:${eh}px"></i>` : ""}
+            ${ch ? `<i class="seg cancel" style="height:${ch}px"></i>` : ""}
+            <i class="seg ok"></i>
+          </div>
+        </div>
+        <div class="bar-col">
+          <div class="bar bar-tok" style="height:${th}px"></div>
+        </div>
+        <span class="bar-val tv" data-b="${th + 3}" style="bottom:${th + 3}px">${fmtWan(d.tokens || 0)}</span>
       </div>
-      <div class="bar-lbl">${d.date?.slice(5)}</div></div>`).join("")
+      <div class="bar-lbl">${i % step === 0 ? d.lbl : "&nbsp;"}</div></div>`; }).join("")
     : '<div class="empty">暂无数据</div>';
   if (chart !== _statSig.chart) { _statSig.chart = chart; $("#chart").innerHTML = chart; }
-  const rows = (arr, nameKey) => arr.length ? arr.map(r => `<tr>
-      <td class="mono">${esc(r[nameKey])}</td><td>${fmtNum(r.requests)} 次</td>
-      <td>${fmtNum(r.tokens)} tk</td><td class="muted small">${r.avg_latency?fmtLatency(Math.round(r.avg_latency)):"—"}</td></tr>`).join("")
-    : '<tr><td class="empty">暂无数据</td></tr>';
-  const modelTbl = rows(s.by_model||[], "model");
-  if (modelTbl !== _statSig.model) { _statSig.model = modelTbl; $("#stat-model").innerHTML = modelTbl; }
-  const chTbl = rows(s.by_channel||[], "name");
-  if (chTbl !== _statSig.channel) { _statSig.channel = chTbl; $("#stat-channel").innerHTML = chTbl; }
+  const chartBox = $("#chart");
+  if (chartBox) chartBox.classList.toggle("dense", step > 1);
+  _declutterLabels();   // 七改：柱顶数字碰撞解排（函数可重入；dense 时内部直接跳过）
+  // 图例：请求柱三种颜色标数量 + Tokens 柱的合计。请求合计口径与 totals 一致
+  // （成功 = 请求 − 失败 − 客户端中断），中断为 0 时不显示那一项，免得常年挂一个 0。
+  // 双柱各自按峰值归一化，等高 ≠ 等量 —— 全量数字以图例 / tooltip 为准。
+  const okN = Math.max(0, (t.requests || 0) - (t.errors || 0) - cancelled);
+  const legend = bars.length ? `<div class="chart-legend">
+      <span class="lg"><i class="lg-ok"></i>成功 ${fmtNum(okN)}</span>
+      <span class="lg"><i class="lg-bad"></i>失败 ${fmtNum(t.errors || 0)}</span>
+      ${cancelled ? `<span class="lg"><i class="lg-cancel"></i>客户端中断 ${fmtNum(cancelled)}</span>` : ""}
+      <span class="lg"><i class="lg-tok"></i>Tokens ${fmtWan(t.tokens || 0)}</span>
+    </div>` : "";
+  if (legend !== _statSig.legend) { _statSig.legend = legend; $("#chart-legend").innerHTML = legend; }
+  const ch = renderChannel(s);
+  if (ch.donut !== _statSig.donut) { _statSig.donut = ch.donut; $("#stat-channel-donut").innerHTML = ch.donut; }
+  if (ch.tbl !== _statSig.channel) { _statSig.channel = ch.tbl; $("#stat-channel").innerHTML = ch.tbl; }
+  const md = renderModel(s);
+  const mdHtml = md.rank + md.foot;
+  if (mdHtml !== _statSig.model) { _statSig.model = mdHtml; $("#stat-model").innerHTML = mdHtml; }
 }
 $("#stat-days").onchange = () => loadStats(false);   // 不能直接挂 loadStats：onchange 会把 event 当 silent 传进去
 
@@ -1359,6 +2661,9 @@ async function loadLogs(silent){
                 : ''))}</td>
     </tr>`;
     }).join("");
+    // 行数变了 → 重套一次高度。务必在写入 innerHTML **之后**再测，行高才准。只改显示、不写存储。
+    _applyLogHeight(_logRowsPref());
+    _syncLogGrip();
     if (!silent && btn) toast(`已刷新：${logs.length} 条请求记录`);
   } catch(e) {
     if (!silent && btn) toast("日志加载失败：" + e.message);
@@ -1367,6 +2672,170 @@ async function loadLogs(silent){
   }
 }
 $("#logs-refresh").onclick = () => loadLogs(false);
+
+// ══ 最近请求：下边框拖拽把手（上下拖动改变可见行数）2026-10-02 ══════════════════
+// 把手与高度都挂在 #log-grip / #log-scroll（#log-rows 的父级静态层），
+// 因为日志每 3s 静默重建 #log-rows 的 innerHTML —— 放进去会被冲掉（高度会跳回全高）。
+const LOG_ROWS_KEY = "ah_log_rows";
+const LOG_MIN_ROWS = 2;      // 最少显示 2 行
+const LOG_DEF_ROWS = 12;     // 默认 / 双击恢复
+function _logRowsPref(){
+  const v = parseInt(localStorage.getItem(LOG_ROWS_KEY) || "", 10);
+  return v >= LOG_MIN_ROWS ? v : LOG_DEF_ROWS;
+}
+function _logRowCount(){ return document.querySelectorAll("#log-rows tr").length; }
+function _logRowH(){          // 单行实际高度；空表 / 未渲染时兜底 35
+  const tr = document.querySelector("#log-rows tr");
+  const h = tr ? tr.getBoundingClientRect().height : 0;
+  return h > 12 ? h : 35;
+}
+function _logTheadH(){        // sticky 表头高度；兜底 34
+  const th = document.querySelector(".log-scroll thead");
+  const h = th ? th.getBoundingClientRect().height : 0;
+  return h > 8 ? h : 34;
+}
+function _clampLogRows(r){
+  return Math.min(Math.max(r, LOG_MIN_ROWS), Math.max(LOG_MIN_ROWS, _logRowCount()));
+}
+function _setLogRowsLabel(r){
+  const n = document.querySelector("#log-rows-n");
+  if (n) n.textContent = r + " 行";
+}
+// 只改高度，不写存储 —— 日志刷新后行数变少时，靠它把高度夹回来，但**不能**覆盖用户的设定值
+function _applyLogHeight(rows){
+  const box = document.querySelector("#log-scroll");
+  if (!box) return LOG_MIN_ROWS;
+  if (!_logRowCount()){ box.style.height = ""; return LOG_MIN_ROWS; }   // 空表 → 让高度自适应
+  const r = _clampLogRows(rows);
+  box.style.height = Math.round(_logTheadH() + r * _logRowH()) + "px";
+  _setLogRowsLabel(r);
+  return r;
+}
+function _syncLogGrip(){      // 行数太少时拖不动 → 藏起把手（保持界面干净）
+  const g = document.querySelector("#log-grip");
+  if (g) g.style.display = _logRowCount() > LOG_MIN_ROWS ? "" : "none";
+}
+(function initLogGrip(){
+  const grip = document.querySelector("#log-grip");
+  const box  = document.querySelector("#log-scroll");
+  if (!grip || !box) return;
+  // 以「当前真实可见行数」为拖动基准，而不是存储值（存储值可能被行数夹过）
+  const shownRows = () => Math.max(LOG_MIN_ROWS,
+    Math.round((box.getBoundingClientRect().height - _logTheadH()) / _logRowH()));
+  let startY = 0, startRows = LOG_DEF_ROWS, dragging = false;
+  const onMove = e => {
+    if (!dragging) return;
+    // 吸附到整行：dy 跨过半行才增减一行，避免拖出「半行残影」
+    _applyLogHeight(startRows + Math.round((e.clientY - startY) / _logRowH()));
+  };
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    grip.classList.remove("dragging");
+    document.body.classList.remove("col-resizing");
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    try { localStorage.setItem(LOG_ROWS_KEY, String(_clampLogRows(shownRows()))); } catch(e){}
+  };
+  grip.addEventListener("mousedown", e => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    dragging = true;
+    startY = e.clientY;
+    startRows = shownRows();
+    grip.classList.add("dragging");
+    document.body.classList.add("col-resizing");   // 拖拽期间禁止选中文字
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+  grip.addEventListener("dblclick", () => {        // 双击 → 恢复默认行数
+    _applyLogHeight(LOG_DEF_ROWS);
+    try { localStorage.setItem(LOG_ROWS_KEY, String(LOG_DEF_ROWS)); } catch(e){}
+  });
+  // 窗口宽度变了 → 列可能换行、行高跟着变 → 按设定重算一次（设定值 > 可用行数时会被夹回）
+  let rzT = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(rzT);
+    rzT = setTimeout(() => {
+      if (document.querySelector("#log-rows tr")) _applyLogHeight(_logRowsPref());
+    }, 150);
+  });
+})();
+
+// ══ 按渠道 / 按模型：两卡共用高度（拖任一条下边框把手 → 两卡同高）2026-10-02 ══════
+// 「保持高度一致」的做法：拖动时给**两张卡**设同一个 px 高度，所以永远等高；
+// 两个把手各贴在对应卡片的下边框，但拖哪一条效果都一样（它们在表达同一个量）。
+// ⚠️ 高度设在 .card 上（静态节点）。paintStats 只重写卡片**内部**的 innerHTML，
+//    所以 5s 静默刷新不会把高度冲掉（和上面日志把手同一个思路）。
+const COLS_H_KEY = "ah_cols2_h";
+const COLS_MIN_H = 240;      // 再矮标题行（h2 + chip）会被挤
+const COLS_MAX_H = 1600;
+const COLS_STEP  = 10;       // 吸附步长（px），拖完高度是 10 的整数倍
+function _colsCards(){ return [...document.querySelectorAll(".cols2.hfit > .card")]; }
+function _colsPref(){
+  const v = parseInt(localStorage.getItem(COLS_H_KEY) || "", 10);
+  return v >= COLS_MIN_H ? v : 0;              // 0 / 非法 = 未设定 → 保持自适应
+}
+function _clampColsH(h){
+  return Math.min(Math.max(Math.round(h / COLS_STEP) * COLS_STEP, COLS_MIN_H), COLS_MAX_H);
+}
+function _setColsLabel(h){
+  document.querySelectorAll("[data-cols-grip-n]").forEach(n => {
+    n.textContent = h ? h + " px" : "自动";
+  });
+}
+// 只改高度，不写存储
+function _applyColsH(h){
+  const cards = _colsCards();
+  if (!cards.length) return 0;
+  if (!h){ cards.forEach(c => { c.style.height = ""; }); _setColsLabel(0); return 0; }
+  const H = _clampColsH(h);
+  cards.forEach(c => { c.style.height = H + "px"; });
+  _setColsLabel(H);
+  return H;
+}
+(function initColsGrips(){
+  const grips = [...document.querySelectorAll("[data-cols-grip]")];
+  if (!grips.length) return;
+  _applyColsH(_colsPref());                    // 上次拖过就先套上
+  let startY = 0, startH = 0, dragging = false;
+  const onMove = e => {
+    if (!dragging) return;
+    const dy = Math.round((e.clientY - startY) / COLS_STEP) * COLS_STEP;   // 吸附到 10px
+    _applyColsH(startH + dy);
+  };
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    grips.forEach(g => g.classList.remove("dragging"));
+    document.body.classList.remove("col-resizing");
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    const c = _colsCards()[0];
+    const h = c ? c.getBoundingClientRect().height : 0;
+    try { localStorage.setItem(COLS_H_KEY, String(_clampColsH(h))); } catch(e){}
+  };
+  grips.forEach(grip => {
+    grip.addEventListener("mousedown", e => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      dragging = true;
+      startY = e.clientY;
+      // 基准取「被拖那张卡」的当前高度：两卡不等高时，拖高的那条不会突然缩到矮的那张
+      const c = grip.closest(".card");
+      const h = c ? c.getBoundingClientRect().height : 0;
+      startH = h > 0 ? h : COLS_MIN_H;
+      grips.forEach(g => g.classList.add("dragging"));   // 两条一起高亮（同一状态）
+      document.body.classList.add("col-resizing");
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+    grip.addEventListener("dblclick", () => {            // 双击 → 恢复自适应高度
+      _applyColsH(0);
+      try { localStorage.removeItem(COLS_H_KEY); } catch(e){}
+    });
+  });
+})();
 
 // 统计页打开时自动轮询：日志 3 秒（新记录立刻出现）、统计卡片/图表 5 秒（聚合查询稍重，慢一拍）；
 // 离开统计页停止轮询
