@@ -101,6 +101,17 @@ DEFAULT_CONFIG = {
     # AA 榜分/视觉能力的缓存新鲜度阈值（小时）：超过才去 OpenRouter 公开端点补一次。
     # 榜分是月级更新的，没必要每次刷新都拿；本地缓存永不失效，只是「旧了就去补」。
     "bench_cache_hours": 24,
+    # 免费模型名单的缓存新鲜度（小时）。**跟榜分分开**：榜分月级更新，免费名单是快照
+    # —— OpenRouter 上架/下架很快，隔太久才看一次就会错过一批限时免费的新模型。
+    # 这份数据来自同一个公开端点，所以调小它不会多花请求（见 main._topup_openrouter_public）。
+    "free_models_cache_hours": 6,
+    # 界面上把「第一次见到距今 ≤ 这么多天」的免费模型标成「新面孔」并提示。
+    "free_models_new_days": 7,
+    # 公开模型目录（models.dev）的缓存新鲜度（小时），服务于「自动补全」——
+    # 给「上游 /models 不列免费模型」的渠道（智谱免费档 / Cloudflare Workers AI）找候选，
+    # 见 app/modelcat.py。那是份 5MB 的公开全量文件，平台上下架不快，24h 足够；
+    # 拉不到就退回内置种子，不影响功能。
+    "model_catalog_hours": 24,
     "auth_enabled": True,
     "api_token": "",
     "aliases": {},

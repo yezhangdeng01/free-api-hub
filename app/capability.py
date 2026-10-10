@@ -105,6 +105,34 @@ _bench_last_ok: float = 0.0   # 最近一次成功收割榜分的时间（0 = �
 _dirty = {"v": False}
 
 
+# ---- 匿名测试模型：默认智能档 ----
+# OpenRouter 会把新模型以「匿名 stealth 预览版」的形式零价放出：`pricing` 全 0，却**不带**
+# `:free` 后缀（如 `inclusionai/ling-3.1-flash`）。它们是正式发布前的灰度版，能力通常在前沿，
+# 但名字对下面的启发式完全陌生 —— 会走「无名家族 → 默认轻量」被压成 1 档，界面上看着像小模型
+# （用户 2026-10-07 实测反馈：这批该默认智能档）。
+#
+# 为什么是「推」而不是「拉」：名单在 `freemodels`（它依赖 store 落盘），而这里要保持
+# 「只认名字和榜分」的纯函数性格 —— 让 capability 反向 import freemodels 会成环
+# （freemodels → capability）。所以反过来：谁有名单谁来登记（见 freemodels._feed_tiers）。
+_anon_ids: set = set()
+
+
+def set_anon_models(ids) -> int:
+    """登记「匿名测试模型」的 id 集合（由 `freemodels` 在名单更新 / 重启恢复后喂进来）。
+
+    ⚠️ 先过 `norm_id` 再存：名单来自 OpenRouter 目录（`vendor/name`），而本机渠道返回的可能是
+    别的写法（带 `:free`、带自己的前缀）—— 归一化后才能跨渠道对上，与 `_bench` 同口径。
+    """
+    global _anon_ids
+    _anon_ids = {norm_id(x) for x in (ids or []) if x}
+    return len(_anon_ids)
+
+
+def is_anon(model_id: str) -> bool:
+    """是否属于「匿名测试模型」（OpenRouter 零价放出的预览版，默认走智能档的那批）"""
+    return bool(model_id) and norm_id(model_id) in _anon_ids
+
+
 def tier_overrides(cfg: dict) -> dict:
     """把两张手动档位表合成一张「先精确、后正则」的查询表（喂给 `override_tier`）。
 
@@ -116,7 +144,8 @@ def tier_overrides(cfg: dict) -> dict:
       这里用 `^re.escape(id)$` 转义后再交给同一条匹配路径；
     - 点名赢过批量规则：`re.search` 是**先命中先返回**，所以精确项必须排在前面。
 
-    优先级总表：`model_tier_exact` > `model_tiers` > AA 榜分 > 名字启发式。"""
+    优先级总表：`model_tier_exact` > `model_tiers` > AA 榜分 > 匿名测试模型（默认智能档）
+    > 名字启发式。"""
     cfg = cfg or {}
     out = {}
     for model, t in (cfg.get("model_tier_exact") or {}).items():
@@ -375,6 +404,12 @@ def tier_of(model_id: str, overrides: dict = None) -> int:
     score = _bench.get(norm_id(model_id))
     if score is not None:
         return 3 if score >= _bench_hi else (2 if score >= _bench_mid else 1)
+    # 2.5) 匿名测试模型（OpenRouter 零价放出的 stealth 预览版）：默认智能档。
+    #      故意放在榜分**之后**：真拿到 AA 榜分就以榜分为准（那是实测值，别让一个「默认」压过它）；
+    #      能走到这里说明没榜分 —— 而这类模型恰恰是「新模型发布前的灰度版」，能力在前沿，
+    #      被名字启发式当成「无名家族」压成轻量档是错的。
+    if norm_id(model_id) in _anon_ids:
+        return 3
     # 3) 轻量：小尺寸 SKU / 名字写明 ≤9B（规模决定，与代际无关）
     if _SMALL_SKU.search(model_id):
         return 1

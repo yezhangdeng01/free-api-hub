@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -19,7 +20,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from . import capability
 from . import config as cfgmod
 from . import dialects
-from . import gateway, providers, store, throttle
+from . import freemodels
+from . import gateway, modelcat, providers, store, throttle
 from . import responses as responses_tr
 from .config import PROVIDER_PRESETS
 
@@ -75,8 +77,9 @@ async def _reset_client():
 # ---------------- 后台健康检查 ----------------
 # net_down：连续「整轮全挂且全是本机网络错误」的次数（退避用，成功一轮即清零）；
 # next_check：网络降级期的下一次检查时间（0 = 按 check_interval_minutes 正常排期）
+# last_public：最近一次打 OpenRouter 公开端点的时刻（榜分 + 免费名单共用这一趟请求）
 # （last_probe 也在这里初始化：启动那一轮若抛异常，循环里再取它能少一次 KeyError）
-_bg = {"last_check": 0.0, "last_probe": 0.0, "last_quota": 0.0, "last_bench": 0.0,
+_bg = {"last_check": 0.0, "last_probe": 0.0, "last_quota": 0.0, "last_public": 0.0,
        "net_down": 0, "next_check": 0.0}
 
 
@@ -84,6 +87,11 @@ async def probe_used_models():
     """模型级主动探测：对近期真实用过的模型发 1-token 请求，提前发现已下线的模型。
 
     成本控制：只探测过去 7 天成功调用过的模型，每渠道每轮最多 20 个、max_tokens=1。
+
+    **豁免**：`gateway.probe_exempt(ch_type)` 为真的渠道**整条跳过**（当前只有魔搭）。
+    理由见 `gateway._PROBE_EXEMPT_TYPES` —— 魔搭是魔粒体系，探测同样是真调用、同样烧魔粒，
+    而探出来的状态是噪声（它的 429 是平台动态限速，与我们的调用量无关）。
+    **魔搭只信真实调用的结果**；手动「测试 / 扫描该渠道」不受影响。
     """
     cfg = cfgmod.load_config()
     if not cfg.get("probe_used_models", True):
@@ -92,24 +100,23 @@ async def probe_used_models():
     if not used:
         return
     now = time.time()
+    skipped = []          # 被豁免、本轮没探的渠道（末尾统一打一行日志，便于验证）
     for ch in cfg["channels"]:
         if not ch.get("enabled", True):
+            continue
+        if gateway.probe_exempt(ch.get("type")):
+            skipped.append(ch.get("name") or ch["id"])
             continue
         cs = gateway.channels.get(ch["id"])
         if not cs or not cs.valid or gateway.channel_cooling(ch["id"]):
             continue
-        # 魔搭等按每日请求次数计额度的平台：探测也在烧额度。
-        # 每轮最多探 5 个，且 24 小时内探测成功过的不再重复探
-        is_ms = ch.get("type") == "modelscope"
-        cap = 5 if is_ms else 20
+        cap = 20
         targets = []
         for m in used:
             key = (m, ch["id"])
             if m not in cs.models:
                 continue
             if gateway.cooldown.get(key, 0) > now or key in gateway.channel_down:
-                continue
-            if is_ms and now - gateway.last_probe_ok.get(key, 0) < 86400:
                 continue
             targets.append(m)
             if len(targets) >= cap:
@@ -128,7 +135,7 @@ async def probe_used_models():
                                "max_tokens": 16 if ch.get("type") in ("openrouter", "opencode") else 1},
                     headers=headers)
                 latency = int((time.time() - t0) * 1000)
-                gateway.note_ratelimit_headers(ch["id"], m, r.headers)
+                gateway.note_ratelimit_headers(ch["id"], m, r.headers, ch.get("type"))
                 if r.status_code == 200:
                     bad = _probe_body_ok(r)
                     if bad:
@@ -142,7 +149,6 @@ async def probe_used_models():
                     else:
                         gateway.mark_result(m, ch["id"], True, latency)
                         gateway.mark_model_status(m, True, "", ch.get("name"))
-                        gateway.last_probe_ok[(m, ch["id"])] = time.time()
                         ok_cnt += 1
                 else:
                     kind = _kind_of(r.status_code)
@@ -178,7 +184,8 @@ async def probe_used_models():
                     elif r.status_code == 429:
                         # 渠道级 429 计数（账号级限流熔断）
                         gateway.note_channel_429(ch["id"], m,
-                                                 _parse_retry_after(r.headers))
+                                                 _parse_retry_after(r.headers),
+                                                 ch.get("type"))
                         gateway.mark_model_status(m, True,
                             f"暂时不可用 (HTTP {r.status_code})", ch.get("name"), state="limited")
                     else:
@@ -202,6 +209,9 @@ async def probe_used_models():
                 gateway.mark_model_status(m, True, "连接失败（暂时）", ch.get("name"), state="limited")
                 logger.warning("渠道[%s] 模型[%s] 探测连接失败: %s", ch.get("name"), m, str(e)[:120])
         logger.info("渠道[%s] 模型探测完成: %d/%d 可用", ch.get("name"), ok_cnt, len(targets))
+    if skipped:
+        logger.info("自动探测：跳过豁免渠道 %s（探测也是真调用，会消耗平台额度；"
+                    "手动「测试 / 扫描该渠道」不受影响）", "、".join(skipped))
 
 
 async def refresh_all():
@@ -229,9 +239,11 @@ async def refresh_all():
     # 榜分兜底、渠道健康检查**同时发起**：兜底只要 2~3 秒，渠道检查要 30~40 秒。
     # 若按顺序（先渠道后兜底）走，冷启动后要等全部渠道查完才有分，界面会有半分钟的
     # 「没分了」空窗（2026-09-15 实测：15:47:21 起服务，15:47:58 才补上分）。
+    # 这一趟公开端点同时也把免费模型名单带回来（见 _topup_openrouter_public）。
     await asyncio.gather(
         *(one(c) for c in chs),
-        _topup_bench_cache(cfg),
+        _topup_openrouter_public(cfg),
+        _topup_model_catalog(cfg),
         return_exceptions=True,
     )
     # 自适应评级：用当前全部可见模型刷新「前沿代际」，
@@ -274,38 +286,77 @@ def _note_sweep_health(chs: list, states: list):
                    _bg["net_down"], delay)
 
 
-async def _topup_bench_cache(cfg: dict):
-    """榜分缓存的兜底刷新：渠道那边没喂到新分时才去 OpenRouter 公开端点补一次。
+async def _topup_openrouter_public(cfg: dict):
+    """OpenRouter 公开端点的兜底刷新：**一次请求喂两样**（榜分缓存 + 免费模型名单）。
 
-    这一步存在的意义就是「OpenRouter 挂着也不该丢分」：
-      · 渠道健康 → fetch_models 已经顺带收割了榜分，缓存是新鲜的，这里直接跳过（零额外请求）；
+    为什么两件事合在一起：数据源是同一个 GET（免密钥的公开 /models），各自看本地那份旧不旧，
+    只要有一个过期就拉一次、两个一起更新 —— 绝不为了两个 TTL 去发两次请求。
+
+    为什么两个 TTL 不同（各自独立判断，别合并成一个）：
+      · 榜分（AA 智能指数）是月级数据 → `bench_cache_hours`（默认 24h）足够；
+      · 免费名单是**快照**，OpenRouter 上架/下架都很快 → `free_models_cache_hours`（默认 6h）。
+    榜分这条分支的存在意义仍是「OpenRouter 挂着也不该丢分」：
+      · 渠道健康 → fetch_models 已经顺带收割了榜分，缓存新鲜，这里跳过（零额外请求）；
       · 渠道挂了/停用/Key 失效 → 缓存变旧，从**免密钥**的公开端点补齐；
-      · 公开端点也够不着 → 记一条 warning 继续用本地缓存里的旧分，档位不受影响。
+      · 公开端点也够不着 → 记一条 warning 继续用本地缓存，档位不受影响。
     """
     try:
-        await _topup_bench_cache_inner(cfg)
+        await _topup_openrouter_public_inner(cfg)
     except Exception as e:      # 兜底路径绝不能反过来把主流程带崩
-        logger.warning("榜分兜底异常（继续用本地缓存）: %s", str(e)[:160])
+        logger.warning("公开端点兜底异常（继续用本地缓存）: %s", str(e)[:160])
 
 
-async def _topup_bench_cache_inner(cfg: dict):
-    ttl = max(1, cfg.get("bench_cache_hours", 24))
-    age = capability.cache_age_hours()
-    if age is not None and age < ttl:
-        return
-    now = time.time()
-    if now - _bg.get("last_bench", 0.0) < 600:   # 失败重试闸：10 分钟，别每轮都撞
-        return
-    _bg["last_bench"] = now
+async def _topup_openrouter_public_inner(cfg: dict, force: bool = False):
+    """`force=True` 供界面上的「↻ 刷新」按钮用：跳过 TTL 与失败重试闸，硬拉一次。"""
+    bench_ttl = max(1, cfg.get("bench_cache_hours", 24))
+    free_ttl = max(1, cfg.get("free_models_cache_hours", 6))
+    if not force:
+        bench_age = capability.cache_age_hours()
+        free_age = freemodels.cache_age_hours()
+        # 「从没抓过」也算过期（None）—— 否则新装/清过缓存的机器会一直不去抓。
+        need_bench = bench_age is None or bench_age >= bench_ttl
+        need_free = free_age is None or free_age >= free_ttl
+        if not (need_bench or need_free):
+            return {"ok": True, "skipped": True, "bench": 0, "vision": 0, "free": 0}
+        now = time.time()
+        if now - _bg.get("last_public", 0.0) < 600:   # 失败重试闸：10 分钟，别每轮都撞
+            return {"ok": True, "skipped": True, "bench": 0, "vision": 0, "free": 0}
+    _bg["last_public"] = time.time()
     st_before = capability.cache_status()
+    free_before = freemodels.view()["total"]
     info = await providers.fetch_bench_public(shared_client)
     if info["ok"]:
-        logger.info("榜分兜底：公开源补入 %d 个榜分 / %d 个视觉标记（缓存此前 %s 小时未更新）",
-                    info["bench"], info["vision"],
+        # 立刻落盘：免费名单里的「首次见到时间」是提示逻辑的基准，晚 30 秒（后台循环那拍）
+        # 才写的话，用户在这个窗口里关掉软件，下次会把同一批模型再提示一遍。
+        freemodels.save_cache()
+        logger.info("公开端点兜底：补入 %d 个榜分 / %d 个视觉标记 / %d 个免费模型"
+                    "（榜分缓存此前 %s 小时未更新）",
+                    info["bench"], info["vision"], info.get("free", 0),
                     "∞" if st_before["age_h"] is None else st_before["age_h"])
     else:
-        logger.warning("榜分兜底失败：继续使用本地缓存（%d 个榜分 / %d 个视觉标记）",
-                       st_before["bench"], st_before["vision_ok"] + st_before["vision_no"])
+        logger.warning("公开端点兜底失败：继续使用本地缓存（%d 个榜分 / %d 个视觉标记 / %d 个免费模型）",
+                       st_before["bench"], st_before["vision_ok"] + st_before["vision_no"],
+                       free_before)
+    return info
+
+
+async def _topup_model_catalog(cfg: dict, force: bool = False):
+    """公开模型目录（models.dev）的后台刷新：给「自动补全」提供候选。
+
+    跟免费模型雷达一个套路：TTL（`model_catalog_hours`，默认 24h）到了才拉，
+    拉不到就继续用磁盘上的旧目录，再不行还有 `modelcat.SEED` 兜底 ——
+    这份目录只是「锦上添花」，**绝不能反过来把渠道检查带崩**。
+    """
+    try:
+        ttl = max(1, cfg.get("model_catalog_hours", 24))
+        age = modelcat.cache_age_hours()
+        if not force and age is not None and age < ttl:
+            return {"ok": True, "skipped": True}
+        await modelcat.refresh(shared_client)
+        return {"ok": True, "skipped": False}
+    except Exception as e:
+        logger.warning("公开模型目录刷新失败（继续用本地缓存 / 内置种子）: %s", str(e)[:160])
+        return {"ok": False, "error": str(e)[:160]}
 
 
 async def _bg_loop():
@@ -336,6 +387,7 @@ async def _bg_loop():
                 _bg["net_down"] = 0
             gateway.flush_runtime_state()  # 把挂起的冷却/失败状态落盘（脏了才写）
             capability.save_cache()        # 榜分/视觉能力脏了才写
+            freemodels.save_cache()        # 免费模型名单（含「首次见到」时间）脏了才写
             cfg = cfgmod.load_config()
             check_iv = max(1, cfg.get("check_interval_minutes", 30)) * 60
             probe_iv = max(1, cfg.get("probe_interval_minutes", 60)) * 60
@@ -389,6 +441,28 @@ async def lifespan(app: FastAPI):
                            "等渠道检查或公开榜分源补数据（不影响启动）")
     except Exception as e:
         logger.warning("能力榜单缓存恢复失败（不影响启动，将重新收割）: %s", e)
+    # 免费模型雷达缓存：名单 + **每个模型的本地首次见到时间**。这一份更要紧的是后者 ——
+    # 不恢复的话，重启后全站免费模型都会重新算「今天刚发现」，界面上的「新面孔」提示
+    # 会变成每次开软件都刷一遍的噪音。
+    try:
+        fm = freemodels.load_cache()
+        if fm["loaded"]:
+            logger.info("已恢复免费模型名单：%d 个在架（含首次见到时间，供「新面孔」提示）",
+                        fm["total"])
+    except Exception as e:
+        logger.warning("免费模型名单恢复失败（不影响启动，将重新收割）: %s", e)
+    # 公开模型目录（自动补全的候选来源）：恢复后第一轮渠道检查就能用上，不必等后台那趟 topup。
+    # 空目录也不影响 —— 还有 modelcat.SEED 顶着（智谱那几条就是这么来的）。
+    try:
+        cat = modelcat.load_cache()
+        n = sum(len(v) for v in cat.values())
+        if n:
+            logger.info("已恢复公开模型目录：%d 个平台 / %d 个标价 0 的模型（%.1f 小时前抓的）",
+                        len(cat), n, modelcat.cache_age_hours() or 0)
+        else:
+            logger.info("公开模型目录为空：将按 TTL 抓取（离线时用内置种子）")
+    except Exception as e:
+        logger.warning("公开模型目录恢复失败（不影响启动）: %s", e)
     gateway.restore_model_status()  # 恢复已测模型状态，重启不丢
     gateway.restore_runtime_state()  # 恢复冷却/待验证/渠道级硬失败（扫描结果重启不丢）
     # 稳定分回填：稳定分只认真实调用，而历史真实调用都在 usage.db 里。重启后窗口是空的，
@@ -503,6 +577,30 @@ async def chat_completions(request: Request):
     return await dialects.chat.convert(await _chat_v1(chat_body, request, cfg), ctx)
 
 
+def _apply_channel_caps(body: dict, ch: dict) -> dict:
+    """渠道级参数钳制（目前只有 max_tokens）。
+
+    「客户端不发 max_tokens → 上游用启动参数兜底」是一类真实的翻车现场：
+    KVMem 的 `-n` 一旦等于 `--kvmem-gen-reserve`，长提示词下单轮申请会顶满预留池，
+    触发 rc3 的 CUDA 越界、整个服务进程直接死掉（2026-09-23 实测 3 次，
+    n_prompt=19391/19349/19353 + n_predict=16384 → illegal memory access）。
+    在渠道里写 `"max_tokens": N` 即可把**任何路径**进来的请求都钳到 N 以内 ——
+    这是唯一一层不依赖客户端自觉的防线。
+
+    只在「缺省」或「超过上限」时补写，不把客户端主动设的小值放大。
+    返回 dict 而非就地改写：body 在候选循环里被复用，就地改会串到下一个渠道。
+    """
+    cap = ch.get("max_tokens")
+    if not isinstance(cap, int) or cap <= 0:
+        return body
+    cur = body.get("max_tokens")
+    if isinstance(cur, int) and 0 < cur <= cap:
+        return body
+    out = dict(body)
+    out["max_tokens"] = cap
+    return out
+
+
 async def _chat_v1(body: dict, request: Request, cfg: dict | None = None):
     model = body.get("model")
     if not model:
@@ -556,7 +654,8 @@ async def _chat_v1(body: dict, request: Request, cfg: dict | None = None):
 
         if is_stream:
             try:
-                req = shared_client.build_request("POST", url, json=body, headers=headers)
+                req = shared_client.build_request("POST", url, json=_apply_channel_caps(body, ch),
+                                                  headers=headers)
                 resp = await shared_client.send(req, stream=True)
             except Exception as e:
                 _fail(cid, name, upstream_model, model, t0, errors, f"connect: {e}", exc=e,
@@ -565,7 +664,7 @@ async def _chat_v1(body: dict, request: Request, cfg: dict | None = None):
             if resp.status_code != 200:
                 raw = (await resp.aread()).decode("utf-8", "ignore")[:300]
                 ra = _parse_retry_after(resp.headers)
-                gateway.note_ratelimit_headers(cid, upstream_model, resp.headers)
+                gateway.note_ratelimit_headers(cid, upstream_model, resp.headers, ch.get("type"))
                 await resp.aclose()
                 _classify(cid, name, upstream_model, model, t0, errors,
                           resp.status_code, raw, ra, ch_type=ch.get("type"),
@@ -574,7 +673,7 @@ async def _chat_v1(body: dict, request: Request, cfg: dict | None = None):
             # 收到 200 = 「上游接受了这次请求」→ 只更新可用性（解冷却/转绿），**不写稳定分**：
             # 真正的成败要等 _stream_gen 跑完（中途断流算失败）。
             gateway.mark_result(upstream_model, cid, True, source="probe")
-            gateway.note_ratelimit_headers(cid, upstream_model, resp.headers)
+            gateway.note_ratelimit_headers(cid, upstream_model, resp.headers, ch.get("type"))
             ms = gateway.get_model_status(upstream_model)
             if ms is not None and ms.get("state") == "down":
                 gateway.mark_model_status(upstream_model, True, "", name)  # 真实成功 → 解除遗留 down
@@ -584,19 +683,19 @@ async def _chat_v1(body: dict, request: Request, cfg: dict | None = None):
                 headers={"X-Api-Hub-Channel": _hdr(name), "X-Api-Hub-Model": _hdr(upstream_model)})
         else:
             try:
-                r = await shared_client.post(url, json=body, headers=headers)
+                r = await shared_client.post(url, json=_apply_channel_caps(body, ch), headers=headers)
             except Exception as e:
                 _fail(cid, name, upstream_model, model, t0, errors, f"connect: {e}", exc=e,
                       superseded=superseded)
                 continue
             latency = int((time.time() - t0) * 1000)
             if r.status_code != 200:
-                gateway.note_ratelimit_headers(cid, upstream_model, r.headers)
+                gateway.note_ratelimit_headers(cid, upstream_model, r.headers, ch.get("type"))
                 _classify(cid, name, upstream_model, model, t0, errors,
                           r.status_code, r.text[:300], _parse_retry_after(r.headers),
                           ch_type=ch.get("type"), superseded=superseded)
                 continue
-            gateway.note_ratelimit_headers(cid, upstream_model, r.headers)
+            gateway.note_ratelimit_headers(cid, upstream_model, r.headers, ch.get("type"))
             try:
                 data = r.json()
             except Exception:
@@ -644,6 +743,16 @@ def _parse_retry_after(headers) -> int:
         return max(0, int(headers.get("retry-after", 0)))
     except (TypeError, ValueError):
         return 0
+
+
+def _one_line(s, limit: int = 200) -> str:
+    """把上游响应体压成一行塞进日志。
+
+    存在的意义：429 的分类**完全依赖正文措辞**（`gateway.classify_429`），
+    只记结论不记原文，事后就没法回答「凭什么判成额度不足」——
+    2026-09-26/27 用户连着问了两次这个问题，所以判定点一律留痕。"""
+    flat = " ".join((s or "").split())
+    return flat[:limit] if flat else "（空响应体）"
 
 
 def _kind_of(status: int) -> str:
@@ -725,16 +834,18 @@ def _classify(cid, name, upstream_model, requested_model, t0, errors, status, ra
             upstream_model, cid,
             f"Key 无效: HTTP {status}" if account_level else f"该模型无权限/需付费: HTTP {status}")
     elif kind == "rate_limit":
-        # 429 分三档：余额不足（要充值）/ 免费额度用尽（等明天）/ 每分钟限流（等一会）。
-        # 判别必须结合渠道类型——魔搭的「每日免费额度用完」正文就是 insufficient balance，
-        # 光看字面会误判成欠费；平台余额接口查得到时以它为准（_quota_exhausted）。
+        # 429 分四档：余额不足（要充值）/ 免费额度用尽（等明天）/ **魔粒池不足（等重试窗）**
+        # / 每分钟限流（等一会）。判别必须结合渠道类型——魔搭的额度类 429 正文就是
+        # insufficient balance，光看字面会误判成欠费；平台余额接口查得到时以它为准
+        # （_quota_exhausted）。
         label, secs, text429 = gateway.classify_429(raw, ch_type, retry_after)
         # `_quota_exhausted` 只能**补强**「正文没写清楚」的 429，不能覆盖正文的明确分类：
         # 正文已判 free_daily（每日额度、次日自动回来）时，余额接口说 0 也拦不住它 —— 两者
         # 说的不是同一件事。2026-09-21 实测：OpenRouter 账户余额 0（免费层，从未充值）、
         # 免费模型 429 正文是「free-models-per-day. Add 10 credits…」，被这条判成
         # 「余额不足」→ 永久 down，而它其实每天都会自己恢复。
-        if label == "paid_balance" or (_quota_exhausted(cid) and label not in ("minute", "free_daily")):
+        if label == "paid_balance" or (
+                _quota_exhausted(cid) and label not in ("minute", "free_daily", "free_pool")):
             # 账户余额/额度不足：等不来自愈，要充值或换 key → 按渠道级「硬不可用」处理
             # （与 Key 无效同一条路径：先挂掉 cs.valid，下次健康检查再试）
             cs = gateway.get_cs(cid)
@@ -750,22 +861,47 @@ def _classify(cid, name, upstream_model, requested_model, t0, errors, status, ra
             logger.warning("渠道[%s] 模型[%s] 账户余额/额度不足，按硬不可用处理（需充值或换 key）", name, upstream_model)
             errors.append(f"{name}: 账户余额不足，需充值{note}")
             return
+        if label == "free_pool":
+            # 魔粒池不足（魔搭）：魔粒是**账号级共享池**，一个模型拿不到 = 该 Key 下全都没了，
+            # 所以直接停整条渠道，不需要 30 分钟爆发度那套「模型级 vs 账号级」的推断。
+            # 停多久由 gateway 决定（`_MS_POOL_BOUNDED_RETRY`：默认 False = 到次日 00:05）。
+            # ⚠️ 走到这里的前提是**正文写明余额/魔粒不足**；只看正文说是「rate limit」的瞬时撞墙
+            # 走的是 minute 档（只冷这一个模型 90s），两种 429 不会混（见 gateway.classify_429）。
+            gateway.mark_channel_quota_exhausted(cid, "魔粒余额不足", ch_type)
+            msg = ("魔粒余额不足 (HTTP 429)：登录魔搭领/兑魔粒后即可恢复"
+                   f"（本渠道冷却{gateway.cool_duration_text(secs)}自动重试；"
+                   "任一次测试成功会立刻解除）")
+            # 把**原始正文**一起记下来：这条判定的唯一依据就是措辞，不记原文的话
+            # 「为什么判成额度不足」事后无法复核（用户反复问过这个）。
+            logger.warning("渠道[%s] 模型[%s] %s（429 原文：%s）",
+                           name, upstream_model, msg, _one_line(raw))
+            gateway.mark_model_status(requested_model, False, msg, name, state="limited")
+            gateway.mark_result(upstream_model, cid, False, kind="rate_limit",
+                                cooldown_seconds=secs)
+            store.log_usage(cid, name, requested_model, 0, 0, latency, False,
+                            f"HTTP 429 魔粒不足: {raw[:200]}", upstream_model=upstream_model,
+                            superseded=superseded)
+            errors.append(f"{name}: {msg}{note}")
+            return
         if label == "free_daily":
             # 额度 429 先按**模型级**处理：只冷这个 (模型,渠道)（下面 mark_result 的
             # cooldown_seconds=到明天 已经做了这件事）。只有短窗口内同渠道 ≥4 个不同模型
             # 一起撞额度 429，才升级成账号级、整渠道停到明天。详见 note_channel_quota_429。
             # 旧行为是「一见就整渠道停到明天」：魔搭大模型日额度只有 100，先耗完的那个撞一次
             # 就把整条渠道封十几个小时 —— 近三周 62 次魔搭 429 里至少 4 天是这种误伤。
-            account_level, n_models = gateway.note_channel_quota_429(cid, upstream_model)
+            account_level, n_models = gateway.note_channel_quota_429(
+                cid, upstream_model, ch_type=ch_type)
             if account_level:
                 logger.warning("渠道[%s] 30 分钟内已有 %d 个不同模型撞额度 429 → 判定账号级额度耗尽，"
-                               "整渠道冷却到明天（本次模型=%s）", name, n_models, upstream_model)
+                               "整渠道冷却到明天（本次模型=%s）（429 原文：%s）",
+                               name, n_models, upstream_model, _one_line(raw))
                 msg = (f"免费额度用完 (HTTP 429)：该渠道 30 分钟内 {n_models} 个模型均受限，"
                        "判账号级，整渠道冷却到明天")
             else:
                 logger.warning("渠道[%s] 模型[%s] 免费额度用完 (free_daily 429)，按**模型级**处理："
-                               "只冷这个模型到明天，渠道其余模型照常路由（窗口内累计 %d 个模型）",
-                               name, upstream_model, n_models)
+                               "只冷这个模型到明天，渠道其余模型照常路由（窗口内累计 %d 个模型）"
+                               "（429 原文：%s）",
+                               name, upstream_model, n_models, _one_line(raw))
                 msg = "免费额度用完 (HTTP 429)：该模型额度已用完，冷却到明天（渠道其它模型不受影响）"
             gateway.mark_model_status(requested_model, False, msg, name, state="limited")
             gateway.mark_result(upstream_model, cid, False, kind="rate_limit",
@@ -778,8 +914,13 @@ def _classify(cid, name, upstream_model, requested_model, t0, errors, status, ra
         logger.warning("渠道[%s] 模型[%s] 限流 (429, %s)，冷却 %ds，Retry-After=%s",
                        name, upstream_model, label, secs, retry_after)
         throttle.observe_429(cid, upstream_model)   # 供自学水位
-        if gateway.note_channel_429(cid, upstream_model, retry_after):
+        # 渠道级熔断只对「有明确账号级 RPM/RPD」的平台生效；魔搭（`quota_agnostic_429`）直接返回
+        # False —— 它的 429 是平台实时压力，多模型一起 429 正是高并发的样子，熔断是误伤。
+        if gateway.note_channel_429(cid, upstream_model, retry_after, ch_type):
             logger.warning("渠道[%s] 窗口内多个模型连续 429，判定账号级限流，整个渠道熔断 10 分钟", name)
+        # 让真正落地的冷却 = 分类给出的那个（旧版这里不赋值 → mark_result 兜底成 300s，
+        # 而日志写的是 90s，两边不一致；分钟级限流 90s 才符合「下一个分钟窗口」的语义）
+        cooldown_seconds = secs
         gateway.mark_model_status(requested_model, True, text429, name, state="limited")
     elif kind == "server":
         logger.warning("渠道[%s] 模型[%s] 上游服务错误 (%s)", name, upstream_model, status)
@@ -1059,8 +1200,16 @@ async def model_test(req: Request):
     if cid:
         ch = next((c for c in cfg["channels"] if c["id"] == cid), None)
         cs = gateway.channels.get(cid)
-        if (not ch or not ch.get("enabled", True) or not cs or not cs.valid
-                or model not in cs.models):
+        # 2026-10-08：健康检查失败（cs.valid=False）不再短路渠道级测试/扫描。
+        # 旧行为：`not cs.valid` 直接返回「渠道无效…」→ 用户点「扫描全部模型」时
+        # **一个真实探测都没发**，61 个模型全被同一句废话打发（2026-10-07/08 实测：
+        # Gemini 渠道 /models 被 Google 地域封锁 400 → 渠道整条判 invalid → 扫描
+        # 变成空转，用户以为在重测、实际什么都没测）。
+        # 渠道级扫描是用户主动点的，愿意花额度；真实结果（哪怕还是 400）比一句
+        # 笼统的「渠道无效」有用得多 —— mark_model_status 会把真实原因写进界面。
+        # cs.valid 为 None（还没做过健康检查）或模型不在 cs.models（列表拉取失败时
+        # cs.models 可能是旧的/空的）都放行：以探测结果为准，不信陈旧快照。
+        if (not ch or not ch.get("enabled", True) or not cs):
             # 该渠道没这个模型 ≠ 模型全局不可用，不做全局标记（避免跨渠道污染）
             return {"available": False, "error": "渠道无效、已停用或未提供该模型"}
         candidates = [{"channel": ch, "model": model}]
@@ -1149,7 +1298,7 @@ async def model_test(req: Request):
                         return {"available": False, "channel": ch.get("name"), "error": last_err}
                     result = {"available": False, "channel": ch.get("name"), "error": last_err}
                     break
-                gateway.note_ratelimit_headers(ch["id"], upstream_model, r.headers)
+                gateway.note_ratelimit_headers(ch["id"], upstream_model, r.headers, ch.get("type"))
                 gateway.mark_model_status(model, True, "", ch.get("name"))
                 gateway.mark_result(upstream_model, ch["id"], True, latency)
                 out = {"available": True, "channel": ch.get("name"), "latency_ms": latency}
@@ -1161,15 +1310,24 @@ async def model_test(req: Request):
                         out["note"] = note
                 return out
             last_err = f"HTTP {r.status_code}: {r.text[:200]}"
-            gateway.note_ratelimit_headers(ch["id"], upstream_model, r.headers)
+            gateway.note_ratelimit_headers(ch["id"], upstream_model, r.headers, ch.get("type"))
             if r.status_code == 429:
                 label429, secs429, text429 = gateway.classify_429(
                     r.text[:300], ch.get("type"), _parse_retry_after(r.headers))
                 # 余额/额度不足（付费渠道）→ 硬不可用，等也不会恢复。
                 # 正文已判 free_daily 时不再被余额接口覆盖（同 `_classify` 里的说明）：
                 # OpenRouter 免费层余额恒为 0，而免费模型的日额度 429 **次日自愈**。
+                #
+                # ⚠️ `unknown`（正文读不出语义）同样**不准**被余额兜底覆盖 —— 2026-10-07 实测：
+                # 智谱账号余额 ¥0，其免费模型撞限流时正文是「该模型当前访问量过大，请您稍后再试」，
+                # 而当时 `_MINUTE_429` 一个中文关键词都不认（现已补上）→ 判 `unknown`
+                # → 被「余额 ≤ 0」接住 → 记成 `state="down"`「账户余额不足，需充值」。
+                # down 没有出口（restore 时不会自愈），一个**平台忙**的模型就此永久变红。
+                # 兜底的适用范围只能是「已经明确说钱不够」的场景；读不出语义时按暂时受限处理 ——
+                # 代价只是多冷却一次，而误判成 down 的代价是模型永远不回来。
                 if label429 == "paid_balance" or (
-                        _quota_exhausted(ch["id"]) and label429 not in ("minute", "free_daily")):
+                        _quota_exhausted(ch["id"]) and label429 not in ("minute", "free_daily",
+                                                                        "free_pool", "unknown")):
                     gateway.mark_channel_down(upstream_model, ch["id"],
                                               "账户余额不足，需充值 (HTTP 429)")
                     gateway.mark_model_status(model, False, "账户余额不足，需充值",
@@ -1184,11 +1342,33 @@ async def model_test(req: Request):
                     # → 继续试下一候选（2026-09-21 用户口径：所有渠道都失败才报不可用）
                     result = out
                     break
+                # 魔粒池不足（魔搭）：魔粒是全账号共享的池子 → 账号级，整渠道一起停。
+                # 停多久由 gateway 决定（默认到次日 00:05；`_MS_POOL_BOUNDED_RETRY=True` 为 30 分钟）。
+                if label429 == "free_pool":
+                    gateway.mark_channel_quota_exhausted(ch["id"], "魔粒余额不足", ch.get("type"))
+                    msg = ("魔粒余额不足 (HTTP 429)：登录魔搭领/兑魔粒后即可恢复"
+                           f"（本渠道冷却{gateway.cool_duration_text(secs429)}自动重试；"
+                           "任一次测试成功会立刻解除）")
+                    logger.warning("测试/扫描 渠道[%s] 模型[%s] %s（429 原文：%s）",
+                                   ch.get("name"), upstream_model, msg, _one_line(r.text))
+                    gateway.mark_model_status(model, False, msg,
+                                              ch.get("name"), state="limited")
+                    gateway.mark_result(upstream_model, ch["id"], False, kind="rate_limit",
+                                        cooldown_seconds=secs429)
+                    out = {"available": False, "channel": ch.get("name"),
+                           "error": msg, "status": 429}
+                    if cid:
+                        out["skipped"] = True
+                        return out
+                    # 模型级测试：魔粒不足只说明**魔搭**这条渠道当前拿不到额度，
+                    # 同模型在别的渠道（NIM/OpenRouter…）可能还好使 → 继续试下一候选
+                    result = out
+                    break
                 # 免费额度用完：先按**模型级**（只冷这一个模型到明天）；短窗口内同渠道
                 # ≥4 个不同模型一起撞才升级成账号级、整渠道停到明天（同 _classify）
                 if label429 == "free_daily":
                     account_level, n_models = gateway.note_channel_quota_429(
-                        ch["id"], upstream_model)
+                        ch["id"], upstream_model, ch_type=ch.get("type"))
                     if account_level:
                         msg = (f"免费额度用完 (HTTP 429)：该渠道 30 分钟内 {n_models} 个模型均受限，"
                                "判账号级，整渠道冷却到明天")
@@ -1208,8 +1388,12 @@ async def model_test(req: Request):
                     # 继续试下一候选（旧版在这里直接 return，会把「别处可用」误报成不可用）
                     result = out
                     break
+                # 界面别只显示一坨裸 JSON：`classify_429` 已经给出人话说明（「平台动态限速」等），
+                # 带上它，用户才知道这是「上游忙、稍后自愈」而不是「模型坏了」。
+                # 2026-10-07 用户实测反馈的原文就是：界面只有 `{"error":{"code":"1305",...}}`。
+                last_err = f"HTTP 429: {text429}（上游原文：{_one_line(r.text, 100)}）"
                 gateway.note_channel_429(ch["id"], upstream_model,
-                                         _parse_retry_after(r.headers))
+                                         _parse_retry_after(r.headers), ch.get("type"))
                 gateway.mark_result(upstream_model, ch["id"], False,
                                     kind=_kind_of(r.status_code), cooldown_seconds=secs429)
             else:
@@ -1227,6 +1411,23 @@ async def model_test(req: Request):
             if hard:
                 gateway.mark_channel_down(upstream_model, ch["id"], last_err)
             state = "down" if hard else "limited"
+            # 地域封锁（Google 系走代理时常见，2026-10-08 实测：出口 IP 在香港 →
+            # generativelanguage.googleapis.com 全线 400 FAILED_PRECONDITION）：
+            # 原文是「User location is not supported for the API use」，报成裸 JSON
+            # 用户看不出是网络问题。压成人话 + 说明它是**本机出口**的事，会自愈
+            # （换出口即恢复），也顺手把 mark_result 的 kind 归成 geo（不计稳定分）。
+            if gateway.is_geo_block(r.text[:300]):
+                last_err = ("HTTP 400 地域封锁：Google 判定当前出口 IP 所在地区不可用"
+                            f"（{_one_line(r.text, 90)}）。换网络出口/代理节点后即恢复，"
+                            "模型本身没坏")
+                gateway.mark_model_status(model, False, last_err, ch.get("name"),
+                                          state="limited")
+                out = {"available": False, "channel": ch.get("name"),
+                       "error": last_err, "status": r.status_code}
+                if cid:
+                    return out
+                result = out
+                break
             gateway.mark_model_status(model, False, last_err, ch.get("name"), state=state)
             out = {"available": False, "channel": ch.get("name"),
                    "error": last_err, "status": r.status_code}
@@ -1346,6 +1547,17 @@ async def overview():
             "latency_ms": cs.latency_ms, "models_count": len(cs.models),
             "models_available_count": gateway.channel_available_models(ch["id"]),
             "cool_until": gateway.channel_cool.get(ch["id"], 0),
+            # 冷却原因（平行表，只为界面文案）：「魔粒余额不足」/「渠道级 429 熔断」…
+            # 空串 = 没在冷却或没记原因 → 前端退回通用说法。
+            "cool_reason": gateway.channel_cool_reason.get(ch["id"], ""),
+            # 手填的额外模型（上游 /models 不列但能调的，见 _validate_channel）：
+            # 界面据此显示「手填 N 个」提示，也是编辑渠道时回填表单的来源。
+            "extra_models": list(ch.get("extra_models") or []),
+            # 自动补全：开关（默认开）+ 本轮实际补进来的模型（探活通过的，见 gateway.auto_add_models）
+            "auto_models": ch.get("auto_models", True),
+            "auto_added": list(getattr(cs, "auto_added", None) or []),
+            # 拉列表失败、靠额外模型兜住的原因（非报错，只为界面提示）
+            "list_error": cs.list_error,
             "quota": cs.quota, "quota_ts": cs.quota_ts, "quota_error": cs.quota_error,
             # 额度型 429 的「爆发度」：最近 30 分钟撞额度 429 的不同模型数。
             # ≥4 就会被判账号级、整渠道停到明天（见 gateway.note_channel_quota_429）
@@ -1375,6 +1587,10 @@ async def overview():
             "pinned": cfg.get("pinned", []),
             # 视觉专属收藏：界面「视觉」视图里那颗 ★ 读写的是这一份（与主收藏互不影响）
             "pinned_vision": cfg.get("pinned_vision", []),
+            # OpenRouter 免费模型雷达（2026-10-07）：全站目录里 pricing 全 0 的模型清单 +
+            # 其中「本地第一次见到距今 ≤ free_models_new_days 天」的新面孔数。
+            # 界面在模型页顶部把它当提示条用；与用户配了哪些渠道**无关**（是情报，不是可用列表）。
+            "free_models": freemodels.view(new_days=cfg.get("free_models_new_days", 7)),
             # 官方限流头解析结果（排障两块）：
             #   ratelimit      = 平台自报的「模型级」剩余额度，键 "上游模型|渠道id"
             #   ratelimit_hits = 各口径被读到的累计次数。`modelscope` 长期为 0
@@ -1389,6 +1605,24 @@ async def refresh():
     await probe_used_models()
     await gateway.refresh_quotas(shared_client, cfgmod.load_config())
     return {"ok": True}
+
+
+@app.post("/api/free-models/refresh")
+async def refresh_free_models():
+    """只刷「免费模型雷达」：打一次免密钥公开端点，**不碰任何渠道**。
+
+    为什么不复用 /api/refresh：那个要跑全渠道健康检查 + 1-token 探测，几十秒才回来；
+    而用户点这个按钮的意图是「看看 OpenRouter 又放了什么新的免费模型」，应该秒回。
+    （顺带会把榜分一起补上，同一份返回，零额外成本。）"""
+    try:
+        info = await _topup_openrouter_public_inner(cfgmod.load_config(), force=True)
+    except Exception as e:
+        raise HTTPException(502, f"拉取失败：{str(e)[:160]}")
+    if not info.get("ok"):
+        raise HTTPException(502, "OpenRouter 公开端点不可达（本机网络或对方抽风），稍后重试")
+    v = freemodels.view()
+    return {"ok": True, "total": v["total"], "new_count": v["new_count"],
+            "bench": info.get("bench", 0), "free": info.get("free", 0)}
 
 
 def _validate_channel(b: dict, allow_empty_key: bool = False):
@@ -1410,6 +1644,35 @@ def _validate_channel(b: dict, allow_empty_key: bool = False):
     }
     if not ch["api_key"]:
         ch["enabled"] = False  # 导入的渠道缺 Key 时先停用，补 Key 后再启用
+    cap = b.get("max_tokens")
+    if isinstance(cap, int) and cap > 0:
+        ch["max_tokens"] = cap   # 渠道级输出上限，见 _apply_channel_caps
+    # ── 额外模型（2026-10-07 加，用户要求）────────────────────────────────
+    # 渠道模型列表**完全来自上游 GET /models**（gateway.refresh_channel: `cs.models = ids`），
+    # 但有两类模型能调却不被 /models 列出，于是永远进不了池子：
+    #   ① 智谱 `glm-4-flash` / `glm-4.7-flash` —— 官方永久免费，实测 chat/completions 直接 200，
+    #      而智谱 /models 只返回 11 个主力/付费模型，不含它俩（2026-10-07 实测）；
+    #   ② Cloudflare Workers AI —— OpenAI 兼容端点只提供 /chat/completions 与 /embeddings，
+    #      **根本没有 /models**，不手填就一个模型都拉不到。
+    # 这里存成一份白名单，由 gateway 并进 cs.models；`/models` 拉不到时只要它非空，
+    # 渠道仍算可用（否则 Cloudflare 这类渠道会被判成「连接失败」直接停用）。
+    # 归一化：中英文逗号 / 分号 / 空白 / 换行都当分隔符；去重保序；空项丢掉。
+    if "extra_models" in b:
+        em = b.get("extra_models")
+        raw = [em] if isinstance(em, str) else list(em or [])
+        ids = []
+        for part in raw:
+            for one in re.split(r"[,;，；\s]+", str(part)):
+                one = one.strip()
+                if one and one not in ids:
+                    ids.append(one)
+        if ids:
+            ch["extra_models"] = ids
+    # 自动补全开关（默认开）：从公开模型目录取该平台**标价 0** 的模型，探活通过后自动并进来
+    # （见 modelcat.py / gateway.auto_add_models）。上游没列免费模型时用户什么都不用填；
+    # 不想让它自动加就关掉，仍可用上面的 extra_models 手填。
+    if "auto_models" in b:
+        ch["auto_models"] = bool(b.get("auto_models"))
     return ch, None
 
 
@@ -1474,6 +1737,38 @@ async def delete_channel(cid: str):
     return {"ok": True}
 
 
+@app.post("/api/channels/reorder")
+async def reorder_channels(req: Request):
+    """渠道排序（界面拖动 / 上移下移按钮写回的，2026-10-02 加）。
+
+    ⚠️ 顺序**只存在 config.json 的 channels 数组里**，不额外加 order 字段：
+       PUT /api/channels/{cid} 会用 _validate_channel 重建整个渠道对象（只保留
+       name/type/base_url/api_key/enabled/max_tokens），任何自定义字段都会被抹掉。
+       数组顺序天然免疫这一点。
+
+    ⚠️ 路径必须与 `POST /api/channels` 区分开：FastAPI 会先匹配精确路径，
+       所以 /api/channels/reorder 不会被当成「新增渠道」；而 /api/channels/{cid}
+       只注册了 PUT/DELETE，没有 POST，不会抢这个路由。
+
+    校验：ids 必须与现有渠道**一一对应**（排序 ≠ 增删），少一个都拒绝——
+    否则一次手滑的拖动就会静默删掉一个渠道。
+    """
+    b = await req.json()
+    ids = b.get("ids")
+    if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
+        raise HTTPException(400, "ids 必须是渠道 ID 字符串数组")
+    cfg = cfgmod.load_config()
+    cur = cfg["channels"]
+    if sorted(ids) != sorted(c["id"] for c in cur):
+        raise HTTPException(400, f"顺序列表与现有渠道不匹配（收到 {len(ids)} 个，现有 {len(cur)} 个）")
+    by_id = {c["id"]: c for c in cur}
+    cfg["channels"] = [by_id[i] for i in ids]
+    cfgmod.save_config(cfg)
+    # 不调 gateway.sync_channels：渠道集合没变（只是顺序），重建状态表反而会把
+    # 各渠道已探测到的模型列表/健康状态清空。
+    return {"ok": True, "order": ids}
+
+
 @app.post("/api/channels/{cid}/test")
 async def test_channel(cid: str):
     cfg = cfgmod.load_config()
@@ -1505,7 +1800,9 @@ async def refresh_quota(cid: str):
 
 @app.get("/api/usage")
 async def usage(days: int = 7):
-    return store.summary(min(max(days, 1), 90))
+    # days <= 0 → 全量累计（不限时间窗，从库里第一条记录算到现在）；其余夹到 [1, 90]。
+    # ⚠️ 不能沿用 max(days, 1)：那会把 0 悄悄变成 1（「全量」变成「最近 24 小时」）。
+    return store.summary(0 if days <= 0 else min(days, 90))
 
 
 @app.get("/api/logs")
@@ -1661,6 +1958,12 @@ async def config_export(req: Request):
              "base_url": ch["base_url"], "enabled": ch.get("enabled", True)}
         if include_keys:
             c["api_key"] = ch["api_key"]
+        # 手填的额外模型要跟着走，否则导入方拿到一个「少几个模型」的渠道
+        if ch.get("extra_models"):
+            c["extra_models"] = list(ch["extra_models"])
+        # 自动补全默认是开的，只在**关掉**时才写 —— 写个 true 只会让导出文件更啰嗦
+        if ch.get("auto_models") is False:
+            c["auto_models"] = False
         out["channels"].append(c)
     tag = "full" if include_keys else "safe"
     path = os.path.join(cfgmod.ROOT, f"api-hub-export-{tag}-{time.strftime('%Y%m%d-%H%M%S')}.json")

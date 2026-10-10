@@ -174,17 +174,19 @@ def test_chat_entry_bad_body_is_400_not_500(client, monkeypatch):
     assert "model" in r.json()["detail"]
 
 
-def test_modelscope_quota_429_is_model_level_then_escalates(client, monkeypatch):
-    """端到端（`_classify` 那条真实路径）：魔搭额度 429 **先只冷那一个模型**，
-    渠道其余模型照常路由；30 分钟内撞到第 4 个不同模型才升级成「整渠道停到明天」。
+def test_modelscope_magicube_429_cools_channel_for_retry_window(client, monkeypatch):
+    """端到端（`_classify` 那条真实路径）：魔搭的**额度类** 429 = 魔粒不足 → 整条渠道进
+    **有界重试窗**（30 分钟），不是「冷却到明天」。
 
-    这是用户 2026-09-20 报的那个现象的回归：旧版一见 `insufficient balance` 就
-    `mark_channel_quota_exhausted` → 一个模型撞一次，整条渠道封十几个小时。"""
+    2026-08 魔搭把「每日 2000 次免费」换成**魔粒体系**（登录发放、短期 24h 有效、
+    做任务可加量），没有「次日 00:00 重置」这个点 —— 用户 2026-09-26 报的就是这条：
+    按原方案判 24 小时，等于把当天领到魔粒就能恢复的额度一起压死。
+    魔粒是全账号共享的池子，所以也不走「模型级 → 账号级」的爆发度判定，直接整渠道。"""
     from app import gateway, store
     from app import config as cfgmod
     from app import main as m
 
-    models = ["ms-m1", "ms-m2", "ms-m3", "ms-m4"]
+    models = ["ms-m1", "ms-m2"]
     ch = {"id": "t_ms", "name": "魔搭 ModelScope", "type": "modelscope",
           "base_url": "http://ms.invalid/v1", "api_key": "k", "enabled": True}
     monkeypatch.setattr(cfgmod, "load_config", lambda: {
@@ -208,19 +210,18 @@ def test_modelscope_quota_429_is_model_level_then_escalates(client, monkeypatch)
     monkeypatch.setattr(m, "shared_client", C())
     store.init()
     try:
-        for i, md in enumerate(models):
-            r = client.post("/v1/chat/completions",
-                            json={"model": md, "messages": [{"role": "user", "content": "hi"}]},
-                            headers=H)
-            assert r.status_code == 502, r.text
-            assert gateway.cooldown.get((md, "t_ms"), 0) > 0      # 这个模型被冷却到明天
-            if i < 3:
-                assert not gateway.channel_cooling("t_ms"), f"第 {i+1} 个模型就封了整渠道"
-                # 渠道其余模型照常进候选（这就是「模型级」的意义）
-                assert gateway.candidates_for(models[i + 1], cfgmod.load_config())
-            else:
-                assert gateway.channel_cooling("t_ms")            # 第 4 个 → 判账号级
-                assert gateway.candidates_for("ms-m1", cfgmod.load_config()) == []
+        r = client.post("/v1/chat/completions",
+                        json={"model": "ms-m1", "messages": [{"role": "user", "content": "hi"}]},
+                        headers=H)
+        assert r.status_code == 502, r.text
+        assert gateway.cooldown.get(("ms-m1", "t_ms"), 0) > 0        # 模型级也冷
+        assert gateway.channel_cooling("t_ms")                       # 魔粒是账号级 → 整渠道
+        left = gateway.channel_cool["t_ms"] - time.time()
+        # 2026-09-27 起默认「到次日 00:05」（下限 600s 会在临近午夜时生效）。
+        # 必须是「等一个时刻」量级，不能退回 30 分钟：那会让界面 30 分钟绿一次。
+        assert 599 <= left <= 86400, f"冷却 {left}s，应为「到次日 00:05」"
+        assert gateway.channel_cool_reason.get("t_ms") == "魔粒余额不足"   # 界面靠它说清原因
+        assert gateway.candidates_for("ms-m2", cfgmod.load_config()) == []   # 全渠道都停
         logged = [l for l in store.recent(limit=50)["logs"] if l["model"] == "ms-m1"]
         assert len(logged) == 1, f"一次 429 尝试只能记一行账，实际 {len(logged)} 行：{logged}"
     finally:
@@ -230,6 +231,65 @@ def test_modelscope_quota_429_is_model_level_then_escalates(client, monkeypatch)
         for md in models:
             gateway.cooldown.pop((md, "t_ms"), None)
             gateway.unverified.discard((md, "t_ms"))
+
+
+def test_free_daily_429_is_model_level_then_escalates(client, monkeypatch):
+    """**日额度型**免费渠道（这里用 NIM 的正文特征）：额度 429 **先只冷那一个模型**，
+    渠道其余模型照常路由；30 分钟内撞到第 4 个不同模型才升级成「整渠道停到明天」。
+
+    这是用户 2026-09-20 报的那个现象的回归：旧版一见 `insufficient balance` 就
+    `mark_channel_quota_exhausted` → 一个模型撞一次，整条渠道封十几个小时。
+    魔搭已改魔粒（见上一个测试），这里改用仍是日额度的渠道来守住这条路径。"""
+    from app import gateway, store
+    from app import config as cfgmod
+    from app import main as m
+
+    models = ["nm-m1", "nm-m2", "nm-m3", "nm-m4"]
+    ch = {"id": "t_nim", "name": "NVIDIA NIM", "type": "nim",
+          "base_url": "http://nim.invalid/v1", "api_key": "k", "enabled": True}
+    monkeypatch.setattr(cfgmod, "load_config", lambda: {
+        "channels": [ch], "aliases": {}, "route_strategy": "balanced", "pinned": [],
+        "auth_enabled": False, "api_token": "", "port": 8787})
+    cs = gateway.ChannelState()
+    cs.models, cs.valid, cs.latency_ms = list(models), True, 10
+    gateway.channels["t_nim"] = cs
+    gateway.channel_cool.pop("t_nim", None)
+    gateway.channel_quota_429.pop("t_nim", None)
+
+    class R429:
+        status_code = 429
+        headers: dict = {}
+        text = '{"error":{"message":"insufficient balance","request_id":"x"}}'
+
+    class C:
+        async def post(self, *a, **k):
+            return R429()
+
+    monkeypatch.setattr(m, "shared_client", C())
+    store.init()
+    try:
+        for i, md in enumerate(models):
+            r = client.post("/v1/chat/completions",
+                            json={"model": md, "messages": [{"role": "user", "content": "hi"}]},
+                            headers=H)
+            assert r.status_code == 502, r.text
+            assert gateway.cooldown.get((md, "t_nim"), 0) > 0     # 这个模型被冷却到明天
+            if i < 3:
+                assert not gateway.channel_cooling("t_nim"), f"第 {i+1} 个模型就封了整渠道"
+                # 渠道其余模型照常进候选（这就是「模型级」的意义）
+                assert gateway.candidates_for(models[i + 1], cfgmod.load_config())
+            else:
+                assert gateway.channel_cooling("t_nim")            # 第 4 个 → 判账号级
+                assert gateway.candidates_for("nm-m1", cfgmod.load_config()) == []
+        logged = [l for l in store.recent(limit=50)["logs"] if l["model"] == "nm-m1"]
+        assert len(logged) == 1, f"一次 429 尝试只能记一行账，实际 {len(logged)} 行：{logged}"
+    finally:
+        gateway.channels.pop("t_nim", None)
+        gateway.channel_cool.pop("t_nim", None)
+        gateway.channel_quota_429.pop("t_nim", None)
+        for md in models:
+            gateway.cooldown.pop((md, "t_nim"), None)
+            gateway.unverified.discard((md, "t_nim"))
 
 
 def test_openrouter_free_daily_429_is_not_judged_as_no_balance(client, monkeypatch):
@@ -302,6 +362,73 @@ def test_openrouter_free_daily_429_is_not_judged_as_no_balance(client, monkeypat
         gateway.channel_down.pop((md, "t_or"), None)
         gateway.cooldown.pop((md, "t_or"), None)
         gateway.unverified.discard((md, "t_or"))
+        gateway.model_status.pop(md, None)
+
+
+def test_zhipu_traffic_429_is_not_judged_as_no_balance(client, monkeypatch):
+    """智谱免费模型撞限流（「访问量过大」）不该被判成「余额不足 → 永久 down」。
+
+    2026-10-07 用户实测反馈。误判链条三个条件叠在一起（账号余额 ¥0 是前提）：
+      1. 用户智谱账户余额 **¥0**（免费模型的正常状态）→ `check_quota` 得 remaining=0
+         → `_quota_exhausted(cid)` 恒为 True；
+      2. 免费模型撞限流的正文是
+         `{"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"}}`
+         —— 当时的 `_MINUTE_429` 只认「频繁 / 速率 / 每分钟」，**一个都不命中** → `unknown`；
+      3. main 里「余额 ≤ 0」的兜底把 `unknown` 也接住 → 走 paid_balance 分支 →
+         `mark_model_status(..., state="down")`。
+    现象：模型页里 `glm-4.7-flash` 是红点「不可用 · 账户余额不足，需充值」，
+    而它压根是免费模型（余额 ¥0 也能调），只是平台忙。**down 还没有出口** → 再不自愈。
+
+    正解：正文证据优先 —— 中文「访问量过大」按短时限流处理，余额推断不得覆盖它。
+    """
+    from app import gateway, store
+    from app import config as cfgmod
+    from app import main as m
+
+    md = "glm-4.7-flash"
+    ch = {"id": "t_zh", "name": "智谱 GLM", "type": "zhipu",
+          "base_url": "https://open.bigmodel.cn/api/paas/v4", "api_key": "k", "enabled": True}
+    monkeypatch.setattr(cfgmod, "load_config", lambda: {
+        "channels": [ch], "aliases": {}, "route_strategy": "balanced", "pinned": [],
+        "auth_enabled": False, "api_token": "", "port": 8787})
+    cs = gateway.ChannelState()
+    cs.models, cs.valid, cs.latency_ms = [md], True, 10
+    # 关键前置：余额 ¥0 —— 免费模型并不需要余额，但旧代码据此把它判成硬失败
+    cs.quota = {"kind": "balance", "label": "账户余额", "remaining": 0.0, "unit": "CNY"}
+    gateway.channels["t_zh"] = cs
+    gateway.mark_model_status(md, True, "", "智谱 GLM")
+    gateway.channel_down.pop(("t_zh"), None)
+    gateway.channel_cool.pop("t_zh", None)
+    for k in [k for k in gateway.cooldown if k[1] == "t_zh"]:
+        gateway.cooldown.pop(k, None)
+
+    class R429:
+        status_code = 429
+        headers: dict = {}
+        text = '{"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"}}'
+
+    class C:
+        async def post(self, *a, **k):
+            return R429()
+
+    monkeypatch.setattr(m, "shared_client", C())
+    store.init()
+    try:
+        r = client.post("/api/models/test",
+                        json={"model": md, "channel_id": "t_zh"}, headers=H)
+        assert r.status_code == 200, r.text
+        assert r.json()["available"] is False
+        st = gateway.model_status[md]
+        assert st["state"] == "limited", \
+            f"被判成 {st['state']}（应为 limited）：{st.get('reason')}"
+        assert "余额" not in (st.get("reason") or ""), \
+            f"被误判成余额问题：{st.get('reason')}"
+        assert (md, "t_zh") not in gateway.channel_down, "误记了 channel_down（永久不可用）"
+        assert gateway.channels["t_zh"].valid is True, "误导 cs.valid=False（等于停掉整条渠道）"
+    finally:
+        gateway.channels.pop("t_zh", None)
+        gateway.channel_down.pop((md, "t_zh"), None)
+        gateway.cooldown.pop((md, "t_zh"), None)
         gateway.model_status.pop(md, None)
 
 
@@ -469,14 +596,17 @@ def test_models_test_multi_channel_walks_past_model_level_limit(client, monkeypa
     这是「额度 429 降级到模型级」的另一面：既然是模型级，同一个模型换个渠道可能还能用，
     所以测试端点不能在第一跳就下结论。旧版在 free_daily 分支直接 return，
     会把「别处可用」误报成不可用（2026-09-20 一并修掉）。
+
+    ⚠️ 用**日额度型**渠道（NIM）而不是魔搭：魔搭已是魔粒池，那条路走 free_pool
+    → 账号级有界冷却（见后面的 magicube 用例），不再有「模型级」这一档。
     """
     from app import gateway, store
     from app import config as cfgmod
     from app import main as m
 
-    chans = [{"id": "t_qa", "name": "甲渠道", "type": "modelscope",
+    chans = [{"id": "t_qa", "name": "甲渠道", "type": "nim",
               "base_url": "http://a.invalid/v1", "api_key": "k", "enabled": True},
-             {"id": "t_qb", "name": "乙渠道", "type": "modelscope",
+             {"id": "t_qb", "name": "乙渠道", "type": "nim",
               "base_url": "http://b.invalid/v1", "api_key": "k", "enabled": True}]
     monkeypatch.setattr(cfgmod, "load_config", lambda: {
         "channels": chans, "aliases": {}, "route_strategy": "balanced", "pinned": [],
@@ -529,6 +659,75 @@ def test_models_test_multi_channel_walks_past_model_level_limit(client, monkeypa
             gateway.unverified.discard(("dup-q", c["id"]))
             gateway.channel_down.pop(("dup-q", c["id"]), None)
         gateway.model_status.pop("dup-q", None)
+
+
+def test_models_test_walks_past_magicube_limit(client, monkeypatch):
+    """魔搭魔粒不足（`free_pool`）→ 这条渠道进**有界**冷却，测试**继续试别的渠道**。
+
+    两个要点：
+    ① 魔粒是全账号共享的池子 → 直接整渠道停（不再有「模型级」这一档），
+       停到**次日 00:05**（2026-09-27 前是 30 分钟有界重试窗，见 `_ms_pool_cool_secs`）；
+    ② 一个渠道拿不到额度不等于这个模型不可用 → 仍要试完其它渠道，别把
+       「别处可用」误报成不可用（与 free_daily 那条同口径）。
+    """
+    from app import gateway, store
+    from app import config as cfgmod
+    from app import main as m
+
+    chans = [{"id": "t_ma", "name": "魔搭 ModelScope", "type": "modelscope",
+              "base_url": "http://ms.invalid/v1", "api_key": "k", "enabled": True},
+             {"id": "t_mb", "name": "NVIDIA NIM", "type": "nim",
+              "base_url": "http://nim.invalid/v1", "api_key": "k", "enabled": True}]
+    monkeypatch.setattr(cfgmod, "load_config", lambda: {
+        "channels": chans, "aliases": {}, "route_strategy": "balanced", "pinned": [],
+        "auth_enabled": False, "api_token": "", "port": 8787})
+    for c in chans:
+        cs = gateway.ChannelState()
+        cs.models, cs.valid, cs.latency_ms = ["mgl-x"], True, 10
+        gateway.channels[c["id"]] = cs
+        gateway.channel_cool.pop(c["id"], None)
+        gateway.channel_quota_429.pop(c["id"], None)
+    calls = []
+
+    class R429:
+        status_code = 429
+        headers: dict = {}
+        text = '{"error":{"message":"insufficient balance","request_id":"x"}}'
+
+    class OK:
+        status_code = 200
+        headers: dict = {}
+
+        def json(self):
+            return {"choices": [{"message": {"role": "assistant", "content": "pong"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+    class C:
+        async def post(self, url, **k):
+            calls.append(url)
+            return R429() if "ms.invalid" in url else OK()
+
+    monkeypatch.setattr(m, "shared_client", C())
+    store.init()
+    try:
+        r = client.post("/api/models/test", json={"model": "mgl-x"}, headers=H)
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert len(calls) == 2 and j["available"] is True, (calls, j)
+        assert j["channel"] == "NVIDIA NIM", j
+        assert gateway.channel_cooling("t_ma"), "魔粒不足是账号级 → 该停整条魔搭渠道"
+        left = gateway.channel_cool["t_ma"] - time.time()
+        assert 599 <= left <= 86400, f"冷却 {left}s，应为「到次日 00:05」"
+        assert not gateway.channel_cooling("t_mb")
+    finally:
+        for c in chans:
+            gateway.channels.pop(c["id"], None)
+            gateway.channel_cool.pop(c["id"], None)
+            gateway.channel_quota_429.pop(c["id"], None)
+            gateway.cooldown.pop(("mgl-x", c["id"]), None)
+            gateway.unverified.discard(("mgl-x", c["id"]))
+            gateway.channel_down.pop(("mgl-x", c["id"]), None)
+        gateway.model_status.pop("mgl-x", None)
 
 
 def test_models_test_multi_channel_walks_past_hard_failure(client, monkeypatch):
@@ -972,3 +1171,86 @@ def test_overview_exposes_ratelimit_quota(client, monkeypatch):
         gateway.user_quota.pop("c_ms", None)
         gateway.ratelimit.pop(("m", "c_ms"), None)
         gateway.ratelimit_hits["modelscope"] = 0
+
+
+def test_overview_exposes_channel_cool_reason(client, monkeypatch):
+    """渠道卡片上那句「冷却中（…）」的唯一来源：`cool_reason` 必须从 overview 透出去。
+
+    2026-09-27 用户报「魔搭额度已经用完了，但它还是一会就跳出来显示可用」：
+    主因是冷却只有 30 分钟（已改到次日 00:05），顺带要能看出**为什么**停 ——
+    前端只读 `ch.cool_reason`，后端不透传就永远退回一句通用文案
+    （旧版写死「账号级限流」，分不出「额度真没了」和「同时撞了限速」）。"""
+    from app import config as cfgmod
+    from app import gateway, store
+    store.init()
+    monkeypatch.setattr(cfgmod, "load_config", lambda: {
+        "port": 8787, "channels": [{"id": "c_ms", "name": "魔搭 ModelScope",
+                                    "type": "modelscope", "base_url": "http://x/v1",
+                                    "api_key": "k", "enabled": True}],
+        "aliases": {}, "route_strategy": "balanced", "pinned": []})
+    try:
+        ch0 = client.get("/api/overview", headers=H).json()["channels"][0]
+        assert not ch0["cool_until"] and ch0["cool_reason"] == ""   # 没冷却 = 无时间、无原因
+        gateway.mark_channel_quota_exhausted("c_ms", "魔粒余额不足", "modelscope")
+        ch = client.get("/api/overview", headers=H).json()["channels"][0]
+        assert ch["cool_until"] > time.time()
+        assert ch["cool_reason"] == "魔粒余额不足"
+    finally:
+        gateway.channel_cool.pop("c_ms", None)
+        gateway.channel_cool_reason.pop("c_ms", None)
+
+
+def test_models_test_scan_works_when_health_check_failed(client, monkeypatch):
+    """2026-10-08 回归：渠道健康检查失败（cs.valid=False）时，渠道级扫描仍必须真发探测。
+
+    事故：Gemini 渠道 /models 被 Google 地域封锁 400 → refresh_channel 判 cs.valid=False
+    → 用户点「扫描全部模型」，/api/models/test 渠道级分支被 `not cs.valid` 短路，
+    61 个模型每个都直接返回「渠道无效…」，一个真实探测都没发 —— 用户以为在重测，
+    实际什么都没测（2026-10-07/08 实测）。扫描是用户主动点的，愿意花额度；
+    真实结果（哪怕还是 400）远比笼统的「渠道无效」有用。
+    """
+    from app import gateway
+    from app import config as cfgmod
+
+    monkeypatch.setattr(cfgmod, "load_config", lambda: {
+        "channels": [{"id": "ch_geo", "name": "GeoBlocked", "type": "gemini",
+                      "base_url": "http://x/v1", "api_key": "k", "enabled": True}],
+        "aliases": {}, "route_strategy": "balanced", "pinned": [],
+        "auth_enabled": False, "api_token": "", "port": 8787})
+
+    # 健康检查失败：渠道 invalid、模型列表为空（正是 Gemini 现场的形状）
+    cs = gateway.get_cs("ch_geo")
+    cs.valid = False
+    cs.error = "Client error '400 Bad Request' for url 'http://x/v1/models'"
+    cs.models = []
+
+    calls = []
+
+    class _Resp:
+        status_code = 400
+        headers = {}
+        text = ('[{"error": {"code": 400, "message": "User location is not supported'
+                ' for the API use.", "status": "FAILED_PRECONDITION"}}]')
+
+    class _Client:
+        async def post(self, url, json=None, headers=None):
+            calls.append((url, json))
+            return _Resp()
+
+    import app.main as M
+    monkeypatch.setattr(M, "shared_client", _Client())
+
+    r = client.post("/api/models/test",
+                    json={"model": "models/gemini-3.8-flash", "channel_id": "ch_geo"},
+                    headers=H)
+    body = r.json()
+    assert r.status_code == 200
+    # 关键断言：真的发了上游探测（而不是被 cs.valid=False 短路）
+    assert len(calls) == 1, "渠道 invalid 时扫描必须仍真发探测，不许短路"
+    assert "/chat/completions" in calls[0][0]
+    # 地域封锁 → limited（可自愈）而不是 down，文案是人话不是裸 JSON
+    assert body["available"] is False
+    assert "地域封锁" in body["error"], body
+    st = gateway.model_status["models/gemini-3.8-flash"]
+    assert st["state"] == "limited", "地域封锁必须记 limited（换出口即恢复），不许记 down"
+    gateway.model_status.pop("models/gemini-3.8-flash", None)

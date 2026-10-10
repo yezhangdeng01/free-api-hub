@@ -3,7 +3,7 @@ import logging
 
 import httpx
 
-from app import capability
+from app import capability, freemodels
 
 logger = logging.getLogger("api-hub")
 
@@ -13,13 +13,56 @@ ZHIPU_BALANCE_URL = "https://www.bigmodel.cn/api/biz/account/query-customer-acco
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 
-def _harvest(items) -> tuple:
-    """从 /models 的返回项里收割「AA 榜分 + 视觉能力」（OpenRouter 系接口才带这两样）
+def _is_zero_pricing(it: dict) -> bool:
+    """该 /models 项是否「价格全 0」（真免费）。
 
-    返回 (ids, bench, vision_ok, vision_no)，并顺手落库到 capability。
+    为什么不能只看名字后缀（2026-09-28 实测）：OpenRouter 的**匿名 stealth 预览模型**
+    （如 `stealth/space-bunny-alpha`）pricing 是 `{"prompt": "0", "completion": "0"}`，
+    但 id **不带** `:free` 后缀 —— 只看后缀会把它连同 440 个付费模型一起丢掉。"""
+    p = it.get("pricing") or {}
+    try:
+        return float(p.get("prompt") or 0) == 0 and float(p.get("completion") or 0) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_text_only_output(it: dict) -> bool:
+    """输出模态是否**只有 text**（才配进 chat 列表）。缺字段按「是」处理（宁松勿误杀）。
+
+    挡掉 `google/lyria-*` 这类**音频生成**模型：它们的 output_modalities 是
+    `["text", "audio"]`（含 text，所以「含 text」这种松判据挡不住），只有「仅 text」才挡得住。"""
+    outs = (it.get("architecture") or {}).get("output_modalities")
+    if not outs:
+        return True
+    outs = [outs] if isinstance(outs, str) else outs
+    return all("text" in str(x).lower() for x in outs)
+
+
+def _has_image_input(it: dict):
+    """能否读图（`architecture.input_modalities` 里有 image）。**不知道时返回 None**。
+
+    为什么不给「缺字段」一个默认值：`_harvest` 只在字段存在时才敢给模型贴
+    「支持/不支持视觉」的标签（没标签 = 未知，档位判定会退回名字启发式）；
+    而免费模型清单里 `bool(None)` 自然就是「不显示 👁」。两边要的默认值不同，
+    所以这里返回三态，由调用方各自决定。"""
+    arch = it.get("architecture") or {}
+    mods = arch.get("input_modalities") or arch.get("modality")
+    if not mods:
+        return None
+    mods = [mods] if isinstance(mods, str) else mods
+    return "image" in " ".join(str(x).lower() for x in mods)
+
+
+def _harvest(items) -> tuple:
+    """从 /models 的返回项里收割「AA 榜分 + 视觉能力 + 价格为 0 的模型」（OpenRouter 系接口才带）
+
+    返回 (ids, bench, vision_ok, vision_no, free_by_price)，并顺手落库到 capability。
+    `free_by_price` 是 pricing 全 0 且**输出仅 text** 的 id 小写集合 —— 供 `filter_free_models`
+    判断「不看后缀也真的免费」的模型（stealth 预览模型走这条）。
     """
     ids, bench = [], {}
     vision_ok, vision_no = set(), set()
+    free_by_price = set()
     for it in items or []:
         if not isinstance(it, dict):
             if it:
@@ -29,16 +72,15 @@ def _harvest(items) -> tuple:
         if not mid:
             continue
         ids.append(mid)
+        if _is_zero_pricing(it) and _is_text_only_output(it):
+            free_by_price.add(str(mid).strip().lower())
         aa = ((it.get("benchmarks") or {}).get("artificial_analysis") or {})
         v = aa.get("intelligence_index")
         if isinstance(v, (int, float)):
             bench[capability.norm_id(mid)] = v
-        arch = it.get("architecture") or {}
-        mods = arch.get("input_modalities") or arch.get("modality")
-        if mods:
-            mods = [mods] if isinstance(mods, str) else mods
-            low = " ".join(str(x).lower() for x in mods)
-            (vision_ok if "image" in low else vision_no).add(capability.norm_id(mid))
+        mods = _has_image_input(it)
+        if mods is not None:
+            (vision_ok if mods else vision_no).add(capability.norm_id(mid))
     if bench:
         info = capability.update_bench_scores(bench)
         logger.info("收割 AA 榜分 %d 个（累计 %d，智能阈值 %.1f / 中档阈值 %.1f）",
@@ -47,17 +89,113 @@ def _harvest(items) -> tuple:
         vin = capability.update_vision_models(vision_ok, vision_no)
         logger.info("收割视觉能力 %d 支持 / %d 不支持（累计 %d / %d）",
                     len(vision_ok), len(vision_no), vin["ok"], vin["no"])
-    return ids, bench, vision_ok, vision_no
+    return ids, bench, vision_ok, vision_no, free_by_price
 
 
-async def fetch_models(client: httpx.AsyncClient, base_url: str, api_key: str) -> list:
+# ---- OpenRouter：只保留免费模型 ----
+# 为什么必须在**拉列表**这一步就过滤（2026-09-26 实测，2026-09-28 修补判据）：
+#   · OpenRouter 的 `/models` 返回的是**全站目录**，实测 458 个；
+#   · 其中真正能免费调的是「名字带 `:free` 后缀」+ `openrouter/free`（官方免费模型路由器）
+#     + **价格全 0 但名字不带后缀的模型**（2026-09-28 补）—— 其余一律要付费/绑卡。
+#   · 用户侧表现是「可用模型里多了很多 OpenRouter 的实际不可用模型，显示可用，测试就不可用」——
+#     因为「能不能用」只看 (模型,渠道) 级记录（见 gateway.model_view），而没测过的模型
+#     没有任何记录 → 渠道健康就显示「可用」；点一次测试才追加一条 `channel_down`，
+#     而且要先花一次 `endpoints` 请求去确认它没有免费提供方。
+# 过滤后 458 → 约 19：那一整类「看着可用、一测就 402」的模型从根上消失，顺带省掉 400+ 次探测
+# 与 400+ 次 endpoints 查询。
+#
+# ⚠️ 判据红线（2026-09-28）：**别只看名字后缀**。OpenRouter 的**匿名 stealth 预览模型**
+#    （如 `stealth/space-bunny-alpha`，2026-09-23 上线）pricing 是 0 却不带 `:free` 后缀，
+#    只看后缀会把它们当付费模型误杀。免费与否只有 `pricing` 说了算
+#    （辅助集合由 `_harvest` 看全量 items 时顺手收，零额外请求）。
+# 想恢复列出付费模型（比如以后给 OpenRouter 充了值）：给该渠道加 `"free_only": false`。
+OPENROUTER_FREE_ONLY = True
+_OR_FREE_EXTRA = {"openrouter/free"}   # 不带 `:free` 后缀但确实免费（官方免费模型路由器）
+
+
+def is_free_or_model(mid: str, free_ids=None) -> bool:
+    """该 OpenRouter 模型 id 是否属于「免费可调」。
+
+    两条路：① 名字带 `:free` 后缀 / 命中 `_OR_FREE_EXTRA` 白名单；
+    ② 命中 `free_ids`（pricing 全 0 的 id 集合，小写）—— 专治 stealth 预览模型这类
+    「免费但名字不带后缀」的漏网之鱼。"""
+    s = (mid or "").strip().lower()
+    if s.endswith(":free") or s in _OR_FREE_EXTRA:
+        return True
+    return bool(free_ids) and s in free_ids
+
+
+def filter_free_models(ids, ch_type: str = None, free_only=None, free_ids=None) -> tuple:
+    """按渠道类型过滤模型列表 → `(保留的 ids, 被丢掉的个数)`。
+
+    目前只有 openrouter 需要过滤：其余平台的 `/models` 返回的就是这个 Key 真正可调的模型，
+    过滤会误删。`free_only=None` 时用 `OPENROUTER_FREE_ONLY`。
+    `free_ids` = pricing 全 0 的 id 集合（小写），由 `fetch_models` 从 `_harvest` 拿。"""
+    if (ch_type or "") != "openrouter":
+        return list(ids), 0
+    if free_only is None:
+        free_only = OPENROUTER_FREE_ONLY
+    if not free_only:
+        return list(ids), 0
+    keep = [i for i in ids if is_free_or_model(i, free_ids)]
+    return keep, len(ids) - len(keep)
+
+
+def free_model_entries(items) -> list:
+    """从 /models 返回项里抽出**所有免费模型**的明细（喂 `app.freemodels` 雷达）。
+
+    与 `filter_free_models` 同源判据（`_is_zero_pricing` + `_is_text_only_output`），
+    所以雷达里列出来的，就是渠道里真正会被保留的那批 —— 不会出现「提示有、列表里没有」的错位。
+
+    `kind` 三分类只为**界面措辞**服务，不影响「免费」这个事实：
+      · `free`   —— 带 `:free` 后缀的常规免费版（OpenRouter 按天限次，最稳）；
+      · `router` —— `openrouter/free`，官方免费模型路由器（它自己挑一个免费模型来答）；
+      · `anon`   —— **匿名 stealth 预览模型**之类：pricing 全 0 却不带后缀，
+                    往往是新模型正式发布前放出来的灰度测试版（2026-09-23 出现过
+                    `stealth/space-bunny-alpha`）。这类最值得提示，因为**过一阵就没了**。
+
+    ⚠️ **只能在 OpenRouter 系接口的返回上调用**。别的平台 `/models` 根本不返回 `pricing`，
+    而 `_is_zero_pricing` 对缺字段是「缺 = 0 = 免费」的宽容判据（宁松勿误杀那批 stealth 模型），
+    拿它们来喂会把几百个付费模型全标成免费。调用点已按 ch_type 把关（见 fetch_models）。"""
+    out = []
+    for it in items or []:
+        if not isinstance(it, dict) or not it.get("id"):
+            continue
+        if not (_is_zero_pricing(it) and _is_text_only_output(it)):
+            continue
+        mid = str(it["id"]).strip()
+        low = mid.lower()
+        if low.endswith(":free"):
+            kind = "free"
+        elif low in _OR_FREE_EXTRA:
+            kind = "router"
+        else:
+            kind = "anon"
+        aa = ((it.get("benchmarks") or {}).get("artificial_analysis") or {})
+        v = aa.get("intelligence_index")
+        out.append({
+            "id": mid,
+            "name": it.get("name") or mid,
+            "context": it.get("context_length") or 0,
+            "kind": kind,
+            "created": it.get("created") or 0,
+            "bench": v if isinstance(v, (int, float)) else None,
+            "vision": bool(_has_image_input(it)),
+        })
+    return out
+
+
+async def fetch_models(client: httpx.AsyncClient, base_url: str, api_key: str,
+                       ch_type: str = None, free_only=None) -> list:
     """拉取渠道的模型列表（OpenAI 兼容 /models）
 
     顺带收割两样白拿的权威数据（OpenRouter 的返回里带，不用额外密钥、不多发请求）：
 
     1. `benchmarks.artificial_analysis.intelligence_index` — Artificial Analysis 智能指数；
     2. `architecture.input_modalities` — **是否支持图像输入**（比名字猜准得多）。
-    """
+
+    `ch_type`/`free_only` 只影响**返回的 id 列表**（OpenRouter 只留免费的，见上面）；
+    收割在看全量 `items` 时完成，所以过滤不会让榜分/视觉数据少收。"""
     r = await client.get(
         base_url.rstrip("/") + "/models",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -66,8 +204,19 @@ async def fetch_models(client: httpx.AsyncClient, base_url: str, api_key: str) -
     r.raise_for_status()
     data = r.json()
     items = data.get("data", []) if isinstance(data, dict) else data
-    ids, _bench, _ok, _no = _harvest(items)
-    return sorted(set(ids))
+    ids, _bench, _ok, _no, free_by_price = _harvest(items)
+    # 免费模型雷达：**在过滤之前**喂（雷达要的是全站目录里的免费模型，与这个渠道
+    # 是否 `free_only` 无关）。只有 OpenRouter 系接口才带 pricing，见 free_model_entries。
+    if (ch_type or "") == "openrouter":
+        entries = free_model_entries(items)
+        if entries:
+            freemodels.update(entries)
+    ids = sorted(set(ids))
+    ids, dropped = filter_free_models(ids, ch_type, free_only, free_by_price)
+    if dropped:
+        logger.info("渠道[%s] 只保留免费模型：%d → %d 个（丢掉 %d 个需付费的）",
+                    ch_type, len(ids) + dropped, len(ids), dropped)
+    return ids
 
 
 async def fetch_bench_public(client: httpx.AsyncClient) -> dict:
@@ -78,7 +227,11 @@ async def fetch_bench_public(client: httpx.AsyncClient) -> dict:
     没必要每次刷新都去拿 —— 只在本地缓存过期时来补一次，失败就继续用旧分。
     实测（2026-09-15）：公开端点免密钥即返回 445 个模型，139 个带 AA 榜分（比带密钥的渠道
     返回还多），且全部带 `architecture.input_modalities`。
-    返回 {"bench": n, "vision": n, "ok": bool}。
+
+    2026-10-07 起顺带喂 `freemodels` 雷达：同一份返回里就带着每个模型的 pricing，
+    **零额外请求**就能拿到免费名单 —— 没配 OpenRouter 渠道、或 Key 失效的用户也照样有情报
+    （这正是「公开端点」存在的意义：不依赖任何 Key）。
+    返回 {"bench": n, "vision": n, "free": n, "ok": bool}。
     """
     try:
         r = await client.get(OPENROUTER_MODELS_URL, timeout=25)
@@ -86,11 +239,16 @@ async def fetch_bench_public(client: httpx.AsyncClient) -> dict:
         data = r.json()
     except Exception as e:
         logger.warning("公开榜分源不可用（继续用本地缓存）: %s", str(e)[:160])
-        return {"bench": 0, "vision": 0, "ok": False}
+        return {"bench": 0, "vision": 0, "free": 0, "ok": False}
     items = data.get("data", []) if isinstance(data, dict) else data
-    _, bench, vision_ok, vision_no = _harvest(items)
+    _, bench, vision_ok, vision_no, _free = _harvest(items)
+    entries = free_model_entries(items)
+    if entries:
+        freemodels.update(entries)
+    # ok 的口径 = 「这趟真拿到东西了」。补进免费名单也算拿到（哪怕榜分这次全空）——
+    # 否则 _topup 只报「失败」，而实际上免费雷达已经更新了，日志会误导排查。
     return {"bench": len(bench), "vision": len(vision_ok) + len(vision_no),
-            "ok": bool(bench or vision_ok)}
+            "free": len(entries), "ok": bool(bench or vision_ok or entries)}
 
 
 async def check_quota(client: httpx.AsyncClient, channel: dict):

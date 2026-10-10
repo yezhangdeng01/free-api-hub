@@ -25,12 +25,15 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import capability, store  # noqa: E402
+from app import capability, freemodels, gateway, modelcat, store  # noqa: E402
 
 # capability 的模块级全局：`update_bench_scores()` / `update_frontier()` / `update_vision_models()`
 # 会直接改写它们，且**不还原**。清单要随 capability.py 的新增全局一起补。
+# `_anon_ids`（匿名测试模型名单，2026-10-07 加）同理：`freemodels.update()` / `load_cache()`
+# 都会推一次，不还原的话上一个测试登记的假模型会让下一个测试的 `tier_of()` 返回 3（flaky）。
 _CAP_GLOBALS = ("_bench", "_bench_hi", "_bench_mid", "_bench_p10", "_bench_p90",
-                "_bench_last_ok", "_observed_frontier", "_vision_ok", "_vision_no")
+                "_bench_last_ok", "_observed_frontier", "_vision_ok", "_vision_no",
+                "_anon_ids")
 
 # **进程初始快照**：在 conftest 被 import 时采集（pytest 最早的时机），保证基准是干净的。
 # 注意不能改成「逐测试互相比对」—— 那样第一个测试拿到的基准可能已经被污染。
@@ -42,7 +45,7 @@ def _isolate_capability_globals():
     """每个测试收尾把 capability 的模块级全局还原到**进程初始值**。
 
     为什么需要（2026-09-21 实测定位）：`test_api.py` 的 TestClient 触发 lifespan →
-    后台 `_bg_loop` → `refresh_all()` → `_topup_bench_cache()` →
+    后台 `_bg_loop` → `refresh_all()` → `_topup_openrouter_public()` →
     `providers.fetch_bench_public()` **去 OpenRouter 免密钥公开端点抓榜分** →
     `capability.update_bench_scores()` 改写 `_bench / _bench_hi / _bench_mid / _bench_p10 /
     _bench_p90`；`refresh_all()` 末尾还有 `capability.update_frontier(all_ids)` 改写
@@ -74,8 +77,57 @@ def _isolate_data_files(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "MODEL_STATUS_PATH", str(tmp_path / "model_status.json"), raising=False)
     monkeypatch.setattr(store, "RUNTIME_STATE_PATH", str(tmp_path / "runtime_state.json"), raising=False)
     monkeypatch.setattr(store, "CAPABILITY_CACHE_PATH", str(tmp_path / "capability_cache.json"), raising=False)
+    # 免费模型雷达（2026-10-07 加）：不重定向的话，任何触发了渠道扫描的测试都会
+    # 把测试夹具里的假模型写进**生产** data/free_models.json（capability 那次的翻版事故）。
+    monkeypatch.setattr(store, "FREE_MODELS_PATH", str(tmp_path / "free_models.json"), raising=False)
+    # 公开模型目录（2026-10-07 加）：同理，不重定向的话拉目录的测试会把测试夹具写进
+    # 生产 data/model_catalog.json。
+    monkeypatch.setattr(store, "MODEL_CATALOG_PATH", str(tmp_path / "model_catalog.json"), raising=False)
     store._ms_cache = None          # 关键：缓存必须跟着路径一起失效
     yield
     store._ms_cache = None          # 收尾再清一次，别把测试缓存带进下一个测试
     # 能力榜单同理：脏标记若留着，测试收尾写盘时会把生产缓存覆盖成测试态（空）
     capability._dirty["v"] = False
+
+
+# freemodels 的模块级状态（内存里的名单 + 首次见到时间）。跟 capability 的全局同一个道理：
+# 路径重定向拦不住内存，所以每个测试前后都清干净 —— 不清的话，上一个测试留下的模型
+# 会让下一个测试的 `added` / `is_new` 断言随机失败（典型的 flaky）。
+@pytest.fixture(autouse=True)
+def _isolate_freemodels_globals():
+    def _snap():
+        return (copy.deepcopy(freemodels._items), copy.deepcopy(freemodels._first_seen),
+                freemodels._ts)
+
+    items0, seen0, ts0 = _snap()
+    freemodels._items.clear()
+    freemodels._first_seen.clear()
+    freemodels._ts = 0.0
+    freemodels._dirty["v"] = False
+    yield
+    freemodels._items.clear()
+    freemodels._items.update(items0)
+    freemodels._first_seen.clear()
+    freemodels._first_seen.update(seen0)
+    freemodels._ts = ts0
+    # 脏标记收尾必须清：留着的话测试进程结束时的写盘会把生产缓存覆盖成测试态（空名单）
+    freemodels._dirty["v"] = False
+
+
+@pytest.fixture(autouse=True)
+def _isolate_modelcat_globals():
+    """公开模型目录（modelcat）与「自动补全」探活缓存的内存隔离。
+
+    跟 capability / freemodels 一个道理：**路径重定向拦不住内存里的全局**。
+    `modelcat._catalog` 留着的话，上一个测试塞进去的假目录会让下一个测试的
+    `candidates_for` 冒出意外候选；`gateway._cand_cache` 留着更阴 —— 探活会直接命中
+    缓存**根本不发请求**，测试假绿（明明该 404 的模型被判成存在）。
+    """
+    cat0, ts0 = modelcat._catalog, modelcat._ts
+    modelcat._catalog, modelcat._ts = None, 0.0
+    cand0 = copy.deepcopy(gateway._cand_cache)
+    gateway._cand_cache.clear()
+    yield
+    modelcat._catalog, modelcat._ts = cat0, ts0
+    gateway._cand_cache.clear()
+    gateway._cand_cache.update(cand0)

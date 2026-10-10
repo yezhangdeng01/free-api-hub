@@ -15,8 +15,10 @@ def _reset():
     gateway.cooldown.clear()
     gateway.stats.clear()
     gateway.channel_cool.clear()
+    gateway.channel_cool_reason.clear()  # 冷却原因（平行表）：与 channel_cool 成对，必须一起清
     gateway.channel_down.clear()
     gateway.unverified.clear()
+    gateway._unverified_until.clear()   # 待验证的暂挂截止时间（与 unverified 成对）
     gateway.channel_last_ok.clear()
     gateway.sticky.clear()          # 会话粘性：全局字典，必须逐测试清，否则会串
     gateway.ratelimit.clear()       # 官方限流头解析结果（模型级）
@@ -243,8 +245,8 @@ def _fake_channels(monkeypatch, m, errs: dict):
     async def no_topup(cfg):
         return None
 
-    monkeypatch.setattr(m, "_topup_bench_cache", no_topup)
-    monkeypatch.setattr(m, "_bg", {"last_check": 0.0, "last_quota": 0.0, "last_bench": 0.0,
+    monkeypatch.setattr(m, "_topup_openrouter_public", no_topup)
+    monkeypatch.setattr(m, "_bg", {"last_check": 0.0, "last_quota": 0.0, "last_public": 0.0,
                                    "net_down": 0, "next_check": 0.0})
 
 
@@ -289,6 +291,59 @@ def test_refresh_all_does_not_back_off_on_real_upstream_failure(monkeypatch):
     asyncio.run(m.refresh_all())
     assert m._bg["net_down"] == 0
     assert m._bg["next_check"] == 0.0
+
+
+def test_probe_exempt_only_modelscope():
+    """自动探测的豁免名单：当前只有魔搭（2026-09-27 用户要求）。
+
+    魔搭 2026-08 起是**魔粒体系**：魔粒登录发放、调用即消耗 —— 探测发的也是真请求，
+    等于在烧魔粒，而探出来的状态还是噪声（它的 429 是平台动态限速）。"""
+    assert gateway.probe_exempt("modelscope") is True
+    for t in ("openrouter", "groq", "nvidia", "gemini", "zhipu", "siliconflow", "", None):
+        assert gateway.probe_exempt(t) is False
+
+
+def test_probe_used_models_skips_exempt_channels(monkeypatch):
+    """魔搭**不该**被自动探测（回归用例）。
+
+    判据：两条渠道各挂一个「近 7 天用过」的模型 → 只有非魔搭那条被真发请求。
+    手动「测试 / 扫描该渠道」不走这里，所以仍然可用（用户主动点、愿意花这一次额度）。
+    """
+    import asyncio
+
+    from app import main as m
+
+    _reset()
+    sent = []
+
+    class _Resp:
+        status_code, text, headers = 200, "", {}
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class _Client:
+        async def post(self, url, json=None, headers=None):
+            sent.append((url, (json or {}).get("model")))
+            return _Resp()
+
+    chans = [
+        {"id": "ch_ms", "name": "魔搭", "enabled": True, "type": "modelscope",
+         "base_url": "https://api-inference.modelscope.cn/v1", "api_key": "k"},
+        {"id": "ch_gr", "name": "Groq", "enabled": True, "type": "groq",
+         "base_url": "https://api.groq.com/openai/v1", "api_key": "k"},
+    ]
+    monkeypatch.setattr(m.cfgmod, "load_config",
+                        lambda: {"channels": chans, "probe_used_models": True})
+    monkeypatch.setattr(m.store, "distinct_models", lambda days=7: ["m-ms", "m-gr"])
+    _chan("ch_ms", ["m-ms"])
+    _chan("ch_gr", ["m-gr"])
+    monkeypatch.setattr(m, "shared_client", _Client())
+
+    asyncio.run(m.probe_used_models())
+
+    assert sent, "非豁免渠道应当被探测，否则这条用例什么也没验证到"
+    assert [mdl for _u, mdl in sent] == ["m-gr"], f"魔搭不该被探测：{sent}"
 
 
 def test_strategy_primary_with_tolerance_band(monkeypatch):
@@ -436,17 +491,24 @@ def test_score_dims_without_stab_data():
     assert _score_dims((0.9, None, 0.9), "stability") == _score_dims((0.9, 0.7, 0.9), "stability")
 
 
-def test_classify_429_three_tiers():
-    """429 四档：余额不足（要充值）/ 免费额度用尽（等明天）/ 每分钟限流 / 未知
+def test_classify_429_five_tiers():
+    """429 五档：余额不足（要充值）/ 魔粒池不足（停到次日 00:05）/ 免费日额度用尽（等明天）
+    / 每分钟限流 / 未知
 
-    关键用例来自实盘：**魔搭的每日免费额度用完，正文就是 insufficient balance**，
-    与 OpenRouter 真欠费的正文完全一样，只能靠渠道类型区分。"""
+    关键用例来自实盘：**魔搭的额度类 429 正文就是 insufficient balance**，
+    与 OpenRouter 真欠费的正文完全一样，只能靠渠道类型区分。
+    2026-09-26 起魔搭改成**魔粒体系**，所以它单独走 `free_pool` 一档；
+    2026-09-27 起该档的冷却时长 = 「到次日 00:05」（原为 30 分钟有界重试窗，
+    在额度真用完时会造成「30 分钟黄 / 30 分钟绿」的界面来回跳）。"""
     from app.gateway import classify_429
     bal = '{"error":{"message":"insufficient balance"}}'
-    label, secs, _ = classify_429(bal, "modelscope")          # 魔搭免费日额度
-    # 冷却到明天：本地 23:5x 时离次日 00:05 已不足 10 分钟 → 被下限夹成 600，
-    # 所以下界用 `>=`（原来写 `> 600`，每天最后 10 分钟必挂一次）
-    assert label == "free_daily" and 600 <= secs <= 86400
+    label, secs, note = classify_429(bal, "modelscope")       # 魔搭：魔粒不足
+    assert label == "free_pool" and 600 <= secs <= 86400, (label, secs)
+    # 时长就是 `_secs_to_tomorrow()`（容 2s 抖动：两次调用可能跨过一个整秒）。
+    # ⚠️ 别断言 note 里一定有「明天」—— 00:05 前后 `cool_duration_text` 会落到低档
+    #    （那是刻意的下限，见 `_secs_to_tomorrow`），那句话本身由下面的开关用例钉。
+    assert abs(secs - gateway._secs_to_tomorrow()) <= 2, secs
+    assert "魔粒" in note
     label, secs, _ = classify_429(bal, "openrouter")          # 真·欠费 → 不冷却，按 down
     assert label == "paid_balance" and secs == 0
     label, _, _ = classify_429('{"error":{"message":"You exceeded your current quota, '
@@ -455,7 +517,28 @@ def test_classify_429_three_tiers():
     label, secs, _ = classify_429('{"status":429,"title":"Too Many Requests"}', "nim")
     assert label == "minute" and secs == 90
     label, secs, _ = classify_429('{"error":{"message":"daily quota"}}', "modelscope", retry_after=60)
-    assert label == "minute"                                  # 上游说 60s 能好 → 不按明天冷却
+    assert label == "free_pool" and secs >= 600               # 魔粒池不看 Retry-After
+    # 魔搭线上实测的 429 正文（2026-09-26）：动态限速 → 分钟级，不是额度
+    label, secs, note = classify_429(
+        '{"error":{"message":"We have to rate limit you for model Qwen/Qwen3.8-27B. '
+        'If you need higher limits, please consider other (commercial) API providers."}}',
+        "modelscope")
+    assert label == "minute" and secs == 90, (label, secs)
+    # 智谱免费模型撞限流的**真实正文**（2026-10-07 用户实测）：
+    # 中文「访问量过大 / 稍后再试」必须按**短时限流**处理。
+    # 旧版只认「频繁 / 速率 / 每分钟」→ 一个都不命中 → `unknown` → 再被 main 的
+    # 「余额 ≤ 0」兜底接住 → 判「账户余额不足，需充值」+ `state="down"`（永不自愈），
+    # 把免费模型（本来不看余额）误杀成永久不可用 —— 用户看到的就是模型页一个红点。
+    label, secs, note = classify_429(
+        '{"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"}}', "zhipu")
+    assert label == "minute" and secs == 90, (label, secs)
+    # 文案也要对：「访问量过大」说的是**上游此刻负载高**，说成「每分钟限流」会让用户
+    # 以为等一分钟就行（智谱这种可能整个高峰期都不通）。
+    assert "负载" in note, note
+    # 余额类正文优先于限流类：正文真的说「余额」，仍须判 paid_balance（别被放宽误伤）
+    label, secs, _ = classify_429(
+        '{"error":{"code":"1113","message":"您的账户余额不足，请先充值"}}', "zhipu")
+    assert label == "paid_balance" and secs == 0, (label, secs)
     label, secs, _ = classify_429("something odd", "custom")
     assert label == "unknown" and secs == 300
 
@@ -559,6 +642,38 @@ def test_channel_quota_exhausted_cools_whole_channel(tmp_path, monkeypatch):
     # 冷却持久化：save_runtime_state 已写入 channel_cool，restore 能读回
     gateway.restore_runtime_state()
     assert gateway.channel_cooling("sc")
+
+
+def test_channel_cool_reason_roundtrip_and_clear(tmp_path, monkeypatch):
+    """冷却**原因**（平行表）的落盘 / 恢复 / 清理，以及老状态文件的兼容。
+
+    这张表只服务界面文案（差异：「按渠道类型给一句人话」，见 gateway 里的声明），
+    但它必须和 `channel_cool` **同生共死**：留着一条挂在已解除冷却的渠道上，
+    界面就会在明明可用的时候说「冷却中（魔粒余额不足）」。"""
+    from app import store as _store
+    import time as _t
+    _reset()
+    monkeypatch.setattr(_store, "RUNTIME_STATE_PATH", str(tmp_path / "rt.json"))
+    gateway.mark_channel_quota_exhausted("c_ms", "魔粒余额不足", "modelscope")
+    assert gateway.channel_cool_reason["c_ms"] == "魔粒余额不足"
+    # 落盘 → 清内存 → 恢复：原因要跟着回来
+    gateway.flush_runtime_state()
+    gateway.channel_cool.clear()
+    gateway.channel_cool_reason.clear()
+    gateway.restore_runtime_state()
+    assert gateway.channel_cooling("c_ms")
+    assert gateway.channel_cool_reason.get("c_ms") == "魔粒余额不足"
+    # 一次成功调用 → 冷却与原因**一起**清
+    gateway.mark_result("m1", "c_ms", True, 10)
+    assert not gateway.channel_cooling("c_ms")
+    assert "c_ms" not in gateway.channel_cool_reason
+    # 冷却已过期时不许把理由恢复进内存（过期的理由不该挂到下一次冷却上）
+    gateway.channel_cool["c_ms"] = _t.time() - 5
+    gateway.channel_cool_reason.clear()
+    gateway.flush_runtime_state()
+    gateway.channel_cool.clear()
+    gateway.restore_runtime_state()
+    assert "c_ms" not in gateway.channel_cool_reason
 
 
 def test_candidates_for_test_bypasses_channel_cool():
@@ -1179,6 +1294,39 @@ def test_model_view_statuses():
     assert view["model-c"]["channels"][0]["unavail_reason"] == ""
 
 
+def test_model_view_channel_cool_explains_reason():
+    """渠道级冷却时：**该渠道下所有模型**一起显示 limited，且原因里读得出「是什么事 + 何时恢复」。
+
+    2026-09-27 用户报「魔搭额度已经用完了，但它还是一会就跳出来显示可用」。复盘：
+    `model_view` 一直认 `channel_cool`（35 个模型一起黄），**问题在冷却只有 30 分钟**，
+    到点无声放行 → 反复跳绿。这条用例把两件事钉住：
+      ① 整条渠道一起受限（不是只当一个模型）；
+      ② 原因可读 —— 旧版写死「账号级限流」，用户分不出「额度真没了」和「同时撞了限速」，
+         而这两者的应对完全不同（去领魔粒/等明天 vs 等十分钟）。
+    """
+    import time as _t
+    _reset()
+    gateway.channels.clear()
+    _chan("c_ms", ["m1", "m2", "m3"], latency=100)
+    cfg = _cfg([{"id": "c_ms", "name": "魔搭 ModelScope", "type": "modelscope",
+                 "base_url": "http://x/v1", "api_key": "k", "enabled": True}])
+    assert all(m["status"] == "ok" for m in gateway.model_view(cfg))      # 冷却前全绿
+    gateway.mark_channel_quota_exhausted("c_ms", "魔粒余额不足", "modelscope")
+    view = gateway.model_view(cfg)
+    assert len(view) == 3
+    assert all(m["status"] == "limited" and m["available"] is False for m in view), view
+    for m in view:
+        why = m["channels"][0]["unavail_reason"]
+        assert "魔粒余额不足" in why and "自动重试" in why, why
+    # 时间型抑制：到点自然放行 —— 这正是「到次日 00:05」的语义（不是永久拉黑）
+    gateway.channel_cool["c_ms"] = _t.time() - 1
+    assert all(m["status"] == "ok" for m in gateway.model_view(cfg))
+    # 没记原因时（老状态文件）退回通用说法，不能因为缺 key 就崩或显示空
+    gateway.channel_cool["c_ms"] = _t.time() + 600
+    gateway.channel_cool_reason.clear()
+    assert "账号级限流" in gateway.model_view(cfg)[0]["channels"][0]["unavail_reason"]
+
+
 def test_model_view_channel_status_ignores_model_level_down():
     """A1 核心回归：一次渠道硬失败（连带写下模型级 down）不得把该模型**其他渠道**判红。
 
@@ -1423,6 +1571,357 @@ def test_throttle_forget_after_hour():
     th._CALLS[(cid, mid)].clear()
     assert th.blocked(cid, mid) is False
     assert th.blocked(cid, mid) is False  # 学习值已清除，不再误伤
+
+
+def test_throttle_cleared_by_real_success():
+    """实测成功必须丢掉该格的自学水位 —— 否则界面会「测试成功但仍显示受限」。
+
+    2026-09-26 线上复现：deepseek-ai/DeepSeek-V4.1-Flash 在魔搭上手动测试 200、
+    直连上游也 200，列表仍是 limited / `限流预判，本轮跳过（等额度刷新）`；
+    而且 `candidates_for` / `candidates_for_auto` 都在**静默跳过**它 ——
+    用户点了测试通过却依然用不上。原因是成功只解 cooldown，不动 throttle。"""
+    import time as _t
+    from app import throttle as th
+    th._CALLS.clear(); th._LEARN.clear()
+    cid, mid = "c_ms", "deepseek-ai/DeepSeek-V4.1-Flash"
+    now = _t.time()
+    for _ in range(10):
+        th.record_call(cid, mid, now - 30)
+    th.observe_429(cid, mid, now)
+    for _ in range(12):
+        th.record_call(cid, mid, now - 5)
+    th.observe_429(cid, mid, now)
+    assert th.blocked(cid, mid) is True          # 已进预判
+    _reset()
+    gateway.mark_result(mid, cid, True)          # 一次真实成功
+    assert th.blocked(cid, mid) is False         # 水位被证伪、清掉
+    assert th.observed(cid, mid) == {}
+    assert th.clear(cid, mid) is False           # 已空 → 再清返回 False（幂等）
+
+
+def test_unverified_expires_after_ttl():
+    """「待实测确认」只压一段暂挂期，超期自动放行。
+
+    旧行为：只有该 (模型,渠道) 自己成功一次才会从 `unverified` 移除，而自动探测只覆盖
+    probe_used_models 里用过的模型 → 没人用的模型**永久**显示「冷却已到期，待实测确认」
+    （线上实测 405 条待验证卡着，其中魔搭 11 个）。
+
+    暂挂期现在只叠在**额度型长冷却**上（≥ `_UNVERIFIED_MIN_COOL`），所以这里用
+    「冷却到明天」的 free_daily 冷却时长来构造 —— 分钟级限流不叠，见下一个用例。"""
+    import time as _t
+    _reset()
+    gateway.mark_result("m1", "c1", False, kind="rate_limit",
+                        cooldown_seconds=gateway._secs_to_tomorrow())
+    assert gateway.is_unverified(("m1", "c1"))            # 刚失败：暂挂中
+    assert ("m1", "c1") in gateway.unverified             # 兼容既有读法
+    # 把截止时间往前拨 → 读一次就自动放行，且从集合里移除
+    gateway._unverified_until[("m1", "c1")] = _t.time() - 1
+    assert gateway.is_unverified(("m1", "c1")) is False
+    assert ("m1", "c1") not in gateway.unverified
+    assert gateway._unverified_until == {}
+    # 成功同样清掉暂挂纪录（不留孤儿键）
+    gateway.mark_result("m2", "c1", False, kind="rate_limit",
+                        cooldown_seconds=gateway._secs_to_tomorrow())
+    assert gateway._unverified_until.get(("m2", "c1"))
+    gateway.mark_result("m2", "c1", True)
+    assert ("m2", "c1") not in gateway.unverified
+    assert ("m2", "c1") not in gateway._unverified_until
+
+
+def test_minute_rate_limit_does_not_linger():
+    """分钟级限流**不叠** 30 分钟暂挂期：冷却过完就该自己回绿。
+
+    2026-09-26 复盘魔搭：日志里 32 次 429 全是 minute 档（90s），但每次都叠了 30 分钟
+    「待实测确认」→ 一次 1.5 分钟的抖动被放大成 30 分钟受限，界面长期一片黄
+    （用户感受就是「撞了一次额度半天缓不过来」）。额度型（≥ `_UNVERIFIED_MIN_COOL`）才叠。"""
+    import time as _t
+    _reset()
+    gateway.mark_result("m1", "c1", False, kind="rate_limit", cooldown_seconds=90)
+    assert gateway.cooldown[("m1", "c1")] - _t.time() <= 91
+    assert gateway.is_unverified(("m1", "c1")) is False   # 分钟级：不叠暂挂
+    assert gateway.unverified == set()
+    assert gateway._unverified_until == {}
+    # 额度型（到明天）才叠
+    gateway.mark_result("m2", "c1", False, kind="rate_limit", cooldown_seconds=86400)
+    assert gateway.is_unverified(("m2", "c1")) is True
+    # 边界：正好等于阈值 → 叠（用 >= 而不是 >）
+    _reset()
+    gateway.mark_result("m3", "c1", False, kind="rate_limit",
+                        cooldown_seconds=gateway._UNVERIFIED_MIN_COOL)
+    assert gateway.is_unverified(("m3", "c1")) is True
+
+
+def test_success_clears_every_inferred_block():
+    """一次真实成功要**同时清掉所有「我们自己的推断」**，否则又是「测试通过却仍受限」。
+
+    2026-09-26 复盘：这些记录各自独立地压着同一个已实测可用的 (模型,渠道) ——
+    cooldown / unverified / channel_down / throttle 水位 / 官方额度头 remaining=0 /
+    额度 429 爆发度窗口 / 渠道级 429 熔断计数 / 渠道级冷却。少清一个就留一个出口。"""
+    import collections
+    import time as _t
+    _reset()
+    key = ("m1", "c1")
+    gateway.cooldown[key] = 9e9
+    gateway._mark_unverified(key)
+    gateway.channel_down[key] = {"reason": "旧账", "ts": 0}
+    gateway.ratelimit[key] = {"remaining": 0, "reset_ts": 9e9, "source": "x-ratelimit",
+                              "limit": 10}
+    gateway.channel_quota_429["c1"] = collections.deque([(0.0, "m1")])
+    gateway._channel_429_events["c1"] = collections.deque([(0.0, "m1")])
+    gateway.channel_cool["c1"] = 9e9
+    assert gateway.ratelimit_exhausted("m1", "c1") is True     # 官方头说没额度了
+    gateway.mark_result("m1", "c1", True)
+    assert key not in gateway.cooldown
+    assert gateway.is_unverified(key) is False
+    assert key not in gateway.channel_down
+    assert key not in gateway.ratelimit                        # 旧版漏了这一条
+    assert "c1" not in gateway.channel_quota_429               # 旧版漏了这一条
+    assert "c1" not in gateway._channel_429_events
+    assert "c1" not in gateway.channel_cool
+    assert gateway.ratelimit_exhausted("m1", "c1") is False
+
+
+def test_modelscope_429_never_escalates_to_channel_breaker():
+    """魔搭（`quota_agnostic_429`）不参与渠道级 429 熔断；普通平台照旧。
+
+    理由见 `gateway.quota_agnostic_429`：魔搭 429 = 平台实时压力，多模型一起 429 正是
+    短时高并发的样子；把它升级成「整条渠道停 10 分钟」就是用户说的那类误伤。"""
+    import time as _t
+    _reset()
+    # 魔搭：窗口内 5 个模型一起 429 → 仍然不熔断
+    for m in ("a", "b", "c", "d", "e"):
+        assert gateway.note_channel_429("c_ms", m, None, "modelscope") is False
+    assert "c_ms" not in gateway.channel_cool
+    assert gateway.channel_cooling("c_ms") is False
+    # 普通平台：同样 5 个模型 → 熔断（既有行为不变）
+    for m in ("a", "b", "c", "d", "e"):
+        gateway.note_channel_429("c_groq", m, None, "groq")
+    assert gateway.channel_cooling("c_groq") is True
+    assert gateway.channel_cool["c_groq"] - _t.time() >= gateway._CH429_COOL - 2
+    # 最近 2 分钟有成功 → 不熔断（既有豁免不变）
+    _reset()
+    gateway.channel_last_ok["c_groq"] = _t.time()
+    for m in ("a", "b"):
+        gateway.note_channel_429("c_groq", m, None, "groq")
+    assert "c_groq" not in gateway.channel_cool
+
+
+def test_openrouter_only_keeps_free_models():
+    """OpenRouter 的 /models 返回**全站目录**（2026-09-26 实测 458 个），
+    其中真正免费可调的是 `:free` 变体 + `openrouter/free`（官方免费模型路由器）
+    + **价格全 0 但名字不带后缀的 stealth 预览模型**（2026-09-28 补，见下一条用例）。
+
+    用户原话：「可用模型里多了很多 OpenRouter 的实际不可用模型，显示可用，测试就不可用」——
+    没测过的模型没有任何 (模型,渠道) 记录，渠道健康就显示可用；点一次测试才追加 channel_down。
+    所以必须在拉列表这一步就只留免费的那些。"""
+    from app import providers
+    ids = ["openai/gpt-6", "qwen/qwen3.8-27b:free", "openrouter/free",
+           "deepseek/deepseek-v4-flash-0731:batch", "OpenRouter/Free"]
+    keep, dropped = providers.filter_free_models(ids, "openrouter")
+    assert keep == ["qwen/qwen3.8-27b:free", "openrouter/free", "OpenRouter/Free"]
+    assert dropped == 2
+    # 其它渠道不过滤：它们返回的就是这个 Key 真正可调的模型，过滤会误删
+    assert providers.filter_free_models(ids, "nim") == (ids, 0)
+    assert providers.filter_free_models(ids, None) == (ids, 0)
+    # 显式放行（以后给 OpenRouter 充了值）：渠道里写 "free_only": false
+    assert providers.filter_free_models(ids, "openrouter", free_only=False) == (ids, 0)
+    # 单个判断
+    assert providers.is_free_or_model("x/y:free") is True
+    assert providers.is_free_or_model("openrouter/free") is True
+    assert providers.is_free_or_model("x/y") is False
+
+
+def test_openrouter_keeps_zero_priced_stealth_models():
+    """回归（2026-09-28）：`stealth/space-bunny-alpha` 这类**匿名 stealth 预览模型** pricing 全 0，
+    但 id **不带** `:free` 后缀 —— 只按后缀过滤会把它误杀。判据必须看 pricing。
+
+    实测：OpenRouter 那天全站 458 个里 pricing 全 0 的共 21 个（17 个带后缀 + 免费路由器
+    + space-bunny-alpha），只看后缀会漏掉它。"""
+    from app import providers
+    free_ids = {"stealth/space-bunny-alpha"}
+    # 名字不带后缀，但命中 pricing 白名单 → 免费
+    assert providers.is_free_or_model("stealth/space-bunny-alpha", free_ids) is True
+    assert providers.is_free_or_model("stealth/SPACE-BUNNY-ALPHA", free_ids) is True   # 大小写无关
+    assert providers.is_free_or_model("stealth/space-bunny-alpha", None) is False      # 不给集合 = 老行为
+    ids = ["openai/gpt-6", "stealth/space-bunny-alpha", "qwen/qwen3.8-27b:free"]
+    keep, dropped = providers.filter_free_models(ids, "openrouter", None, free_ids)
+    assert keep == ["stealth/space-bunny-alpha", "qwen/qwen3.8-27b:free"]
+    assert dropped == 1
+
+
+def test_harvest_collects_zero_priced_text_only_models():
+    """`_harvest` 把「pricing 全 0 且**输出仅 text**」的 id 收进 free_by_price；
+    含 audio 输出的（google/lyria-*）与付费模型都不收。"""
+    from app import providers
+    items = [
+        {"id": "stealth/space-bunny-alpha",
+         "pricing": {"prompt": "0", "completion": "0"},
+         "architecture": {"output_modalities": ["text"]}},
+        {"id": "google/lyria-3-pro-preview",              # 音频生成，价格也是 0
+         "pricing": {"prompt": "0", "completion": "0"},
+         "architecture": {"output_modalities": ["text", "audio"]}},
+        {"id": "openai/gpt-6",                            # 付费
+         "pricing": {"prompt": "0.00001", "completion": "0.00003"},
+         "architecture": {"output_modalities": ["text"]}},
+    ]
+    ids, _b, _ok, _no, free = providers._harvest(items)
+    assert set(ids) == {"stealth/space-bunny-alpha", "google/lyria-3-pro-preview", "openai/gpt-6"}
+    assert free == {"stealth/space-bunny-alpha"}          # lyria 被 audio 输出挡掉，gpt-6 付费
+
+
+def test_fetch_models_end_to_end_keeps_space_bunny():
+    """端到端：`fetch_models` 必须把 pricing 为 0 的 stealth 模型留在返回里
+    （走 `_harvest` → `filter_free_models` 这条真实链路）。"""
+    import asyncio
+    from app import providers
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": [
+                {"id": "stealth/space-bunny-alpha", "pricing": {"prompt": "0", "completion": "0"},
+                 "architecture": {"output_modalities": ["text"]}},
+                {"id": "openai/gpt-6", "pricing": {"prompt": "0.00001", "completion": "0.00003"},
+                 "architecture": {"output_modalities": ["text"]}},
+                {"id": "qwen/qwen3.8-27b:free", "pricing": {"prompt": "0", "completion": "0"},
+                 "architecture": {"output_modalities": ["text"]}},
+            ]}
+
+    class _Client:
+        async def get(self, *a, **k):
+            return _Resp()
+
+    out = asyncio.run(providers.fetch_models(_Client(), "http://x/v1", "k", ch_type="openrouter"))
+    assert out == ["qwen/qwen3.8-27b:free", "stealth/space-bunny-alpha"]
+
+
+def test_refresh_channel_passes_free_only_through():
+    """refresh_channel 必须把渠道类型与 `free_only` 透传给 providers（否则过滤形同虚设）。"""
+    import asyncio
+    from app import providers
+    seen = {}
+
+    async def fake(client, base_url, api_key, ch_type=None, free_only=None):
+        seen["ch_type"] = ch_type
+        seen["free_only"] = free_only
+        return ["qwen/qwen3.8-27b:free"]
+
+    orig = providers.fetch_models
+    providers.fetch_models = fake
+    try:
+        _reset()
+        ch = {"id": "c_or", "type": "openrouter", "name": "OR", "base_url": "http://x/v1",
+              "api_key": "k", "enabled": True, "free_only": False}
+        cs = asyncio.run(gateway.refresh_channel(None, ch))
+        assert seen == {"ch_type": "openrouter", "free_only": False}
+        assert cs.models == ["qwen/qwen3.8-27b:free"]
+    finally:
+        providers.fetch_models = orig
+
+
+def test_restore_drops_legacy_unverified_list(tmp_path, monkeypatch):
+    """旧格式（无截止时间的字符串列表）在重启时**按已过期处理**，不再续命。
+
+    线上那批 405 条就是这么攒出来的：只要该 (模型,渠道) 没被成功调用过一次，就永久挂着
+    「冷却已到期，待实测确认」。新格式带截止时间 → 超期自动放行；
+    新格式里的未到期项仍照常恢复。"""
+    import json
+    import time as _t
+    from app import store as _store
+    _reset()
+    p = tmp_path / "rt.json"
+    monkeypatch.setattr(_store, "RUNTIME_STATE_PATH", str(p))
+    p.write_text(json.dumps({"unverified": ["a|c1", "b|c1"]}), encoding="utf-8")
+    gateway.restore_runtime_state()
+    assert gateway.unverified == set()          # 旧格式：一条都不留
+    assert gateway._unverified_until == {}
+    # 新格式：未到期的收下，已过期的丢掉
+    _reset()
+    p.write_text(json.dumps({"unverified": {"a|c1": _t.time() + 600,
+                                            "b|c1": _t.time() - 600}}), encoding="utf-8")
+    gateway.restore_runtime_state()
+    assert ("a", "c1") in gateway.unverified
+    assert ("b", "c1") not in gateway.unverified
+    assert gateway.is_unverified(("a", "c1")) is True
+
+
+def test_restore_seed_cooldown_skips_preempt_exempt_channels(tmp_path, monkeypatch):
+    """重启时的「保守 seed 冷却」只给预判真正生效的渠道，魔搭这类豁免渠道不 seed。
+
+    为什么：seed 的原料是 throttle 自学水位，而魔搭的水位本身是噪声（平台动态限速，
+    见 `_PREEMPT_EXEMPT_TYPES`）。拿它 seed 一个 300s 冷却 = 「重启后又受限五分钟」，
+    正是用户报的「测试通过却还是受限」。"""
+    import time as _t
+    from app import store as _store
+    from app import throttle as th
+    _reset()
+    th._CALLS.clear()
+    th._LEARN.clear()
+    monkeypatch.setattr(_store, "RUNTIME_STATE_PATH", str(tmp_path / "rt.json"))
+    # 恢复路径自己去读配置判渠道类型 → 这里直接给一份含魔搭 + 普通渠道的配置
+    monkeypatch.setattr(gateway, "_load_cfg_safe",
+                        lambda: _cfg([{"id": "c_ms", "type": "modelscope"},
+                                      {"id": "c_groq", "type": "groq"}]))
+    now = _t.time()
+    for cid, mid in (("c_ms", "m1"), ("c_groq", "m2")):
+        for _ in range(10):
+            th.record_call(cid, mid, now - 30)
+        th.observe_429(cid, mid, now)
+        for _ in range(12):
+            th.record_call(cid, mid, now + 1800 - 60)
+        th.observe_429(cid, mid, now + 1800)   # 样本 ≥2 → 启用预判
+    gateway.save_runtime_state()
+    # 模拟重启：清内存后恢复
+    gateway.cooldown.clear()
+    th._CALLS.clear()
+    th._LEARN.clear()
+    gateway.restore_runtime_state()
+    assert ("m2", "c_groq") in gateway.cooldown        # 普通渠道：seed 300s 保守冷却
+    assert ("m1", "c_ms") not in gateway.cooldown      # 魔搭：水位是噪声，不 seed
+    assert ("c_groq", "m2") in th.learned_pairs()      # 水位本身仍恢复（只是不转成冷却）
+
+
+def test_load_cfg_safe_survives_broken_config(monkeypatch):
+    """配置读不到时恢复流程照走：`_load_cfg_safe` 兜成 {}，不抛异常。"""
+    from app import config as cfgmod
+
+    def _boom():
+        raise RuntimeError("config.json 读盘失败")
+    monkeypatch.setattr(cfgmod, "load_config", _boom)
+    assert gateway._load_cfg_safe() == {}
+    # 渠道类型查不到 → "" → preemption_on("") is True（保持旧行为，不误伤）
+    assert gateway._channel_type_of("c1", {}) == ""
+    assert gateway.preemption_on("", {}) is True
+
+
+def test_modelscope_preemption_disabled():
+    """魔搭不做 429 预判（`_PREEMPT_EXEMPT_TYPES`），其它渠道照旧。
+
+    魔搭官方限制页写明并发按平台实时压力动态调整，429 与我们的调用量无关；
+    自学水位学到的其实是「当时平台有多忙」，会低到 3~29 次/天并把主力模型全部预判掉。"""
+    import time as _t
+    from app import throttle as th
+    _reset()
+    assert gateway.preemption_on("modelscope", {"adaptive_preemption": True}) is False
+    assert gateway.preemption_on("custom", {"adaptive_preemption": True}) is True
+    assert gateway.preemption_on("custom", {"adaptive_preemption": False}) is False
+    # 端到端：预判即便成立，魔搭模型也不该被判受限
+    th._CALLS.clear(); th._LEARN.clear()
+    now = _t.time()
+    for _ in range(10):
+        th.record_call("ms", "m1", now - 30)
+    th.observe_429("ms", "m1", now)
+    for _ in range(12):
+        th.record_call("ms", "m1", now - 5)
+    th.observe_429("ms", "m1", now)
+    assert th.blocked("ms", "m1") is True
+    ch = _chan("ms", ["m1"])
+    ch["type"] = "modelscope"
+    entry = gateway.model_view(_cfg([ch]))[0]["channels"][0]
+    assert entry["preempted"] is False and entry["available"] is True
+    th._CALLS.clear(); th._LEARN.clear()
 
 
 
@@ -1744,14 +2243,97 @@ def test_ratelimit_reset_ts_never_zero():
     assert gateway.ratelimit[("m_x", "c")]["reset_ts"] > _t.time()
 
 
-def test_next_ms_daily_reset_is_next_utc8_midnight():
-    import calendar
+def test_ms_quota_reset_ts_follows_pool_policy():
+    """魔搭额度头里的 reset_ts 与 `free_pool`/渠道冷却**同一口径**（都问「魔搭魔粒池见底、
+    什么时候能再试」）—— 默认「到次日 00:05」。
+
+    历史上这里按「下一个 UTC+8 零点」算，之后改过 30 分钟有界窗；2026-09-27 起
+    与 `_ms_pool_cool_secs()` 统一（见那里：30 分钟窗在额度真用完时会让界面来回跳绿）。
+    关键约束：**不能出现 0** —— `ratelimit_exhausted` 只在 reset_ts 为正且已过期时解除跳过。"""
     import time as _t
-    base = calendar.timegm((2026, 9, 20, 12, 0, 0, 0, 0, 0))   # 12:00 UTC = 20:00 UTC+8
-    r = gateway._next_ms_daily_reset(base)
-    assert r - base == 4 * 3600 + 60
-    g = _t.gmtime(r - 60 + 8 * 3600)                           # 去掉缓冲、平移回 UTC+8
-    assert (g.tm_hour, g.tm_min, g.tm_sec) == (0, 0, 0)
+    base = 1790000000.0
+    assert gateway._ms_quota_reset_ts(base) - base == gateway._secs_to_tomorrow(base)
+    assert 600 <= gateway._ms_quota_reset_ts(base) - base <= 86400
+    assert gateway._ms_quota_reset_ts(base) > base              # 绝不为 0
+    # 走一遍真实路径：账号级头见底 → 整渠道冷却，与 reset_ts 同一量级（不是 30 分钟的死循环）
+    _reset()
+    gateway.note_ratelimit_headers("c_ms", "m", _Headers({
+        "modelscope-ratelimit-requests-remaining": "0"}))
+    assert gateway.channel_cooling("c_ms")
+    left = gateway.channel_cool["c_ms"] - _t.time()
+    assert 600 <= left <= 86400, left
+    # 非魔搭的日额度渠道仍是「冷却到明天」（下限 600s）
+    _reset()
+    gateway.mark_channel_quota_exhausted("c_gem", "日额度用完", "gemini")
+    assert 599 <= gateway.channel_cool["c_gem"] - _t.time() <= 86400
+
+
+def test_ms_pool_policy_switch_and_cool_text():
+    """「魔粒真不足」停多久是一个**开关**，文案跟着它走。
+
+    **2026-09-27 起默认 `False` = 「冷却到次日 00:05」**。原先默认 30 分钟有界重试，
+    在额度真的用完时变成死循环 + 界面来回跳绿（用户原话：「额度已经用完了，但它还是
+    一会就跳出来显示可用」）。原因链见 `gateway._ms_pool_cool_secs` 的 docstring。
+    这条用例把两个方向都钉住，改开关时不会漏改文案。"""
+    import time as _t
+    assert gateway.cool_duration_text(120) == "2 分钟"
+    assert gateway.cool_duration_text(1800) == "30 分钟"
+    assert gateway.cool_duration_text(86400) == "至明天 00:05"
+    assert gateway.cool_duration_text(0) == "不冷却"
+    assert gateway.cool_duration_text(None) == "未知时长"
+    # 默认：到次日 00:05
+    assert gateway._MS_POOL_BOUNDED_RETRY is False
+    assert 600 <= gateway._ms_pool_cool_secs() <= 86400
+    label, secs, note = gateway.classify_429(
+        '{"error":{"message":"insufficient balance"}}', "modelscope")
+    assert label == "free_pool" and 600 <= secs <= 86400
+    assert "魔粒" in note
+    _reset()
+    gateway.mark_channel_quota_exhausted("c_ms", "魔粒不足", "modelscope")
+    left = gateway.channel_cool["c_ms"] - _t.time()
+    assert 599 <= left <= 86400, left
+    assert gateway.channel_cool_reason["c_ms"] == "魔粒不足"
+    # 反向：置 True 回到 30 分钟有界重试窗（魔粒其实还有、只是撞了瞬时限速的时期）
+    orig = gateway._MS_POOL_BOUNDED_RETRY
+    gateway._MS_POOL_BOUNDED_RETRY = True
+    try:
+        assert gateway._ms_pool_cool_secs() == gateway._MS_POOL_COOL == 1800
+        label, secs, note = gateway.classify_429(
+            '{"error":{"message":"insufficient balance"}}', "modelscope")
+        assert label == "free_pool" and secs == 1800, (label, secs)
+        assert "分钟" in note                   # 文案必须跟着开关走
+        _reset()
+        gateway.mark_channel_quota_exhausted("c_ms", "魔粒不足", "modelscope")
+        assert gateway.channel_cool["c_ms"] - _t.time() <= gateway._MS_POOL_COOL + 5
+    finally:
+        gateway._MS_POOL_BOUNDED_RETRY = orig
+
+
+def test_secs_to_tomorrow_midnight_edges():
+    """`_secs_to_tomorrow` 必须落在「下一个 00:05」，**00:00–00:05 不许算成 24 小时**。
+
+    旧实现用 `(24-h-1)*3600 + (60-m-1)*60 + (65-s)` 的算术式：在 00:00 得 86405 →
+    被上限夹成 86400。后果是「刚过午夜撞一次额度 → 被封一整天」，
+    而 00:05 之后本来就是到明天，所以这个 bug 只在那 5 分钟里现形、很难撞到。"""
+    import time as _t
+    def at(h, mi, s=0):
+        """构造「今天 h:mi:s」的时间戳（用真实日期；tm_isdst=-1 = 交给系统判，与实现一致）"""
+        lt = _t.localtime()
+        return _t.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, mi, s, 0, 0, -1))
+    # 00:00 / 00:04 → 只该停到**今天** 00:05（被 600s 下限托住），绝不是 24 小时
+    assert gateway._secs_to_tomorrow(at(0, 0)) == 600
+    assert gateway._secs_to_tomorrow(at(0, 4, 59)) == 600
+    # 00:05 整 → 今天的窗口已过，下一个是明天 00:05
+    assert gateway._secs_to_tomorrow(at(0, 5)) == 86400
+    # 常规时刻：就是到明天 00:05 的秒数（±1s 允许跨整秒）；避开 23:55 之后那段
+    # ——那里真实剩余 < 600s，会被**刻意的下限**托到 600（单独断言在下面）。
+    for h, mi in ((12, 0), (6, 30), (20, 13), (23, 50)):
+        got = gateway._secs_to_tomorrow(at(h, mi))
+        want = at(0, 5) + 86400 - at(h, mi)
+        assert abs(got - want) <= 1, (h, mi, got, want)
+    # 23:56 → 真实只剩 ~9 分钟 → 用下限 600s，别让它在 00:05 刚过就再撞一次
+    assert gateway._secs_to_tomorrow(at(23, 58)) == 600
+    assert gateway._secs_to_tomorrow(1790000000.0) >= 600
 
 
 def test_ratelimit_x_headers_path_unchanged():

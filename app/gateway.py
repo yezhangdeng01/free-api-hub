@@ -1,4 +1,5 @@
 """运行时状态：渠道健康、模型注册表、评分排序、错误分类冷却"""
+import asyncio
 import collections
 import hashlib
 import logging
@@ -6,7 +7,7 @@ import math
 import re
 import time
 
-from . import capability, providers, throttle
+from . import capability, modelcat, providers, throttle
 
 # 失败冷却秒数（按错误类型分类，借鉴 FreeLLMAPI 的智能路由思想）
 COOLDOWN_SECONDS = {
@@ -20,6 +21,53 @@ DEFAULT_COOLDOWN = 120
 
 cooldown: dict = {}   # (上游模型ID, channel_id) -> 冷却截止时间
 unverified: set = set()  # 冷却到期但还没实测确认恢复的 (模型, 渠道)
+# 「待实测确认」的**暂挂期**：冷却到期后靠它再压一会儿，等一次真实调用/探测确认恢复。
+# 为什么要有截止时间（2026-09-26 加）：这个集合此前只增不减——只有「该 (模型,渠道)
+# 自己成功一次」才会移除，而自动探测只覆盖 probe_used_models 里用过的模型，于是没人用的
+# 模型会**永久**显示「冷却已到期，待实测确认」= 永久受限（线上实测：405 条待验证，
+# 其中魔搭 11 个模型卡住；还有 4 个「响应没有 choices」的图生图模型，用文本 ping 永远
+# 测不过 → 永远出不来）。现在超期自动放行：宁可让它回到候选里被真实路由证伪，
+# 也不要挂着一个没人会去点的「受限」。`_unverified_until` 只在到期时移除
+# `unverified` 里的成员，所以「key in unverified」这类既有读法仍然成立。
+_UNVERIFIED_TTL = 1800
+_unverified_until: dict = {}  # (模型,渠道) -> 暂挂截止时间
+# **暂挂期只叠在「等一个时刻」的冷却上**：冷却时长 ≥ 这个阈值（额度型：free_daily 到明天、
+# free_pool 有界窗、渠道级停摆）才加 30 分钟暂挂；分钟级限流（90~300s）不加。
+#
+# 为什么（2026-09-26 复盘 魔搭 32 次 429，实测全部是 minute 档）：
+# 分钟的限流窗口过了就是真的过了 —— 平台那一分钟的并发压力散了，模型立刻可用。再压 30 分钟
+# 「冷却已到期，待实测确认」，等于把一次 1.5 分钟的抖动放大成 30 分钟的受限；
+# 57 次这样的抖动叠加起来，界面就长期一片黄，用户看到的就是「撞了一次额度、半天缓不过来」。
+# 额度型的冷却不一样：它到期只说明「时间到了」，不代表额度回来了（次日/领魔粒才算），
+# 所以那种情况必须多压一会儿，等一次实测确认。这条区分也正好对上用户问的
+# 「真额度用完 vs 短时高并发撞墙」——见 classify_429 的判据表。
+_UNVERIFIED_MIN_COOL = 600
+
+
+def _mark_unverified(key: tuple, now: float = None):
+    """记一次「待实测确认」并起算暂挂期（失败路径唯一入口）。
+
+    只该被 `mark_result` 在「冷却时长 ≥ `_UNVERIFIED_MIN_COOL`」时调用 —— 分钟级限流
+    调用它是错的（见上面的常量说明）。"""
+    now = now if now is not None else time.time()
+    unverified.add(key)
+    _unverified_until[key] = now + _UNVERIFIED_TTL
+
+
+def is_unverified(key: tuple, now: float = None) -> bool:
+    """该 (模型,渠道) 是否还在「冷却到期但未实测」的暂挂期内（过期即自动放行）。
+
+    读的时候顺手清 —— 不用额外的清扫循环，任何一条读路径都不会读到过期项。
+    没有截止时间的（极老的落盘数据）按原样视为暂挂，等下一次 mark_result 覆盖。"""
+    now = now if now is not None else time.time()
+    until = _unverified_until.get(key)
+    if until is None:
+        return key in unverified
+    if until <= now:
+        unverified.discard(key)
+        _unverified_until.pop(key, None)
+        return False
+    return True
 stats: dict = {}      # (上游模型ID, channel_id) -> {"score": 0~1, "latency": EMA毫秒}
 # 模型级测试记录。**自 2026-09-21（用户拍板 A1）起不再参与任何可用性 / 路由判定**，只用于
 # 界面展示「最近一次测过什么」（tested / test_reason / test_channel / test_ts）。
@@ -36,7 +84,8 @@ ratelimit: dict = {}
 user_quota: dict = {}
 # 各口径限流头的命中计数（排障用）：重启后看一眼就知道魔搭的头到底有没有被读到
 ratelimit_hits: dict = {"modelscope": 0, "x-ratelimit": 0}
-last_probe_ok: dict = {}  # (模型, 渠道) -> 上次探测成功的 ts（魔搭等按次计费平台用于省探测预算）
+last_probe_ok: dict = {}  # (模型, 渠道) -> 上次探测成功的 ts。⚠️ 当前**无使用者**：魔搭已豁免
+                          # 自动探测（见 `probe_exempt`），留作以后按平台做探测节流用
 
 # ---- 渠道级 429 熔断（修魔搭等账号级限流：整个 Key 被限，所有模型一起 429）----
 _CH429_WINDOW = 600    # 10 分钟窗口
@@ -44,6 +93,11 @@ _CH429_MIN_MODELS = 2  # 窗口内 ≥2 个不同模型撞 429 → 判定账号�
 _CH429_COOL = 600      # 渠道冷却 10 分钟
 _channel_429_events: dict = {}  # channel_id -> deque[(ts, model_id)]
 channel_cool: dict = {}  # channel_id -> 冷却截止时间
+# 冷却**原因**（给人看的短句：「魔粒余额不足」/「渠道级 429 熔断」/「魔搭账号级额度见底」）。
+# 为什么用平行表而不是把 channel_cool 的值改成 dict：channel_cool 到处按 float 读
+# （`channel_cooling` / `model_view` / `overview` / 落盘），改结构要动一圈，
+# 而这里只服务一句界面文案。**只在冷却有效期内有意义**，随 channel_cool 一起清理。
+channel_cool_reason: dict = {}
 channel_last_ok: dict = {}  # channel_id -> 最近一次成功请求的 ts（区分账号级/按模型限流）
 
 # ---- 额度型 429（free_daily）：模型级 vs 账号级 ----
@@ -74,6 +128,50 @@ def channel_recently_ok(cid: str, within: float = _AUTH_MODEL_LEVEL_WINDOW) -> b
     return bool(ts and time.time() - ts < within)
 
 
+# ---- 429 预判（throttle 自学水位）该不该对某类渠道生效？----
+# 水位的假设是「429 = 我们打太多」，对 Groq/NIM/Gemini 这类有明确 RPM/RPD 的平台成立。
+# 魔搭（modelscope）不成立：官方 API-Inference 限制页写明并发**按平台实时压力动态调整**，
+# 429 说的是「平台现在忙」，与我们的调用量无关 —— 学到的其实是当时的平台负载，
+# 于是水位低到 3~29 次/天，几小时内就把这条渠道的主力模型全部预判掉。
+# 2026-09-26 实测：魔搭 5 个模型 status=limited/preempted，其中 DeepSeek-V4.1-Flash、
+# Qwen/Qwen3.8-27B 手动测试与直连上游都返回 200（429 正文是
+# `We have to rate limit you for model X...`，而同一批并发请求里另有 4 个 200 —— 动态限速）。
+_PREEMPT_EXEMPT_TYPES = {"modelscope"}
+
+
+def preemption_on(ch_type: str, cfg: dict = None) -> bool:
+    """该渠道类型是否启用「429 自学预判」（配置里关掉即全局关闭）。"""
+    if cfg is not None and not cfg.get("adaptive_preemption", True):
+        return False
+    return not quota_agnostic_429(ch_type)
+
+
+def quota_agnostic_429(ch_type: str) -> bool:
+    """该渠道类型的 429 **只说明「平台此刻忙」，不说明我们账号被限**。
+
+    魔搭（2026-09 实测正文 `We have to rate limit you for model X. If you need higher
+    limits, ...`，官方限制页写明并发**按平台实时压力动态调整**）。同一组渠道有两处后果，
+    必须一起关掉，否则会出现「瞬时撞墙被当成账号级额度用完」：
+      · 不做 429 自学预判（`preemption_on`）——水力学到的是「平台有多忙」；
+      · 不做渠道级 429 熔断（`note_channel_429`）——多模型一起 429 正是高并发的样子。
+    真账号级的唯一信号是**正文自己说余额/魔粒不足**（`classify_429` → `free_pool`）。"""
+    return (ch_type or "") in _PREEMPT_EXEMPT_TYPES
+
+
+# ---- 自动探测（`probe_used_models`）该不该对某类渠道生效？----
+# 魔搭（modelscope）2026-08 起改为**魔粒体系**：魔粒登录发放、调用即消耗，
+# 而探测发的也是真请求（1-token ping）→ **探测在烧魔粒**；换来的却只是噪声状态
+# （它的 429 是平台动态限速，与我们的调用量无关，见上面 `_PREEMPT_EXEMPT_TYPES`）。
+# 结论：魔搭只信**真实调用**的结果，不再自动探测（2026-09-27 用户要求）。
+# 手动「测试 / 扫描该渠道」**不受影响** —— 那是用户主动点的，愿意花这一次额度。
+_PROBE_EXEMPT_TYPES = {"modelscope"}
+
+
+def probe_exempt(ch_type: str) -> bool:
+    """该渠道类型是否**跳过自动探测**（`probe_used_models`）。"""
+    return (ch_type or "") in _PROBE_EXEMPT_TYPES
+
+
 class ChannelState:
     def __init__(self):
         self.valid = None          # None=未检测 True/False
@@ -84,6 +182,12 @@ class ChannelState:
         self.quota = None
         self.quota_ts = 0
         self.quota_error = None
+        # 拉模型列表失败、但渠道靠「额外模型」兜住了时的原因（只为界面提示，不是报错）。
+        # 典型：Cloudflare Workers AI 的 OpenAI 兼容端点没有 /models，用户手填模型名。
+        self.list_error = None
+        # 本轮由「自动补全」探活通过后加进来的模型（见 auto_add_models）。
+        # 只为界面显示来源，不影响路由 —— 它们和上游列表里的模型同等对待。
+        self.auto_added: list = []
 
 
 # 全局状态表
@@ -106,6 +210,9 @@ def sync_channels(cfg: dict):
         if key[1] not in ids:
             cooldown.pop(key, None)
     unverified.difference_update(k for k in list(unverified) if k[1] not in ids)
+    for k in list(_unverified_until):
+        if k[1] not in ids:
+            _unverified_until.pop(k, None)
     for key in list(stats):
         if key[1] not in ids:
             stats.pop(key, None)
@@ -124,6 +231,7 @@ def sync_channels(cfg: dict):
     for cid in list(channel_cool):
         if cid not in ids:
             channel_cool.pop(cid, None)
+            channel_cool_reason.pop(cid, None)
             _channel_429_events.pop(cid, None)
     for cid in list(channel_quota_429):
         if cid not in ids:
@@ -149,32 +257,117 @@ def mark_channel_up(mid: str, cid: str):
 # ⚠️ 光看正文分不出后两者：**魔搭的每日免费额度用完，正文就是 `insufficient balance`**
 # （2026-09-12 实测：魔搭 429 → {"error":{"message":"insufficient balance"}}，翌日自动恢复；
 #  OpenRouter 同样正文则是真没 credits，要充值）。所以必须结合渠道类型：
-#  - 免费额度型渠道（modelscope/gemini/nim/agnes/huggingface）：额度类措辞一律当「等窗口刷新」；
+#  - 免费额度型渠道（gemini/nim/agnes/huggingface）：额度类措辞一律当「等窗口刷新」；
+#  - 魔搭见 `_MS_POOL_TYPES`（2026-08 起是**魔粒池**，不是日额度，单独一档）；
 #  - 其它（有余额接口的付费渠道）：余额/额度不足 → 需充值 → down，等不来自愈。
 # 最权威的判据是平台余额接口（providers.check_quota），调用方查得到就覆盖这里的推断。
-_FREE_QUOTA_TYPES = {"modelscope", "gemini", "nim", "agnes", "huggingface"}
+_FREE_QUOTA_TYPES = {"gemini", "nim", "agnes", "huggingface"}
+# 魔搭（modelscope）单独一档：2026-08 起魔搭把「每日 2000 次免费」改成**魔粒体系**
+# （官方：登录每天发 200 魔粒、做社区任务最高 500；短期魔粒 24h 有效、长期 90 天；
+#  API-Inference 按 轻量 0.5 / 主流 1 / 旗舰 2 魔粒每次扣减）。
+# ⇒ 魔粒**不是**按自然日刷新的（登录/做任务才发），所以严格说没有「00:00 重置」这个点；
+#   但「今天撞完了就停到明天」才是用户要的口径（详见 `_ms_pool_cool_secs` 的说明）。
+_MS_POOL_TYPES = {"modelscope"}
+_MS_POOL_COOL = 1800     # 有界重试窗：撞额度后 30 分钟再试一次（仅在开关置 True 时生效）
+# 魔搭**真·魔粒不足**（正文写明余额/魔粒不足，不是瞬时限速）时，整条渠道停多久？
+#   · `False`（**当前默认**）：跟其它免费日额度渠道一样「冷却到次日 00:05」。
+#     理由见 `_ms_pool_cool_secs`：30 分钟有界窗在「额度真用完」时是死循环，
+#     界面会 30 分钟绿/30 分钟黄地来回跳（2026-09-27 用户报的就是这个）。
+#   · `True`：30 分钟有界重试（早先默认；适合「魔粒其实还有、只是撞了瞬时限速」的时期）。
+# 两种口径下 `_ms_pool_cool_secs()`（渠道冷却时长）、`classify_429` 文案、
+# `_ms_quota_reset_ts`（额度头 reset_ts）**都会自动跟着走**，不需要改别处。
+_MS_POOL_BOUNDED_RETRY = False
 _PAID_TEXT = ("insufficient balance", "insufficient_quota", "insufficient funds",
               "credit balance", "no credit", "recharge", "top up", "add credit",
               "purchase", "billing", "余额", "充值", "欠费", "资源包", "购买")
+
 _FREE_TEXT = ("free tier", "freetier", "free-models-per-day", "免费额度",
               "daily", "per day", "day limit", "monthly",
               "今日", "每日", "当日", "已用完", "用尽", "quota exceeded", "exceeded your current quota")
 _MINUTE_429 = ("per minute", "per-min", "rpm", "per hour", "too many requests",
-               "too frequent", "rate limit", "每分钟", "频繁", "速率", "minute limit")
+               "too frequent", "rate limit", "每分钟", "频繁", "速率", "minute limit",
+               # 中文平台的「短时限流」措辞（2026-10-07 加）。
+               # 智谱账号余额 ¥0 时，免费模型撞限流的正文是
+               # `{"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"}}`
+               # —— 上面那批只认「频繁 / 速率 / 每分钟」，一个都不命中 → 落到 `unknown`
+               # → 再被 main.model_test 的「余额 ≤ 0」兜底接住 → 判成
+               # 「账户余额不足，需充值」+ state=down（**永久不可用，永不自愈**）。
+               # 结果：智谱的免费模型（本来就不看余额）被自己的余额判据误杀。
+               # 用户实际看到的：`glm-4.7-flash` 在模型页显示红点「不可用」。
+               "访问量过大", "当前访问量", "稍后再试", "稍后重试", "服务繁忙",
+               "系统繁忙", "请稍候", "负载过高", "过载")
+
+# `_MINUTE_429` 的子集：这些措辞说的是「**上游此刻负载高**」，不是「你按分钟超频了」。
+# 冷却时长一样，但文案要分开写 —— 智谱 1305「访问量过大」说成「每分钟限流」会让人
+# 以为等一分钟就好，实际可能整个高峰期都不通（2026-10-07 用户实测反馈）。
+_LOAD_429 = ("访问量过大", "当前访问量", "服务繁忙", "系统繁忙", "负载过高", "过载", "请稍候")
 
 
-def _secs_to_tomorrow() -> int:
-    """冷却到下一个 00:05（额度按天刷新，留 5 分钟缓冲）"""
-    t = time.localtime()
-    secs = (24 - t.tm_hour - 1) * 3600 + (60 - t.tm_min - 1) * 60 + (65 - t.tm_sec)
-    return int(min(max(secs, 600), 86400))
+def _minute_note(text: str) -> str:
+    """minute 档的人话说明（给界面看，决定用户要不要等、等多久）。"""
+    if any(k in text for k in _LOAD_429):
+        return "上游负载高，暂时限流（稍后自动重试）"
+    return "每分钟限流"
+
+
+def _secs_to_tomorrow(now: float = None) -> int:
+    """冷却到**下一个 00:05**（额度按天刷新，留 5 分钟缓冲）。
+
+    ⚠️ 不要再用「(24-h-1)*3600 + (60-m-1)*60 + (65-s)」那种算术式：它在
+    **00:00:00–00:05:00** 这一段会算出 86405 秒（被上限夹成 24 小时）——
+    刚过午夜撞一次额度就被封一整天。直接落到「下一个 00:05」这个**时刻**，
+    边界自然正确（00:04 → 1 分钟；00:06 → 23h59m）。
+    下限 600s：避免 00:05 前后刚冷却 1 分钟就又去撞一次。"""
+    now = now if now is not None else time.time()
+    t = time.localtime(now)
+    today_005 = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 5, 0, 0, 0, -1))
+    target = today_005 + 86400 if now >= today_005 else today_005
+    return int(min(max(target - now, 600), 86400))
+
+
+def _ms_pool_cool_secs(now: float = None) -> int:
+    """魔搭真·魔粒不足时整条渠道停多久（见 `_MS_POOL_BOUNDED_RETRY`）。
+
+    `now` 透传给 `_secs_to_tomorrow`：调用方常常带着一个显式时刻（测试、重放日志），
+    这里若偷偷用 `time.time()`，就会出现「按 20:00 算出的冷却 + 按现在算的时长」。
+
+    ⚠️ 2026-09-27 改为**默认「冷却到次日 00:05」**。原先默认 30 分钟有界重试，
+    在「额度真的用完了」时是个死循环，而且**界面上会来回跳绿**：
+        18:40 撞额度 → 停 30 分（至 19:10）→ 到点无声放行、35 个模型全绿
+        → 19:37 再撞 → 又停 30 分 → 20:07 又全绿 → …
+    这就是用户报的「额度已经用完了，但它还是一会就跳出来显示可用」。
+    判断依据：魔粒虽是登录/做任务发放、没有 00:00 这个刷新点，但**用户的心智和实际
+    行为就是「今天的没了，明天再说」**；而「429 不花钱、重试成本≈0」这个理由在
+    30 分钟一次、每次都失败的情况下不成立（只是让界面反复变绿）。
+    想要回 30 分钟有界重试：把 `_MS_POOL_BOUNDED_RETRY` 置 True 即可 ——
+    渠道冷却时长、`classify_429` 文案、额度头 reset_ts 会一起跟着走。"""
+    return _MS_POOL_COOL if _MS_POOL_BOUNDED_RETRY else _secs_to_tomorrow(now)
+
+
+def cool_duration_text(secs: int) -> str:
+    """把冷却秒数写成给用户看的话：「至明天 00:05」/「30 分钟」。
+
+    只在 ≥2 小时时才说「明天」—— 否则 86400 秒会显示成「1440 分钟」，
+    而 600 秒显示成「10 分钟」。"""
+    try:
+        secs = int(secs)
+    except (TypeError, ValueError):
+        return "未知时长"
+    if secs <= 0:
+        return "不冷却"
+    return "至明天 00:05" if secs >= 7200 else f"{max(1, round(secs / 60))} 分钟"
 
 
 def classify_429(body: str, ch_type: str = None, retry_after=None) -> tuple:
-    """解析 429 响应体 → (类型, 建议冷却秒数, 可读说明)。四档：
+    """解析 429 响应体 → (类型, 建议冷却秒数, 可读说明)。五档：
 
     paid_balance → 冷却 0（调用方按 down 处理：等不来自愈，要充值/换 key）
-    free_daily   → 冷却到明天凌晨（免费额度按天刷新，次日自动回来）。
+    free_pool    → 魔搭**魔粒池**不足：整条渠道冷却 `_ms_pool_cool_secs()`
+                   （默认「到次日 00:05」，`_MS_POOL_BOUNDED_RETRY=True` 时为 30 分钟）。
+                   **账号级**（魔粒全账号共享，一个模型没了 = 该 Key 下全都没了），
+                   所以调用方直接 `mark_channel_quota_exhausted` 停整条渠道，
+                   不必再走 `note_channel_quota_429` 的爆发度判定
+    free_daily   → 冷却到明天凌晨（日额度型免费渠道，次日自动回来）。
                    **这只是「该模型冷却到明天」**；要不要升级成整渠道停摆，由调用方用
                    `note_channel_quota_429` 按「短窗口内几个不同模型撞过」判定（见那里）
     minute       → 90 秒（上游给了 Retry-After 就用它）
@@ -186,20 +379,51 @@ def classify_429(body: str, ch_type: str = None, retry_after=None) -> tuple:
     free_ch = (ch_type or "") in _FREE_QUOTA_TYPES
     paid = any(k in text for k in _PAID_TEXT)
     daily = any(k in text for k in _FREE_TEXT)
+    if (ch_type or "") in _MS_POOL_TYPES:
+        # 魔粒池：**靠正文措辞区分两类 429**（这是用户问的「真额度用完 vs 短时高并发撞墙」）：
+        #
+        # | 正文特征                        | 判定        | 后果                      |
+        # |--------------------------------|------------|---------------------------|
+        # | 余额/魔粒不足（insufficient…）    | `free_pool` | **账号级**：整渠道停到次日 00:05 |
+        # | `rate limit you for model`      | `minute`    | **模型级**：只冷这一个 (模型,渠道) 90s |
+        # | 两者都读不出                     | `unknown`   | 模型级，300s 保守          |
+        #
+        # 为什么不能靠「有几个模型同时 429」来判账号级：魔搭的并发上限是**平台实时压力**决定的，
+        # 我们 8 并发实测里 4 个 200、4 个 429 —— 多模型同时 429 正是高并发的样子，不是额度问题。
+        # 所以 `note_channel_429` 的渠道级熔断对魔搭整体关闭（见 `quota_agnostic_429`）。
+        #
+        # 实测 429 正文（2026-09-26）：
+        # `We have to rate limit you for model X. If you need higher limits, ...`
+        # 命中 `_MINUTE_429` 的 "rate limit" → minute，与「平台动态限速」的事实一致。
+        if paid or daily:
+            label = "free_pool"
+            _secs = _ms_pool_cool_secs()
+            note = (f"魔粒余额不足，冷却{cool_duration_text(_secs)}"
+                    "（登录魔搭领/兑魔粒后即可恢复；任意一次测试成功会立刻解除）")
+        elif any(k in text for k in _MINUTE_429):
+            label, note = "minute", "平台动态限速（并发按实时压力调整）"
+        else:
+            label, note = "unknown", "暂时限流"
+        if label == "free_pool":
+            return (label, _ms_pool_cool_secs(), note)
+        if label == "minute":
+            return (label, max(90, int(retry_after or 0)), note)
+        return (label, 300, note)
     if free_ch:
         if paid or daily:
             label, note = "free_daily", "免费额度用完，冷却至明天（次日自动恢复）"
         elif any(k in text for k in _MINUTE_429):
-            label, note = "minute", "每分钟限流"
+            label, note = "minute", _minute_note(text)
         else:
             label, note = "unknown", "暂时限流"
     else:
+
         if paid:
             label, note = "paid_balance", "账户余额/额度不足，需充值或换 key（硬不可用）"
         elif daily:
             label, note = "free_daily", "额度用尽，冷却至明天"
         elif any(k in text for k in _MINUTE_429):
-            label, note = "minute", "每分钟限流"
+            label, note = "minute", _minute_note(text)
         else:
             label, note = "unknown", "暂时限流"
     # 上游给的 Retry-After 若很短，说明不是「额度到明天」那种限制
@@ -355,7 +579,6 @@ def is_permanent_failure(status: int, text: str = "") -> bool:
 
 
 # ---- 上游官方限流响应头：平台自己报的剩余额度，比自学水位精确 ----
-_MS_DAILY_TZ_OFFSET = 8 * 3600   # 魔搭日额度按 UTC+8 00:00 刷新
 _RL_NO_RESET_FALLBACK = 300.0    # 通用口径没给重置时刻时的兜底窗（见下）
 
 
@@ -383,33 +606,39 @@ def _header_int(headers, name: str):
         return None
 
 
-def _next_ms_daily_reset(now: float = None) -> float:
-    """下一个 UTC+8 00:00 的 epoch 秒（+60s 缓冲，避开刷新瞬间的竞态）。
+def _ms_quota_reset_ts(now: float = None) -> float:
+    """魔搭额度头里的「什么时候能再试」= 现在 + `_ms_pool_cool_secs()`。
 
-    魔搭 API-Inference 的日额度「每日 UTC+8 00:00 重置，不跨天累计」，但
-    **响应头只给剩余数、不给重置时刻**，所以必须自己算出来。
+    与 `classify_429` 判 `free_pool` 时用的**同一个口径**（都是「魔粒池见底」这件事，
+    不能两处给出不同的恢复时刻）：默认「到次日 00:05」；开关置 True 时为 30 分钟重试窗。
+
+    历史上这里按「下一个 UTC+8 00:00」算过：魔搭 2026-08 起用**魔粒体系**取代
+    「每日 2000 次免费调用」，魔粒是登录发放（短期 24h、长期 90 天）、做社区任务可加量，
+    严格说没有「次日 0 点重置」这个点。但**实践上「今天的用完了」就等明天**才是对的
+    （见 `_ms_pool_cool_secs` 里 2026-09-27 的复盘）。
 
     为什么非要有值：`ratelimit_exhausted` 只在 `reset_ts` 是正数且已过期时才解除跳过，
-    `reset_ts=0` 会让那一格**永久拉黑**。魔搭这条路径不允许出现 0。"""
-    now = now if now is not None else time.time()
-    g = time.gmtime(now + _MS_DAILY_TZ_OFFSET)   # 先平移成 UTC+8 日历，再数「今天过了多少秒」
-    into_day = g.tm_hour * 3600 + g.tm_min * 60 + g.tm_sec
-    return now + (86400 - into_day) + 60
+    `reset_ts=0` 会让那一格**永久拉黑**。这条路径不允许出现 0。"""
+    return (now if now is not None else time.time()) + _ms_pool_cool_secs(now)
 
 
-def note_ratelimit_headers(cid: str, mid: str, headers) -> bool:
+def note_ratelimit_headers(cid: str, mid: str, headers, ch_type: str = None) -> bool:
     """从响应头读平台给的官方额度信息并记录。返回 True = 本次读到有效数据。
 
     两套口径并存，**先魔搭后通用**（头名不冲突，各自独立判据）：
 
-    **① 魔搭 ModelScope**（`modelscope-ratelimit-*`；官方 API-Inference limits 文档有据，
-    **成功响应也带**，不像 OpenRouter 只有 429 才带）
-      - `...-model-requests-remaining` = 该**模型**当天剩余 → 粒度正好是 (模型,渠道)，
+    **① 魔搭 ModelScope**（`modelscope-ratelimit-*`）
+      - `...-model-requests-remaining` = 该**模型**剩余 → 粒度正好是 (模型,渠道)，
         写进 `ratelimit`；归零后 `ratelimit_exhausted` 会让路由跳过这一格，不用撞墙。
-      - `...-requests-remaining`       = 该**账号**当天剩余（跨所有模型共享）→ 写 `user_quota`；
+      - `...-requests-remaining`       = 该**账号**剩余（跨所有模型共享）→ 写 `user_quota`；
         归零后该 Key 下所有模型都会 429，直接走既有的 `mark_channel_quota_exhausted`。
-      - 两个 `...-limit` 一并记下：官方会**动态调整**单模型上限（大模型只有 100/天，
-        新模型/濒临下线还会再降），所以「上限」要从头里读，不能写死 500。
+      - 两个 `...-limit` 一并记下：官方会**动态调整**单模型上限，所以「上限」要从头里读。
+
+    ⚠️ **2026-09-26 实测：魔搭已经不回这 4 个头了**（直连上游 dump 全部响应头，
+    200 与 429 都没有任何 `modelscope-ratelimit-*`；进程内 `ratelimit_hits.modelscope`
+    长期为 0 是同一件事的证据，不是解析代码的问题）。魔粒体系下也不再适用「日剩余额度」
+    这个概念。整段保留是为了**头一旦回来仍能正确接住**，判据是
+    `grep 魔搭官方额度 data/api-hub.log` 重新出现。
 
     **② 通用 `x-ratelimit-*`**（Groq / NIM；OpenRouter 只在 429 时带）
       - `x-ratelimit-remaining-requests` / `x-ratelimit-remaining` 配
@@ -423,7 +652,7 @@ def note_ratelimit_headers(cid: str, mid: str, headers) -> bool:
     if ms_model is not None:
         cur = ratelimit.setdefault((mid, cid), {})
         cur["remaining"] = ms_model
-        cur["reset_ts"] = _next_ms_daily_reset()
+        cur["reset_ts"] = _ms_quota_reset_ts()
         cur["source"] = "modelscope"
         limit = _header_int(headers, "modelscope-ratelimit-model-requests-limit")
         if limit is not None:
@@ -435,12 +664,14 @@ def note_ratelimit_headers(cid: str, mid: str, headers) -> bool:
         user_quota[cid] = {
             "remaining": ms_user,
             "limit": _header_int(headers, "modelscope-ratelimit-requests-limit"),
-            "reset_ts": _next_ms_daily_reset(),
+            "reset_ts": _ms_quota_reset_ts(),
         }
         hit = True
-        # 账号级见底：整条渠道当天都调不动，立刻停到明天（不等第二个模型撞 429）
+        # 账号级见底：整条渠道都调不动，立刻停到「次日 00:05」（与 free_pool 同一口径）。
+        # 渠道类型直接写死 "modelscope" —— 走到这个分支就说明读到的是魔搭的头，
+        # 不依赖调用方传参（少一个「忘了传就退回旧语义」的坑）。
         if ms_user <= 0 and not channel_cooling(cid):
-            mark_channel_quota_exhausted(cid, "魔搭账号级日额度用完")
+            mark_channel_quota_exhausted(cid, "魔搭账号级额度见底", ch_type or "modelscope")
 
     if hit:
         n = ratelimit_hits.get("modelscope", 0) + 1
@@ -487,11 +718,26 @@ def ratelimit_exhausted(mid: str, cid: str, now: float = None) -> bool:
     return True
 
 
-def note_channel_429(cid: str, mid: str, retry_after: int = None):
+def note_channel_429(cid: str, mid: str, retry_after: int = None,
+                     ch_type: str = None) -> bool:
     """渠道级 429 计数：窗口内 ≥2 个不同模型撞 429 → 判定账号级限流，整个渠道进冷却。
-    这样魔搭这类按 Key 限流的平台被限后，UI 会显示受限而不是全绿。
-    例外：渠道 2 分钟内刚有成功请求 → 更可能是"按模型限流"（Gemini 等免费档每个模型
-    有独立 RPM），账号级限流会让成功请求也一起停，所以有成功就不熔断。"""
+    适用对象是**有明确账号级 RPM/RPD 的平台**（Groq / Gemini / NIM 免费档等）：
+    它们被限时，成功请求也会一起停，所以「多模型同时 429」是真信号。
+
+    两条**不该熔断**的例外：
+
+    1. 渠道 2 分钟内刚有成功请求 → 更可能是"按模型限流"（Gemini 等免费档每个模型有
+       独立 RPM），账号级限流会让成功请求也一起停，所以有成功就不熔断。
+    2. **`_PREEMPT_EXEMPT_TYPES`（魔搭）直接不参与**（2026-09-26 加）。
+       魔搭 429 的正文是 `We have to rate limit you for model X...`，官方文档写明并发
+       **按平台实时压力动态调整** —— 多模型一起 429 恰恰就是「短时高并发撞墙」的样子，
+       把它升级成「整条渠道停 10 分钟」是纯粹的误伤。魔搭真实的账号级信号只有一个：
+       **正文写明余额/魔粒不足**（`classify_429` → `free_pool`，调用方直接停渠道，
+       不需要经过这里）。这条区分就是用户问的「两种 429 能不能分开」的答案：
+       看正文措辞，不看 429 的个数。
+    """
+    if quota_agnostic_429(ch_type):
+        return False
     now = time.time()
     last_ok = channel_last_ok.get(cid)
     if last_ok and now - last_ok < 120:
@@ -504,6 +750,7 @@ def note_channel_429(cid: str, mid: str, retry_after: int = None):
     if len(distinct) >= _CH429_MIN_MODELS:
         seconds = max(_CH429_COOL, min(retry_after or 0, 1800))
         channel_cool[cid] = now + seconds
+        channel_cool_reason[cid] = f"渠道级 429 熔断（{len(distinct)} 个模型同窗口受限）"
         return True
     return False
 
@@ -513,30 +760,53 @@ def channel_cooling(cid: str, now: float = None) -> bool:
     return channel_cool.get(cid, 0) > now
 
 
-def mark_channel_quota_exhausted(cid: str, reason: str = ""):
-    """账户级「当天额度用完」：整个渠道冷却到明天 00:05，无需等第二个模型撞 429。
+def _channel_quota_cool(ch_type: str = None, now: float = None) -> int:
+    """账户级额度耗尽 → 渠道冷却多久？
 
-    魔搭等按「每日调用次数」限额的平台，一旦触发 daily 型 429，说明当天免费额度已用尽，
-    该 Key 下**所有**模型都会跟着 429（账户级，不是按模型级）。普通按模型 RPM 限流的平台
-    （Gemini/NIM 等）每个模型有独立额度，不会走到这里（它们的 429 是 minute 型）。
-    只有 `classify_429` 判为 `daily`（响应体含「今日/每日/额度已用完」等）才调用本函数。"""
-    # 冷却到下一个 00:05（额度按天刷新，留 5 分钟缓冲）
-    now = time.time()
-    t = time.localtime(now)
-    secs = (24 - t.tm_hour - 1) * 3600 + (60 - t.tm_min - 1) * 60 + (65 - t.tm_sec)
-    channel_cool[cid] = now + min(max(secs, 600), 86400)
+    - **魔搭（modelscope）= 魔粒池**：`_ms_pool_cool_secs()`（默认「到次日 00:05」；
+      置 `_MS_POOL_BOUNDED_RETRY=True` 则为 30 分钟有界重试窗）。
+      严格说魔粒没有 00:00 刷新点，但「今天没了就明天再说」是用户要的口径 ——
+      30 分钟有界窗在额度真用完时会变成「30 分钟黄 / 30 分钟绿」的死循环。
+    - 其余免费日额度型渠道（gemini / nim / agnes / huggingface / openrouter…）：
+      仍是**自然日额度**，冷却到次日 00:05。它们确实有 00:00 这个自愈点。"""
+    now = now if now is not None else time.time()
+    if (ch_type or "") in _MS_POOL_TYPES:
+        return _ms_pool_cool_secs(now)
+    return _secs_to_tomorrow(now)
+
+
+def mark_channel_quota_exhausted(cid: str, reason: str = "", ch_type: str = None,
+                                 now: float = None):
+    """账户级额度耗尽：整个渠道冷却，无需等第二个模型撞 429。
+
+    按「每日调用次数」限额的平台（Gemini/NIM/OpenRouter 免费层），一旦触发额度型 429，
+    说明当天额度已用尽，该 Key 下**所有**模型都会跟着 429（账户级，不是按模型级），
+    冷却到次日 00:05；魔搭（魔粒池）同样走「到次日 00:05」（见 `_channel_quota_cool`）。
+    普通按模型 RPM 限流的平台每个模型有独立额度，不会走到这里（它们的 429 是 minute 型）。
+    调用时机：`classify_429` 判 `free_pool`/`free_daily`、`note_channel_quota_429` 判账号级、
+    以及魔搭账号级额度头见底。
+
+    `reason` 会存进 `channel_cool_reason[cid]`（平行表，只为界面文案：让「冷却中」能说清
+    是**魔粒不足**还是**账号级 429 熔断**，而不是笼统一句「账号级限流」）。"""
+    now = now if now is not None else time.time()
+    channel_cool[cid] = now + _channel_quota_cool(ch_type, now)
+    if reason:
+        channel_cool_reason[cid] = reason
     save_runtime_state()
 
 
-def note_channel_quota_429(cid: str, mid: str, now: float = None) -> tuple:
+def note_channel_quota_429(cid: str, mid: str, now: float = None,
+                           ch_type: str = None) -> tuple:
     """额度型 429（`classify_429` 判 `free_daily`）到底是**模型级**还是**账号级**？
 
     返回 `(是否账号级, 最近窗口内撞过的不同模型数)`。
+    **魔搭（魔粒池）不走这条**：魔粒是全账号共享的池子，判为 `free_pool` 时调用方直接
+    按账号级处理，不需要爆发度判定。
 
-    背景（2026-09-20 取证）：魔搭是**两层**限额——账号级 2000 次/天（该 Key 下全模型共享）
-    + 模型级 500 次/天（大模型仅 100 次/天）。两者撞限时的 429 正文**一模一样**
-    （`{"error":{"message":"insufficient balance"}}`），从响应里分不出来。
-    旧做法是「一见额度 429 就整条渠道停到明天」→ 一个大模型（日额度只有 100）先耗完，
+    背景（2026-09-20 取证，针对的是**日额度**型平台）：魔搭当年是**两层**限额——
+    账号级 2000 次/天（该 Key 下全模型共享）+ 模型级 500 次/天（大模型仅 100 次/天）。
+    两者撞限时的 429 正文**一模一样**（`{"error":{"message":"insufficient balance"}}`），
+    从响应里分不出来。旧做法是「一见额度 429 就整条渠道停到明天」→ 一个大模型先耗完，
     撞一次就把整条渠道封十几个小时。
 
     判据用**爆发度**：窗口内（30 分钟）有几个不同模型撞额度 429。
@@ -544,7 +814,7 @@ def note_channel_quota_429(cid: str, mid: str, now: float = None) -> tuple:
       - **小簇**（窗口内 1~3 个模型）：渠道**仍在正常服务**（有成功请求为证）→ 判模型级，
         只冷这一个 (模型,渠道)，渠道其余模型照常路由；
       - **大簇**（19 / 15 / 8 个模型在同一两分钟内一起撞）：整条渠道确实中断 → 判账号级，
-        调 `mark_channel_quota_exhausted` 停到明天。
+        调 `mark_channel_quota_exhausted` 停一段。
     阈值 4 正好把这两类分开。代价上界：真账号级时最多白撞 4 次 429（这 4 个模型本来也确实
     已经不可用），换来的是一条渠道不会被单个模型拖停一整天。
 
@@ -557,7 +827,9 @@ def note_channel_quota_429(cid: str, mid: str, now: float = None) -> tuple:
         dq.popleft()
     n = len({m for _, m in dq})
     if n >= _CH429_QUOTA_MODELS:
-        mark_channel_quota_exhausted(cid, f"{_CH429_QUOTA_WINDOW // 60} 分钟内 {n} 个不同模型撞额度 429 → 账号级")
+        mark_channel_quota_exhausted(
+            cid, f"{_CH429_QUOTA_WINDOW // 60} 分钟内 {n} 个不同模型撞额度 429 → 账号级",
+            ch_type, now)
         return (True, n)
     return (False, n)
 
@@ -650,7 +922,10 @@ def save_runtime_state():
         store.persist_runtime_state({
             "saved_at": round(now, 1),
             "cooldown": {f"{k[0]}|{k[1]}": round(v, 1) for k, v in cooldown.items() if v > now},
-            "unverified": [f"{k[0]}|{k[1]}" for k in unverified],
+            # 待实测确认（暂挂期）：存成「键 -> 截止时间」，到期的重启后自然消失。
+            # 旧格式（纯字符串列表）在 restore 里仍认，但**按已过期丢弃**（不再续命）。
+            "unverified": {f"{k[0]}|{k[1]}": round(v, 1)
+                           for k, v in _unverified_until.items() if v > now},
             "channel_down": {f"{k[0]}|{k[1]}": v for k, v in channel_down.items()},
             "ratelimit": {f"{k[0]}|{k[1]}": v for k, v in ratelimit.items()},
             # 魔搭账号级日额度：只存还没到刷新点的，过期的重启后自然重学
@@ -659,6 +934,9 @@ def save_runtime_state():
             # 限流头命中计数：落盘是为了「重启后还没发请求时」也能看出魔搭的头有没有被读到
             "ratelimit_hits": dict(ratelimit_hits),
             "channel_cool": {cid: round(v, 1) for cid, v in channel_cool.items() if v > now},
+            # 冷却原因（平行表）：只存冷却仍有效的那些，过期的理由不该留到下次重启
+            "channel_cool_reason": {cid: r for cid, r in channel_cool_reason.items()
+                                    if channel_cool.get(cid, 0) > now},
             # 会话粘性（auto 用）：重启后同一个会话继续用同一个模型，不因为重启而换模型
             "sticky": {f"{s}|{k}": v for (s, k), v in sticky.items()
                        if (v.get("ts") or 0) + STICKY_TTL > now},
@@ -673,6 +951,31 @@ def save_runtime_state():
         pass  # 持久化失败不影响内存状态
 
 
+def _load_cfg_safe() -> dict:
+    """best-effort 读配置（只在重启恢复路径上用）。
+
+    为什么不用 config.load_config() 直读：恢复运行时状态这件事**不能因为配置读不到就中断**——
+    读盘异常时宁可当作「没有配置」继续恢复（此时 preemption_on 走默认值，行为等同旧版），
+    也不要让一个 IO 抖动把冷却/硬失败记录全丢掉。"""
+    try:
+        from . import config as cfgmod
+        return cfgmod.load_config() or {}
+    except Exception:
+        logging.getLogger("api-hub").warning("恢复状态时读配置失败，按空配置处理", exc_info=True)
+        return {}
+
+
+def _channel_type_of(cid: str, cfg: dict) -> str:
+    """渠道 id → 渠道类型。查不到返回 ""（preemption_on 对 "" 返回 True，即保持旧行为）。
+
+    只看内存里这份配置，不查运行期 channel_state：重启恢复发生在渠道探测之前，
+    此时 state 表还是空的，而配置里一定已经有 type 了。"""
+    for ch in (cfg or {}).get("channels") or []:
+        if isinstance(ch, dict) and ch.get("id") == cid:
+            return ch.get("type") or ""
+    return ""
+
+
 def restore_runtime_state():
     """启动时恢复上一轮扫描/请求留下的失败与冷却记录"""
     from . import store
@@ -685,10 +988,21 @@ def restore_runtime_state():
             if mid and cid:
                 cooldown[(mid, cid)] = v
                 n_cool += 1
-    for k in data.get("unverified") or []:
-        mid, _, cid = k.partition("|")
-        if mid and cid:
+    # 待实测确认（暂挂期）：新格式是「键 -> 截止时间」，已过期的直接不收。
+    # 旧格式是字符串列表（没有截止时间）→ **按已过期处理**：这批是 2026-09-26 之前累积的
+    # （线上 405 条，有的挂了几周），冷却早过了、也没人会去手测；给它们补一个新的暂挂期
+    # 等于把刚修掉的「永久受限」再续 30 分钟。新格式从下一次 mark_result 起自然建立。
+    raw_unv = data.get("unverified")
+    n_legacy = 0
+    if isinstance(raw_unv, dict):
+        for k, until in raw_unv.items():
+            mid, _, cid = k.partition("|")
+            if not (mid and cid and isinstance(until, (int, float))) or until <= now:
+                continue
             unverified.add((mid, cid))
+            _unverified_until[(mid, cid)] = float(until)
+    else:
+        n_legacy = sum(1 for k in (raw_unv or []) if "|" in str(k))
     for k, v in (data.get("channel_down") or {}).items():
         mid, _, cid = k.partition("|")
         if mid and cid:
@@ -708,6 +1022,10 @@ def restore_runtime_state():
     for cid, v in (data.get("channel_cool") or {}).items():
         if v > now:
             channel_cool[cid] = v
+    # 恢复冷却原因（老 runtime_state.json 没有这个键 → 空表，界面退回通用文案，不算错）
+    for cid, r in (data.get("channel_cool_reason") or {}).items():
+        if isinstance(r, str) and r and channel_cool.get(cid, 0) > now:
+            channel_cool_reason[cid] = r
     # 恢复会话粘性（auto 用）：只收还没过闲置期的
     n_sticky = 0
     for k, v in (data.get("sticky") or {}).items():
@@ -742,17 +1060,28 @@ def restore_runtime_state():
             continue
         n_stat += 1
     n_seeded = 0
+    n_seed_skip = 0
+    # 只给「预判真正生效」的渠道 seed 冷却：对魔搭这类不做预判的渠道，水位本身就是噪声
+    # （平台动态限速，见 _PREEMPT_EXEMPT_TYPES），拿它 seed 一个 300s 冷却等于「重启后又受限
+    # 五分钟」—— 正是用户报的那类「测试通过却还是受限」。
+    cfg_now = _load_cfg_safe()
     for cid, mid in throttle.learned_pairs():
+        if not preemption_on(_channel_type_of(cid, cfg_now), cfg_now):
+            n_seed_skip += 1
+            continue
         key = (mid, cid)
         if cooldown.get(key, 0) <= now:
             cooldown[key] = now + 300  # 与 rate_limit 默认冷却一致
             n_seeded += 1
-    import logging
     logging.getLogger("api-hub").info(
         "已恢复运行时状态：冷却 %d，待验证 %d，渠道级硬失败 %d，限流头 %d，429 预判 %d，会话粘性 %d"
-        "（seed 冷却 %d，评分样本 %d）",
+        "（seed 冷却 %d，跳过 seed %d，评分样本 %d）",
         n_cool, len(unverified), len(channel_down), len(ratelimit),
-        len(throttle.learned_pairs()), n_sticky, n_seeded, n_stat)
+        len(throttle.learned_pairs()), n_sticky, n_seeded, n_seed_skip, n_stat)
+    if n_legacy:
+        logging.getLogger("api-hub").info(
+            "丢弃 %d 条没有截止时间的旧「待验证」记录（新规则只压 %d 分钟暂挂期，见 is_unverified）",
+            n_legacy, _UNVERIFIED_TTL // 60)
 
 
 def _request_save():
@@ -823,15 +1152,40 @@ def mark_result(model: str, cid: str, ok: bool, latency_ms=None,
     if ok:
         cooldown.pop(key, None)
         unverified.discard(key)      # 实测成功 → 恢复状态被确认
+        _unverified_until.pop(key, None)
         channel_down.pop(key, None)  # 之前硬失败的 (模型,渠道) 也随之恢复
+        # 429 自学水位（throttle）也要一起忘掉：那条水位只是**预测**，一次真实成功就证伪了它。
+        # 不清的后果（2026-09-26 用户报的「测试成功但列表仍受限」）：界面继续显示
+        # 「限流预判，本轮跳过」，而且 candidates_for / candidates_for_auto 都在静默跳过它。
+        throttle.clear(cid, model)
         channel_last_ok[cid] = time.time()
+        # 一次真实成功会**同时证伪**下面这几条「我们自己的推断」，所以一起清掉。
+        # 少清任何一条，都会留下一个「测试通过却仍然受限」的出口 —— 2026-09-26 复盘时
+        # 它们各自独立地压着一个已经实测可用的模型（用户原话：「测试成功但列表仍是受限」）。
+        changed = False
+        # ① 官方额度头（`x-ratelimit-*` / `modelscope-ratelimit-*`）说 remaining=0 时，
+        #    `ratelimit_exhausted` 会让 `candidates_for` **静默跳过**这一格。它只在下一次
+        #    响应头里被更新，而上游不给头时（魔搭 2026-09 起就不给了）就是永久拉黑。
+        if ratelimit.pop(key, None) is not None:
+            changed = True
+        # ② 额度 429 的爆发度窗口：成功本身就证明「账号额度没耗尽」，旧账不该把下一次
+        #    429 直接推成账号级停摆（整条渠道停一段的代价，远大于多试一次）。
+        if channel_quota_429.pop(cid, None) is not None:
+            changed = True
+        # ③ 渠道级 429 熔断计数（窗口内 ≥2 个模型一起 429 → 判账号级）：同理，成功即证伪。
+        if _channel_429_events.pop(cid, None) is not None:
+            changed = True
+        # ④ 渠道级冷却（含「账户级额度用完」「魔粒不足」，都是等一个时刻）
         if cid in channel_cool:
-            # 成功调用 = 渠道确实可用（额度可能已刷新）→ 解除渠道级冷却并即时落盘，
-            # 避免「手动测试成功但冷却到明天的状态还在、重启后渠道仍被封」。
-            # 自动探测/路由不会在渠道冷却期间发请求，只有用户手动测试能走到这里。
+            # 成功调用 = 渠道确实可用（额度可能已刷新）→ 解除渠道级冷却。
+            # 自动探测/路由不会在渠道冷却期间发请求，只有用户手动测试 + 内联重试能走到这里。
             channel_cool.pop(cid, None)
-            _channel_429_events.pop(cid, None)  # 清掉熔断计数，恢复后不再被旧账立刻熔断
-            save_runtime_state()
+            changed = True
+        # ⑤ 冷却原因随冷却一起清（平行表，别让它挂在一条已经解除冷却的渠道上）
+        if channel_cool_reason.pop(cid, None) is not None:
+            changed = True
+        if changed:
+            save_runtime_state()   # 解封必须即时落盘，否则「重启后渠道仍被封」
     else:
         seconds = COOLDOWN_SECONDS.get(kind, DEFAULT_COOLDOWN)
         if retry_after and retry_after > 0 and not cooldown_seconds:
@@ -840,7 +1194,14 @@ def mark_result(model: str, cid: str, ok: bool, latency_ms=None,
             seconds = cooldown_seconds
         if seconds:
             cooldown[key] = time.time() + seconds
-        unverified.add(key)  # 冷却到期后仍显示受限，直到实测/探测成功才转绿
+        # 冷却到期后仍显示受限，直到实测/探测成功才转绿 —— 但只压 `_UNVERIFIED_TTL`
+        # 这段时间（见 is_unverified）：没人会去手测的模型不该被永久挂着「受限」。
+        #
+        # ⚠️ 只给「等一个时刻」的冷却（额度型，≥ `_UNVERIFIED_MIN_COOL`）加暂挂期。
+        # 分钟级限流（90~300s）**不加**：那一分钟的窗口过了就是真的过了，再压 30 分钟等于
+        # 把一次 1.5 分钟的抖动放大成 30 分钟的受限（魔搭 2026-09-26 实测 32 次 429 全属此类）。
+        if seconds >= _UNVERIFIED_MIN_COOL:
+            _mark_unverified(key)
     _request_save()
 
 
@@ -945,20 +1306,191 @@ def _migrate_named_models(ch: dict, old_models: list, new_models: list):
             "渠道[%s] 模型命名变更，已迁移 %d 条旧状态到新命名", ch.get("name"), migrated)
 
 
+def extra_models_of(ch: dict) -> list:
+    """渠道手填的「额外模型」白名单（上游 /models 不列、但确实能调的模型）。
+
+    为什么要这个口子（2026-10-07 实测）：
+      · 智谱 `glm-4-flash` / `glm-4.7-flash` 官方永久免费、chat/completions 直接 200，
+        但智谱 /models 只返回主力/付费模型，不含它俩；
+      · Cloudflare Workers AI 的 OpenAI 兼容端点**只有 /chat/completions 与 /embeddings**，
+        没有 /models —— 不手填就一个模型都进不来。
+    两类模型原本永远进不了 cs.models。列表来自配置（见 main._validate_channel 的归一化）。"""
+    out = []
+    for m in (ch.get("extra_models") or []):
+        s = "" if m is None else str(m).strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+# ---- 自动补全：候选探活（2026-10-07）----
+# 上游 /models 不列的免费模型由 modelcat 给候选，但**必须探活确认**才并入：
+# 目录数据滞后是常态（例：`glm-4.5-flash` 官方已公告下线，目录里仍标免费）。
+#
+# ⚠️ 判据是「**这次能不能真调通**」，不是「上游认不认这个名字」——2026-10-07 用户实测反馈后收紧。
+# 旧版把 429/5xx 也算「存在」（理由：忙是免费档常态，丢了可惜）。用户随即发现
+# `glm-4.7-flash` 被自动补进池子、点测试却报不可用 —— **「忙」不等于「可用」**。
+# 自动补全的意义是「拿来就能调」；把一个高概率 429 的模型塞进池子，等于让用户自己试错。
+# 现在 429/5xx 不并入，但只压 30 分钟（不是 6 小时），给平台忙完的机会。
+_cand_cache: dict = {}          # (渠道id, 模型) -> (是否可用, 记录时间, 该结果的 TTL)
+_CAND_OK_TTL = 6 * 3600         # 探到了就复用 6 小时：健康检查 30 分钟一轮，没必要每轮重探
+_CAND_BUSY_TTL = 30 * 60        # 「忙」→ 压 30 分钟。**不能照 6 小时压**：那等于把模型拉黑半天，
+                                # 人家缓过来了我们也看不见（免费档的忙基本是时段性的）
+_CAND_GONE_TTL = 6 * 3600       # 4xx 硬失败（名字不对 / 无权 / 已下线）→ 6 小时内不必再问
+_CAND_RETRY = 1                 # 429/5xx 先重试一次再下结论：单次抖动不该被当成「忙」
+_CAND_RETRY_DELAY = 1.5         # 重试间隔（秒）
+# 「忙或抖」的状态码 —— 重试后仍是这些，就不并入。
+_CAND_BUSY_STATUS = (429, 500, 502, 503, 504)
+_CAND_MAX = 8                   # 单渠道单轮最多探 8 个。上限是给兜底留的：万一某平台 /models
+                                # 挂了、候选变成整份目录（NIM 有 100+ 个），不能全探一遍。
+
+
+def _probe_resp_ok(r) -> str:
+    """探活响应的内容校验：通过返回空串，否则返回原因。
+
+    200 也不能无条件信 —— 上游可能拿 200 包一个错误对象。
+    **不要求 content 非空**：思考模型（`glm-4.7-flash` / `glm-4.6v-flash`）在
+    `max_tokens=1` 时只输出思考、content 为空，但模型本身是好的。
+    （同 `main._probe_body_ok` 的道理，那边多校验一层 choices 结构。）
+    """
+    try:
+        d = r.json()
+    except Exception:
+        return "响应不是 JSON"
+    if isinstance(d, dict) and d.get("error"):
+        return str(d["error"])[:80]
+    return ""
+
+
+async def _probe_candidates(client, ch: dict, models: list) -> list:
+    """并发探活候选，只返回**这次真能调通**的。
+
+    200（且不是错误对象）→ 可用，结果复用 6 小时；
+    429 / 5xx            → 隔 1.5s 重试一次，仍如此判「忙」→ **不返回**，30 分钟后重试；
+    其它 4xx              → 判「没有这个模型」→ **不返回**，6 小时内不再问；
+    连不上                → **不写缓存**（那是本机网络问题，不是模型坏，下轮要重试）。
+    """
+    if not models:
+        return []
+    now = time.time()
+    url = ch["base_url"].rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {ch.get('api_key') or ''}",
+               "Content-Type": "application/json"}
+
+    async def one(m):
+        cached = _cand_cache.get((ch["id"], m))
+        if cached:
+            ok, ts, ttl = cached
+            if now - ts < ttl:
+                return m if ok else None
+        busy = False
+        for i in range(_CAND_RETRY + 1):
+            try:
+                t0 = time.time()
+                r = await client.post(
+                    url, json={"model": m, "messages": [{"role": "user", "content": "ping"}],
+                               "max_tokens": 1},
+                    headers=headers, timeout=20)
+                latency = int((time.time() - t0) * 1000)
+            except Exception:
+                return None            # 连不上：不写缓存，下轮重试
+            if r.status_code == 200:
+                if not _probe_resp_ok(r):
+                    _cand_cache[(ch["id"], m)] = (True, now, _CAND_OK_TTL)
+                    mark_result(m, ch["id"], True, latency, source="auto")
+                    return m
+                busy = True                # 200 却包着错误对象 → 当「忙」，别标绿
+            elif r.status_code in _CAND_BUSY_STATUS:
+                busy = True
+            else:
+                _cand_cache[(ch["id"], m)] = (False, now, _CAND_GONE_TTL)
+                return None
+            if i + 1 <= _CAND_RETRY:
+                await asyncio.sleep(_CAND_RETRY_DELAY)
+        if busy:
+            _cand_cache[(ch["id"], m)] = (False, now, _CAND_BUSY_TTL)
+        return None
+
+    got = await asyncio.gather(*(one(m) for m in models), return_exceptions=True)
+    return [m for m, r in zip(models, got) if isinstance(r, str)]
+
+
+async def auto_add_models(client, ch: dict, upstream_ids, extra) -> list:
+    """本轮自动补进该渠道的模型（已探活）。关掉开关 / 没候选 / 没 client → `[]`。
+
+    `upstream_ids` 与 `extra` 都要排除 —— 已经在列表里的、用户手填的，都不算「补」。
+    """
+    if client is None or not ch.get("auto_models", True):
+        return []
+    cands = modelcat.candidates_for(ch.get("type"), upstream_ids, extra)[:_CAND_MAX]
+    if not cands:
+        return []
+    alive = await _probe_candidates(client, ch, cands)
+    if alive:
+        logging.getLogger("api-hub").info(
+            "渠道[%s] 自动补全 %d 个免费模型：%s",
+            ch.get("name"), len(alive), ", ".join(alive))
+    return alive
+
+
 async def refresh_channel(client, ch: dict) -> ChannelState:
     """拉取单个渠道的模型列表并更新健康状态"""
     cs = get_cs(ch["id"])
     t0 = time.time()
+    extra = extra_models_of(ch)
+    list_error = None
+    ids: list = []
     try:
-        ids = await providers.fetch_models(client, ch["base_url"], ch["api_key"])
+        # ch_type / free_only 交给 providers 决定要不要过滤（OpenRouter 只留免费模型，
+        # 否则会把全站 458 个付费目录当成「可用模型」列出来 —— 见 providers.OPENROUTER_FREE_ONLY）
+        ids = await providers.fetch_models(client, ch["base_url"], ch["api_key"],
+                                           ch_type=ch.get("type"),
+                                           free_only=ch.get("free_only"))
         _migrate_named_models(ch, cs.models, ids)  # 命名变更 → 旧 down/limited 迁移到新名
-        cs.models = ids
+    except Exception as e:
+        list_error = str(e)[:160]
+        # 2026-10-08：地域封锁单独点名（Google 系常见：出口 IP 在不支持地区时
+        # /models 也返回 400 FAILED_PRECONDITION "User location is not supported"）。
+        # 旧文案是裸的 "Client error '400 Bad Request'…"，用户看不出是网络出口问题、
+        # 以为是 Key 或渠道坏了。这条渠道下轮健康检查（换出口后）自然恢复。
+        if is_geo_block(str(e)):
+            list_error = ("地域封锁：上游判定当前出口 IP 所在地区不可用"
+                          f"（{str(e)[:120]}）。换网络出口/代理节点后自动恢复")
+
+    # 自动补全：上游没列、用户也没手填的**免费**模型，探活通过才并进来（见 modelcat）。
+    # 放在异常之后，是为了让「上游根本没有 /models」的渠道也能靠它拿到模型。
+    try:
+        auto = await auto_add_models(client, ch, ids, extra)
+    except Exception as e:
+        auto = []
+        logging.getLogger("api-hub").warning(
+            "渠道[%s] 自动补全失败（不影响渠道检查）: %s", ch.get("name"), str(e)[:160])
+
+    cs.auto_added = auto
+    floor = sorted(set(extra) | set(auto))     # 不依赖上游列表的那部分
+    if list_error is None:
+        cs.models = sorted(set(ids) | set(floor))
         cs.valid = True
         cs.error = None
+        cs.list_error = None
         cs.latency_ms = int((time.time() - t0) * 1000)
-    except Exception as e:
+    elif floor:
+        # 上游没给 /models（或临时抽风），但有手填/自动补的模型 → 渠道仍算可用。
+        # 否则这类渠道会被判「连接失败」整条停用，补进来的模型一个都用不上
+        # （gateway 里所有取模型的路径都要求 cs.valid is True）。
+        # 真实可用性交给「扫描全部模型」和后台探测去验，它们才是决定性判据。
+        cs.models = floor
+        cs.valid = True
+        cs.error = None
+        cs.list_error = list_error
+        cs.latency_ms = int((time.time() - t0) * 1000)
+        logging.getLogger("api-hub").info(
+            "渠道[%s] 上游未提供模型列表（%s），改用 %d 个手填/自动补全的模型",
+            ch.get("name"), list_error, len(floor))
+    else:
         cs.valid = False
-        cs.error = str(e)[:200]
+        cs.error = list_error[:200]
+        cs.list_error = None
     cs.last_check = time.time()
     return cs
 
@@ -1113,7 +1645,6 @@ def candidates_for(model: str, cfg: dict) -> list:
     返回 [{"channel": 渠道dict, "model": 上游模型ID}]"""
     now = time.time()
     out, seen = [], set()
-    preempt = cfg.get("adaptive_preemption", True)
 
     def collect(ignore_cooldown: bool):
         for mid in model_targets(model, cfg):
@@ -1136,7 +1667,7 @@ def candidates_for(model: str, cfg: dict) -> list:
                     if cooldown.get(key, 0) > now:
                         continue
                     # 429 自学预判：预计这条会越线 → 本轮跳过（仍有兜底逻辑）
-                    if preempt and throttle.blocked(ch["id"], mid):
+                    if preemption_on(ch.get("type"), cfg) and throttle.blocked(ch["id"], mid):
                         continue
                 seen.add(key)
                 out.append({"channel": ch, "model": mid})
@@ -1204,8 +1735,9 @@ def model_view(cfg: dict) -> list:
 
     语义：暂时超过额度被限流的模型仍算「可用」范畴，只是标注受限；仅 402/403/下线 等
     硬失败才记为 down，且按 (模型, 渠道) 粒度记录——只有所有渠道都硬失败才算整个模型 down。
-    冷却到期但未实测确认（unverified）、429 预判跳过（preempted）、渠道级熔断（账号级限流）
-    都会让该渠道显示受限，避免「界面绿色但实际用不了」。
+    冷却到期但未实测确认（unverified，只压 30 分钟暂挂期）、429 预判跳过（preempted，
+    限流型渠道才启用）、渠道级熔断（账号级限流）都会让该渠道显示受限，
+    避免「界面绿色但实际用不了」。
 
     **2026-09-21（用户拍板 A1）**：`model_status`（模型级）**不再参与这里的任何判定**，
     模型能不能用完全由渠道级状态聚合得出。它只提供 `tested / test_reason / test_channel / test_ts`
@@ -1220,11 +1752,12 @@ def model_view(cfg: dict) -> list:
         if not cs:
             continue
         ch_cool = channel_cooling(ch["id"], now)
-        preempt = cfg.get("adaptive_preemption", True)
+        preempt = preemption_on(ch.get("type"), cfg)
         for m in cs.models:
             key = (m, ch["id"])
             entry = agg.setdefault(m, [])
-            in_cool = cooldown.get(key, 0) > now or key in unverified
+            unv = is_unverified(key, now)
+            in_cool = cooldown.get(key, 0) > now or unv
             ch_down = key in channel_down
             preempted = bool(preempt and not in_cool and not ch_down
                              and not ch_cool and throttle.blocked(ch["id"], m))
@@ -1237,9 +1770,15 @@ def model_view(cfg: dict) -> list:
                 _r = (channel_down.get(key) or {}).get("reason") or "已下线/无权限/需充值"
                 unavail = "硬失败：" + _r
             elif ch_cool:
-                unavail = "渠道级冷却（账号级限流），到点自动恢复"
-            elif key in unverified:
-                unavail = "冷却已到期，待实测确认"
+                # 说清**为什么**停 + **停到什么时候**：笼统一句「账号级限流」没法区分
+                # 「魔粒不足」和「同窗口多个模型一起 429」，用户看不出是该去领魔粒还是等一会儿。
+                _why = channel_cool_reason.get(ch["id"]) or "账号级限流"
+                _left = cool_duration_text(channel_cool.get(ch["id"], now) - now)
+                unavail = f"渠道级冷却（{_why}），{_left}自动重试"
+            elif unv:
+                # 暂挂期：冷却到期但还没实测成功过。30 分钟后自动放行（届时会真的排进候选，
+                # 让下一次调用/探测给出结论），不再需要用户去点一次测试才解。
+                unavail = "冷却已到期，待实测确认（30 分钟后自动放行）"
             elif in_cool:
                 unavail = "限流冷却至 " + time.strftime(
                     "%H:%M", time.localtime(cooldown.get(key, now)))
@@ -1335,7 +1874,7 @@ def alias_view(cfg: dict) -> list:
                 if (ch.get("enabled", True) and cs and cs.valid and t in cs.models
                         and not channel_cooling(ch["id"], now)
                         and (t, ch["id"]) not in channel_down
-                        and (t, ch["id"]) not in unverified
+                        and not is_unverified((t, ch["id"]), now)
                         and cooldown.get((t, ch["id"]), 0) <= now):
                     ok = True
                     break
@@ -1517,7 +2056,6 @@ def candidates_for_auto(strategy: str, cfg: dict) -> list:
     pinned = set(cfg.get("pinned_vision" if strategy == "vision" else "pinned") or [])
     need_vision = strategy == "vision"
     out, seen = [], set()
-    preempt = cfg.get("adaptive_preemption", True)
     for ch in cfg["channels"]:
         if not ch.get("enabled", True):
             continue
@@ -1539,7 +2077,7 @@ def candidates_for_auto(strategy: str, cfg: dict) -> list:
             # 2026-09-21（用户拍板 A1）：不再读模型级状态。能不能路由只看 (模型,渠道) 自己的
             # 记录 —— cooldown / channel_down / ratelimit 都在上面几行判完了。旧逻辑在这里
             # 用 model_status[模型] 一票否决整个模型，会把该模型其他健康渠道一起踢出候选。
-            if preempt and throttle.blocked(ch["id"], m):
+            if preemption_on(ch.get("type"), cfg) and throttle.blocked(ch["id"], m):
                 continue
             seen.add(key)
             out.append({"channel": ch, "model": m})
@@ -1597,7 +2135,7 @@ def channel_available_models(cid: str) -> int:
     avail = 0
     for m in cs.models:
         key = (m, cid)
-        if cooldown.get(key, 0) > now or key in unverified or key in channel_down:
+        if cooldown.get(key, 0) > now or is_unverified(key, now) or key in channel_down:
             continue
         avail += 1
     return avail

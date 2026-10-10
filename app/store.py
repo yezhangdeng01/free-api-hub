@@ -15,6 +15,10 @@ DB_PATH = os.path.join(ROOT, "data", "usage.db")
 MODEL_STATUS_PATH = os.path.join(ROOT, "data", "model_status.json")
 RUNTIME_STATE_PATH = os.path.join(ROOT, "data", "runtime_state.json")
 CAPABILITY_CACHE_PATH = os.path.join(ROOT, "data", "capability_cache.json")
+FREE_MODELS_PATH = os.path.join(ROOT, "data", "free_models.json")
+# 公开模型目录（models.dev 抽取后的精简版）：给「上游 /models 不列」的渠道自动补全候选，
+# 见 app/modelcat.py。跟 free_models.json 一样是快照，删了会自动重抓。
+MODEL_CATALOG_PATH = os.path.join(ROOT, "data", "model_catalog.json")
 _lock = threading.Lock()
 _ms_cache = None
 
@@ -131,6 +135,23 @@ def persist_capability_cache(data: dict):
         _atomic_write(CAPABILITY_CACHE_PATH, data)
 
 
+# ---------------- OpenRouter 免费模型雷达（名单 + 首次见到时间，重启不丢） ----------------
+# 为什么要落盘：「新面孔」的判据是**本地第一次见到**的时间，只存内存的话每次重启
+# 全站免费模型都会重新变成「今天刚发现」—— 提示就变成了噪音，等于没提示。
+def load_free_models_cache() -> dict:
+    try:
+        with open(FREE_MODELS_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def persist_free_models_cache(data: dict):
+    with _lock:
+        _atomic_write(FREE_MODELS_PATH, data)
+
+
 def model_usage_24h() -> dict:
     """近 24h 每个模型的调用统计 {model: {requests, ok, avg_latency}}
 
@@ -219,7 +240,9 @@ def summary(days: int = 7) -> dict:
     - `superseded`：**补充信息**，指这些失败里有几次后面还换到了别的候选（客户端最终拿到了结果）。
       它不改变失败归属，只是让你知道「这一跳失败之后请求续到了哪」。
     - 成功率分母用 `requests - cancelled`（中断那一跳不是模型的账）。"""
-    since = time.time() - days * 86400
+    # days <= 0 → 全量累计（since = 0）：ts 是 unix 秒，`ts >= 0` 覆盖这个库里的全部历史。
+    # ⚠️ 别写成 `time.time() - 0*86400`，那等于「从现在起算」→ 一条都查不到。
+    since = time.time() - days * 86400 if days > 0 else 0
     _ERR = "(success = 0 AND COALESCE(cancelled,0) = 0)"       # 含 superseded
     with _conn() as con:
         totals = dict(con.execute(
@@ -237,15 +260,25 @@ def summary(days: int = 7) -> dict:
             " COALESCE(SUM(COALESCE(cancelled, 0)), 0) AS cancelled,"
             " COALESCE(SUM(COALESCE(superseded, 0)), 0) AS superseded"
             " FROM usage WHERE ts >= ? GROUP BY date ORDER BY date", (since,))]
+        # errors / avg_latency 两个字段 2026-10-02 补齐（统计页做图表时发现缺）：
+        #   - by_model 原先没有 errors → 模型那栏画不出失败率；
+        #   - by_channel 原先没有 avg_latency → 前端 rows() 统一读 r.avg_latency，
+        #     渠道表第 4 列恒为「—」（整列废掉）。
+        # 两条口径都与 totals 一致：errors 含 superseded（换路不豁免），
+        # avg_latency 只取成功样本（失败那一跳的耗时没有参考价值）。
+        # ⚠️ by_model 仍是 LIMIT 20 —— 前端算占比时**分母必须用 totals**，
+        #    拿 by_model 求和会静默少算（长尾被截掉）。
         by_model = [dict(r) for r in con.execute(
             "SELECT COALESCE(NULLIF(upstream_model, ''), model) AS model,"
             " COUNT(*) AS requests,"
             " COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens,"
+            f" COALESCE(SUM(CASE WHEN {_ERR} THEN 1 ELSE 0 END), 0) AS errors,"
             " COALESCE(AVG(CASE WHEN success = 1 THEN latency_ms END), 0) AS avg_latency"
             " FROM usage WHERE ts >= ? GROUP BY 1 ORDER BY requests DESC LIMIT 20", (since,))]
         by_channel = [dict(r) for r in con.execute(
             "SELECT COALESCE(channel_name, channel_id) AS name, COUNT(*) AS requests,"
             " COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens,"
-            f" COALESCE(SUM(CASE WHEN {_ERR} THEN 1 ELSE 0 END), 0) AS errors"
+            f" COALESCE(SUM(CASE WHEN {_ERR} THEN 1 ELSE 0 END), 0) AS errors,"
+            " COALESCE(AVG(CASE WHEN success = 1 THEN latency_ms END), 0) AS avg_latency"
             " FROM usage WHERE ts >= ? GROUP BY channel_id ORDER BY requests DESC", (since,))]
     return {"totals": totals, "daily": daily, "by_model": by_model, "by_channel": by_channel}

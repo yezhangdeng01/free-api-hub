@@ -59,6 +59,22 @@ def observe_429(cid: str, model: str, ts: float = None):
         _prune(cid, model, ts - _RPD_WIN)
 
 
+def clear(cid: str, model: str) -> bool:
+    """实测成功 → 丢掉这一格的 429 自学水位与调用窗口。返回是否真有东西被清掉。
+
+    为什么必须清：`blocked()` 只是一条**预测**（"按这个量再打会越线"），而一次真实成功
+    就是这条预测被直接证伪的证据。此前成功只解 `cooldown`，不动这里的水位，于是出现
+    「手动测试 200、列表仍然受限」——2026-09-26 实测：deepseek-ai/DeepSeek-V4.1-Flash
+    手动测试成功、直连上游也是 200，界面却仍是 `限流预判，本轮跳过（等额度刷新）`；
+    更糟的是 `candidates_for` / `candidates_for_auto` 都在**静默跳过**它，用户点了测试
+    通过却依然用不上这个模型。"""
+    with _lock:
+        had = (cid, model) in _LEARN or (cid, model) in _CALLS
+        _LEARN.pop((cid, model), None)
+        _CALLS.pop((cid, model), None)
+        return had
+
+
 def _active(cid, model, now):
     pre = _LEARN.get((cid, model))
     if not pre or pre["samples"] < _MIN_SAMPLES:
